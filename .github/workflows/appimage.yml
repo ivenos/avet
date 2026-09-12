@@ -24,7 +24,7 @@ env:
   FFMPEG_VERSION: n8.1.2
   VSHIP_VERSION: v5.1.1
   VMAF_VERSION: v3.2.0
-  RUST_VERSION: 1.98.0
+  RUST_VERSION: 1.98.1
   LINUXDEPLOY_VERSION: 1-alpha-20251107-1
 
 # The appimage job opts into contents: write to attach release assets.
