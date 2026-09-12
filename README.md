@@ -4,7 +4,7 @@
 [![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
 [![License](https://img.shields.io/badge/license-BSL_1.1-orange)](https://github.com/ivenos/avxs/blob/main/LICENSE)
 [![svt-av1](https://img.shields.io/badge/svt--av1-v4.2.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
-[![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-cfb4e17-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@cfb4e17693ae16945a7fe288d45437243d96c12e -->
+[![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-0033340-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@00333404f455471aaa6ee2c927cac3c93efb76e3 -->
 
 avxs is an AV1 encoding service. It watches a folder, splits each video into scenes, encodes them in parallel with SVT-AV1 and writes a finished MKV with audio, subtitles and chapters carried over. It ships as a Docker image and as a Linux AppImage with every tool bundled.
 
