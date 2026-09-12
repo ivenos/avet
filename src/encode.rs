@@ -34,10 +34,10 @@ pub struct EncodeOptions {
 }
 
 pub fn encode_chunk(
-    source_file: PathBuf,
-    index_file: PathBuf,
-    scene: SceneEntry,
-    output_path: PathBuf,
+    source_file: &Path,
+    index_file: &Path,
+    scene: &SceneEntry,
+    output_path: &Path,
     config: &Config,
     opts: &EncodeOptions,
     overrides: EncodeOverrides,
@@ -45,7 +45,7 @@ pub fn encode_chunk(
     let encoder = config.encoder.context("encoder is required when video is encoded")?;
     let encoder_name = encoder_binary(encoder);
     let encoder_bin = external_bin(encoder_name);
-    let mut encoder_args = build_encoder_args(config, &output_path, opts)?;
+    let mut encoder_args = build_encoder_args(config, output_path, opts)?;
     if let Some(crf) = overrides.crf {
         set_arg(&mut encoder_args, "--crf", crf.to_string());
     }
@@ -54,8 +54,8 @@ pub fn encode_chunk(
     }
 
     let mut vs = VideoSource::open(
-        &source_file,
-        &index_file,
+        source_file,
+        index_file,
         OpenOpts { target_bit_depth: opts.target_bit_depth },
     )
     .context("open FFMS2 VideoSource")?;
@@ -66,15 +66,15 @@ pub fn encode_chunk(
     match opts.scale {
         Some(scale) => encode_scaled(
             &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, &scene, opts.crop, scale,
+            &mut vs, scene, opts.crop, scale,
         )?,
         None => encode_direct(
             &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, &scene, opts.crop,
+            &mut vs, scene, opts.crop,
         )?,
     }
 
-    chunk_size(&output_path)
+    chunk_size(output_path)
 }
 
 /// FFMS2 Y4M piped straight into the encoder.
@@ -128,17 +128,7 @@ fn encode_scaled(
     crop: Option<Crop>,
     scale: (u32, u32),
 ) -> Result<()> {
-    let (w, h) = scale;
-    let vf = format!("scale={w}:{h}:flags=lanczos");
-    let mut ff = std::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-i", "pipe:0"])
-        // -strict -1: yuv4mpegpipe muxer needs it to write >8-bit Y4M.
-        .args(["-vf", &vf, "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg scaler")?;
+    let mut ff = spawn_scaler(scale)?;
 
     let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let mut ff_err = ff.stderr.take().expect("ffmpeg stderr unavailable");
@@ -175,6 +165,19 @@ fn encode_scaled(
     }
     write_res.context("write Y4M frames to ffmpeg scaler")?;
     Ok(())
+}
+
+pub fn spawn_scaler((w, h): (u32, u32)) -> Result<std::process::Child> {
+    let vf = format!("scale={w}:{h}:flags=lanczos");
+    std::process::Command::new(external_bin("ffmpeg"))
+        .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-i", "pipe:0"])
+        // -strict -1: yuv4mpegpipe muxer needs it to write >8-bit Y4M.
+        .args(["-vf", &vf, "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start ffmpeg scaler")
 }
 
 fn chunk_size(output_path: &Path) -> Result<u64> {
@@ -240,13 +243,12 @@ pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String>
 }
 
 /// Readable, and holding `expected_frames` when avxs encoded it (None for `video = copy`).
-pub async fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> {
+pub fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
 
-    let mut cmd = tokio::process::Command::new(external_bin("ffprobe"));
+    let mut cmd = std::process::Command::new(external_bin("ffprobe"));
     cmd.args(["-v", "error", "-i"]).arg(path);
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffprobe output validation")
-        .await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffprobe output validation")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("output file is invalid: {stderr}");
@@ -254,7 +256,7 @@ pub async fn validate_output(path: &Path, expected_frames: Option<u64>) -> Resul
 
     // A merge that lost a chunk is valid Matroska that ends early.
     if let Some(expected) = expected_frames {
-        let actual = video_packet_count(path).await?;
+        let actual = video_packet_count(path)?;
         if actual != expected {
             bail!(
                 "output holds {actual} video frames, but the chunk list accounts for \
@@ -267,7 +269,7 @@ pub async fn validate_output(path: &Path, expected_frames: Option<u64>) -> Resul
 }
 
 /// Video frames in a muxed file. One ffprobe pass over the container, no decoding.
-async fn video_packet_count(path: &Path) -> Result<u64> {
+fn video_packet_count(path: &Path) -> Result<u64> {
     #[derive(serde::Deserialize)]
     struct Root { streams: Vec<Stream> }
     #[derive(serde::Deserialize)]
@@ -282,7 +284,6 @@ async fn video_packet_count(path: &Path) -> Result<u64> {
         path,
         TIMEOUT_SECS,
     )
-    .await
     .context("count the output's video frames")?;
 
     root.streams
@@ -310,7 +311,7 @@ fn concat_entry(path: &Path) -> Result<String> {
     Ok(format!("file {escaped}"))
 }
 
-pub async fn concat_chunks(
+pub fn concat_chunks(
     chunk_paths: &[PathBuf],
     output_path: &Path,
     list_dir: &Path,
@@ -327,13 +328,13 @@ pub async fn concat_chunks(
         }
     }
 
-    let mut cmd = tokio::process::Command::new(external_bin("ffmpeg"));
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "concat", "-safe", "0", "-i"])
         .arg(&list_path)
         .args(["-c:v", "copy", "-map_metadata", "-1", "-an", "-sn"])
         .arg(output_path);
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg concat").await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg concat")?;
 
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

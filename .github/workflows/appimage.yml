@@ -23,6 +23,7 @@ env:
   FFMS2_VERSION: "5.0"
   FFMPEG_VERSION: n8.1.2
   VSHIP_VERSION: v5.1.1
+  VMAF_VERSION: v3.2.0
   RUST_VERSION: 1.98.0
   LINUXDEPLOY_VERSION: 1-alpha-20251107-1
 
@@ -96,7 +97,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang cmake nasm yasm git curl ca-certificates \
-            pkg-config autoconf automake libtool \
+            pkg-config autoconf automake libtool meson ninja-build \
             zlib1g-dev libbz2-dev liblzma-dev \
             libopus-dev libmp3lame-dev libvorbis-dev libdav1d-dev \
             libvulkan-dev \
@@ -181,6 +182,17 @@ jobs:
           sudo install -m755 libvship.so /usr/local/lib/libvship.so
           sudo ldconfig
 
+      - name: Build libvmaf (vmaf tool, for CAMBI)
+        run: |
+          git clone --depth 1 --branch "$VMAF_VERSION" \
+            https://github.com/Netflix/vmaf.git /tmp/vmaf
+          meson setup /tmp/vmaf/libvmaf/build /tmp/vmaf/libvmaf \
+            --buildtype release \
+            -Dbuilt_in_models=false -Denable_float=false \
+            -Denable_tests=false -Denable_docs=false
+          ninja -C /tmp/vmaf/libvmaf/build
+          sudo install -m755 /tmp/vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf
+
       - name: Build avxs
         env:
           PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
@@ -200,6 +212,7 @@ jobs:
           cp /usr/local/bin/ffprobe           "$APPDIR/usr/bin/"
           cp "$(command -v mkvmerge)"         "$APPDIR/usr/bin/"
           cp /usr/local/bin/FFVship           "$APPDIR/usr/bin/"
+          cp /usr/local/bin/vmaf              "$APPDIR/usr/bin/"
 
           cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
           cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
@@ -241,6 +254,7 @@ jobs:
           "$BIN/mkvmerge"         --version             >/dev/null
           "$BIN/SvtAv1EncApp"     --version             >/dev/null
           "$BIN/SvtAv1EncApp-hdr" --version             >/dev/null
+          "$BIN/vmaf"             --version             >/dev/null
           # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
           "$BIN/ffmsindex" 2>&1 | grep -qi usage
           # No GPU here, so "no device" is success and only a loader error is a failure.

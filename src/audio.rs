@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
-use tokio::process::Command;
-use tokio::sync::OnceCell;
+use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::config::{AudioConfig, AudioMode, layout_name, output_is_lossless, toml_value_to_arg};
 use crate::ext::external_bin;
@@ -46,26 +46,22 @@ struct AudioTrack {
 }
 
 /// Audio codec names ffmpeg flags as lossless, queried once from `ffmpeg -codecs`.
-static LOSSLESS_CODECS: OnceCell<HashSet<String>> = OnceCell::const_new();
+static LOSSLESS_CODECS: OnceLock<HashSet<String>> = OnceLock::new();
 
-async fn lossless_codecs() -> &'static HashSet<String> {
-    LOSSLESS_CODECS
-        .get_or_init(|| async {
-            match probe_lossless_codecs().await {
-                Ok(set) => set,
-                Err(e) => {
-                    tracing::warn!("ffmpeg -codecs query failed ({e:#}); using built-in lossless list");
-                    fallback_lossless_codecs()
-                }
-            }
-        })
-        .await
+fn lossless_codecs() -> &'static HashSet<String> {
+    LOSSLESS_CODECS.get_or_init(|| match probe_lossless_codecs() {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::warn!("ffmpeg -codecs query failed ({e:#}); using built-in lossless list");
+            fallback_lossless_codecs()
+        }
+    })
 }
 
-async fn probe_lossless_codecs() -> Result<HashSet<String>> {
+fn probe_lossless_codecs() -> Result<HashSet<String>> {
     let mut cmd = Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-codecs"]);
-    let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -codecs").await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -codecs")?;
     if !out.status.success() {
         bail!("ffmpeg -codecs exited with failure");
     }
@@ -163,14 +159,12 @@ struct FfprobeDispOutput {
     streams: Vec<FfprobeDispStream>,
 }
 
-async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDisposition> {
+fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDisposition> {
     match crate::ext::ffprobe_json::<FfprobeDispOutput>(
         &["-v", "error", "-select_streams", stream_spec,
           "-show_entries", "stream=disposition", "-of", "json"],
         path,
-    )
-    .await
-    {
+    ) {
         Ok(p) => p.streams.into_iter().map(|s| s.disposition).collect(),
         Err(e) => {
             tracing::warn!("ffprobe disposition probe failed for {}: {e:#}", path.display());
@@ -179,14 +173,13 @@ async fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispos
     }
 }
 
-async fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
+fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
     let parsed: FfprobeOutput = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "a",
           "-show_entries", "stream=codec_name,profile,channels:stream_tags=language,title",
           "-of", "json"],
         source_file,
-    )
-    .await?;
+    )?;
 
     Ok(parsed
         .streams
@@ -240,8 +233,8 @@ pub struct AudioPlan {
     tracks: Vec<PlannedTrack>,
 }
 
-pub async fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
-    let tracks = probe_audio_tracks(source_file).await?;
+pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
+    let tracks = probe_audio_tracks(source_file)?;
     if tracks.is_empty() {
         return Ok(AudioPlan { tracks: vec![] });
     }
@@ -259,7 +252,7 @@ pub async fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan>
         return Ok(AudioPlan { tracks: vec![] });
     }
 
-    let lossless_set = lossless_codecs().await;
+    let lossless_set = lossless_codecs();
     let mut planned = Vec::with_capacity(kept.len());
     for track in kept {
         let lossless = is_lossless(&track.codec_name, track.profile.as_deref(), lossless_set);
@@ -270,7 +263,6 @@ pub async fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan>
                 let codec = r.codec.ok_or_else(|| anyhow::anyhow!(
                     "audio track {}: codec is required when mode = encode", track.audio_index
                 ))?;
-                // lossless ignores bitrate
                 let bitrate = if output_is_lossless(codec) {
                     None
                 } else {
@@ -331,7 +323,7 @@ impl AudioPlan {
     }
 }
 
-pub async fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPlan) -> Result<()> {
+pub fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPlan) -> Result<()> {
     if plan.tracks.is_empty() {
         // The muxer only tests whether this file exists.
         let _ = std::fs::remove_file(audio_path);
@@ -381,7 +373,7 @@ pub async fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPla
     cmd.arg(audio_path);
 
     // Transcoding every kept track, so it scales with the runtime of the file.
-    let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg audio extraction").await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg audio extraction")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("ffmpeg audio extraction failed:\n{stderr}");
@@ -390,7 +382,7 @@ pub async fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPla
     Ok(())
 }
 
-pub async fn mux_final(
+pub fn mux_final(
     video_path: &Path,
     audio_path: &Path,
     source_file: &Path,
@@ -404,7 +396,7 @@ pub async fn mux_final(
     let video_disps = if video_path == source_file {
         Vec::new()
     } else {
-        probe_dispositions(source_file, "v").await
+        probe_dispositions(source_file, "v")
     };
 
     let mut cmd = Command::new(external_bin("mkvmerge"));
@@ -433,7 +425,7 @@ pub async fn mux_final(
             if indices.is_empty() {
                 cmd.arg("--no-subtitles");
             } else {
-                let track_ids = crate::subtitle::probe_track_ids(source_file, indices).await?;
+                let track_ids = crate::subtitle::probe_track_ids(source_file, indices)?;
                 if track_ids.is_empty() {
                     cmd.arg("--no-subtitles");
                 } else {
@@ -445,7 +437,7 @@ pub async fn mux_final(
     }
     cmd.arg(source_file);
 
-    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge").await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
     // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
         let stderr = String::from_utf8_lossy(&out.stderr);

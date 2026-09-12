@@ -108,6 +108,7 @@ jobs:
             mkvmerge --version             >/dev/null
             SvtAv1EncApp     --version     >/dev/null
             SvtAv1EncApp-hdr --version     >/dev/null
+            vmaf             --version     >/dev/null
             # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
             # Piping it into head only ever reports on head.
             ffmsindex 2>&1 | grep -qi usage

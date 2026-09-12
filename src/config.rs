@@ -341,6 +341,8 @@ pub struct TargetQualityConfig {
     pub probe_preset: u32,
     /// Encoded size ceiling as a percent of the source over the chunk duration.
     pub max_encoded_percent: f64,
+    pub max_cambi: Option<f64>,
+    pub max_cambi_diff: Option<f64>,
 }
 
 impl Default for TargetQualityConfig {
@@ -354,6 +356,8 @@ impl Default for TargetQualityConfig {
             tolerance: 0.5,
             probe_preset: 13,
             max_encoded_percent: 90.0,
+            max_cambi: None,
+            max_cambi_diff: None,
         }
     }
 }
@@ -429,6 +433,13 @@ impl Config {
                     "target_quality.max_encoded_percent must be a finite value > 0 (got {})",
                     tq.max_encoded_percent
                 );
+            }
+            for (key, limit) in [("max_cambi", tq.max_cambi), ("max_cambi_diff", tq.max_cambi_diff)] {
+                if let Some(c) = limit
+                    && (!c.is_finite() || c < 0.0)
+                {
+                    bail!("target_quality.{key} must be a finite value >= 0 (got {c})");
+                }
             }
         }
         self.scene_detection.validate()?;
@@ -609,6 +620,14 @@ mod tests {
         let tq = c.target_quality.unwrap();
         assert_eq!((tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset), (1, 70, 2, 7, 13));
         assert_eq!((tq.tolerance, tq.max_encoded_percent), (0.5, 90.0));
+        assert_eq!((tq.max_cambi, tq.max_cambi_diff), (None, None));
+
+        let c = Config::from_str_for_test(
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_cambi = 5\nmax_cambi_diff = 1.5",
+        )
+        .unwrap();
+        let tq = c.target_quality.unwrap();
+        assert_eq!((tq.max_cambi, tq.max_cambi_diff), (Some(5.0), Some(1.5)));
     }
 
     #[test]
@@ -623,6 +642,8 @@ mod tests {
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmin_probes = 5\nmax_probes = 3",
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nprobe_preset = 14",
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_encoded_percent = 0",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_cambi = -1",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_cambi_diff = -0.5",
         ];
         for t in bad {
             let c: Config = toml::from_str(t).unwrap();
@@ -690,6 +711,8 @@ mod tests {
         assert!(bad(&format!("{base}max_encoded_percent = nan")).contains("max_encoded_percent"));
         assert!(bad(&format!("{base}max_encoded_percent = inf")).contains("max_encoded_percent"));
         assert!(bad(&format!("{base}tolerance = nan")).contains("tolerance"));
+        assert!(bad(&format!("{base}max_cambi = nan")).contains("max_cambi"));
+        assert!(bad(&format!("{base}max_cambi_diff = inf")).contains("max_cambi_diff"));
     }
 
     #[test]

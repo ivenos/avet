@@ -5,7 +5,7 @@ use crate::ext::external_bin;
 use crate::ffms2::Crop;
 
 /// "crop=W:H:X:Y", or None if there is nothing to cut. Cached in the job's temp dir.
-pub async fn detect(
+pub fn detect(
     source_file: &Path,
     duration_secs: f64,
     cache_path: &Path,
@@ -24,28 +24,29 @@ pub async fn detect(
         return Ok(if cached.is_empty() { None } else { Some(cached) });
     }
 
-    let (orig_w, orig_h) = probe_dimensions(source_file).await?;
+    let (orig_w, orig_h) = probe_dimensions(source_file)?;
 
     tracing::info!("[{stem}] auto-crop: running cropdetect...");
 
-    let source = source_file.to_owned();
-    let handles: Vec<_> = [10u64, 25, 40, 55, 70]
-        .iter()
-        .map(|&pct| {
-            let src = source.clone();
-            let seek = (duration_secs * pct as f64 / 100.0) as u64;
-            tokio::spawn(async move { run_cropdetect(&src, seek).await })
-        })
-        .collect();
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = [10u64, 25, 40, 55, 70]
+            .iter()
+            .map(|&pct| {
+                let seek = (duration_secs * pct as f64 / 100.0) as u64;
+                s.spawn(move || run_cropdetect(source_file, seek))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join()).collect()
+    });
 
     let mut samples: Vec<Crop> = Vec::new();
     let mut failed = 0usize;
-    for handle in handles {
-        match handle.await {
+    for result in results {
+        match result {
             Ok(Ok(Some(c))) => samples.push(c),
             Ok(Ok(None))    => {}
             Ok(Err(e))      => { failed += 1; tracing::warn!("[{stem}] cropdetect sample failed: {e:#}"); }
-            Err(e)          => { failed += 1; tracing::warn!("[{stem}] cropdetect sample panicked: {e}"); }
+            Err(_)          => { failed += 1; tracing::warn!("[{stem}] cropdetect sample panicked"); }
         }
     }
 
@@ -90,7 +91,7 @@ pub async fn detect(
     Ok(result)
 }
 
-async fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
+fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Root { streams: Vec<Stream> }
     #[derive(serde::Deserialize)]
@@ -101,7 +102,6 @@ async fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
           "-show_entries", "stream=width,height", "-of", "json"],
         source_file,
     )
-    .await
     .context("auto-crop: probe source dimensions")?;
 
     root.streams
@@ -113,10 +113,10 @@ async fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
 }
 
 /// The last cropdetect box of one sample, which is its cumulative bounding box.
-async fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
+fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
     const TIMEOUT_SECS: u64 = 300;
 
-    let mut cmd = tokio::process::Command::new(external_bin("ffmpeg"));
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     cmd.args(["-ss", &seek_secs.to_string()])
         .arg("-i").arg(source_file)
         // Same track as probe_dimensions; ffmpeg's own pick is by resolution.
@@ -124,7 +124,7 @@ async fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Cro
         // Below 1.0 ffmpeg scales the limit by the bit depth; round=16 would report
         // 640x352 for a clean 640x360 source.
         .args(["-t", "10", "-vf", "cropdetect=0.094:2:0", "-f", "null", "-"]);
-    let output = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg cropdetect").await?;
+    let output = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg cropdetect")?;
 
     if !output.status.success() {
         bail!(

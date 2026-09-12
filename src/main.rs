@@ -14,12 +14,15 @@ mod target_quality;
 mod workers;
 
 use anyhow::{Context, Result};
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_logging();
 
     let input_dir = env_path("AVXS_INPUT_DIR", "./input");
@@ -40,16 +43,10 @@ async fn main() -> Result<()> {
         output_dir: output_dir.clone(),
     };
 
-    let mut shutdown = shutdown_signal();
+    let shutdown = shutdown_signal();
 
     loop {
-        let in_dir  = input_dir.clone();
-        let out_dir = output_dir.clone();
-        let scan_result = tokio::task::spawn_blocking(move || scanner::scan(&in_dir, &out_dir))
-            .await
-            .context("spawn_blocking scanner")?;
-
-        match scan_result {
+        match scanner::scan(&input_dir, &output_dir) {
             Err(e) => tracing::error!("scanner error: {e:#}"),
             Ok(jobs) if jobs.is_empty() => {
                 tracing::debug!("no jobs - sleeping {poll_interval}s");
@@ -59,10 +56,10 @@ async fn main() -> Result<()> {
                 for j in &jobs {
                     let stem = j.stem();
 
-                    if let Err(e) = job::run(j, &ctx).await {
+                    if let Err(e) = job::run(j, &ctx) {
                         job::handle_failure(j, &ctx, stem, &e);
                     }
-                    if *shutdown.borrow() {
+                    if shutdown.load(Ordering::Relaxed) {
                         tracing::info!("stopping after {stem}");
                         return Ok(());
                     }
@@ -70,46 +67,36 @@ async fn main() -> Result<()> {
             }
         }
 
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(poll_interval)) => {}
-            // Ok only: `changed()` also resolves once the sender is gone.
-            Ok(()) = shutdown.changed() => return Ok(()),
+        for _ in 0..poll_interval {
+            std::thread::sleep(Duration::from_secs(1));
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(());
+            }
         }
     }
 }
 
 /// Ends the scan loop between jobs. Killed instead, the orphaned encoders keep writing
 /// chunk files the restarted instance starts writing too.
-fn shutdown_signal() -> tokio::sync::watch::Receiver<bool> {
-    let (tx, rx) = tokio::sync::watch::channel(false);
+fn shutdown_signal() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
 
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let (Ok(mut term), Ok(mut int)) =
-                (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
-            else {
-                tracing::error!("could not install signal handlers - avxs will keep running on SIGTERM until it is killed");
-                return;
-            };
-            tokio::select! {
-                _ = term.recv() => {}
-                _ = int.recv() => {}
-            }
+    let mut signals = match Signals::new([SIGTERM, SIGINT]) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("could not install signal handlers ({e}) - avxs will keep running on SIGTERM until it is killed");
+            return flag;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+    };
+    let set = Arc::clone(&flag);
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            tracing::info!("signal received - finishing the current job, then stopping");
+            set.store(true, Ordering::Relaxed);
         }
-        tracing::info!("signal received - finishing the current job, then stopping");
-        let _ = tx.send(true);
     });
 
-    rx
+    flag
 }
 
 fn init_logging() {

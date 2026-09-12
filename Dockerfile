@@ -5,6 +5,7 @@ ARG SVT_AV1_VERSION=v4.2.0
 ARG SVT_AV1_HDR_REF=cfb4e17693ae16945a7fe288d45437243d96c12e
 ARG FFMS2_VERSION=5.0
 ARG VSHIP_VERSION=v5.1.1
+ARG VMAF_VERSION=v3.2.0
 ARG RUST_VERSION=1.98.0
 
 FROM alpine:3.24 AS builder
@@ -13,6 +14,7 @@ ARG SVT_AV1_VERSION
 ARG SVT_AV1_HDR_REF
 ARG FFMS2_VERSION
 ARG VSHIP_VERSION
+ARG VMAF_VERSION
 ARG RUST_VERSION
 ARG TARGETARCH
 
@@ -27,6 +29,8 @@ RUN apk add --no-cache \
         autoconf \
         automake \
         libtool \
+        meson \
+        ninja \
         ffmpeg-dev \
         vulkan-headers \
         vulkan-loader-dev \
@@ -83,6 +87,19 @@ RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
     install -m755 libvship.so /usr/local/lib/libvship.so && \
     rm -rf /vship
 
+# Without the VMAF models busybox xxd suffices; v3.2.0's tests break on vcs_version.h.
+RUN git clone --depth 1 --branch ${VMAF_VERSION} \
+        https://github.com/Netflix/vmaf.git /vmaf && \
+    meson setup /vmaf/libvmaf/build /vmaf/libvmaf \
+        --buildtype release \
+        -Dbuilt_in_models=false \
+        -Denable_float=false \
+        -Denable_tests=false \
+        -Denable_docs=false && \
+    ninja -C /vmaf/libvmaf/build && \
+    install -m755 /vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf && \
+    rm -rf /vmaf
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
@@ -120,6 +137,7 @@ COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
 # FFVship + libvship, for target_quality.
 COPY --from=builder /usr/local/bin/FFVship           /usr/local/bin/FFVship
 COPY --from=builder /usr/local/lib/libvship.so       /usr/local/lib/
+COPY --from=builder /usr/local/bin/vmaf              /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
 ENV AVXS_INPUT_DIR=/input

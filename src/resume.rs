@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// Missing or empty reads as the default; the fingerprint would never clear a leftover.
 fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path, what: &str) -> Result<T> {
@@ -87,8 +87,8 @@ impl DoneFile {
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
-    pub async fn is_done(&self, chunk_key: &str, chunk_path: &Path) -> bool {
-        let expected = match self.state.lock().await.chunks.get(chunk_key) {
+    pub fn is_done(&self, chunk_key: &str, chunk_path: &Path) -> bool {
+        let expected = match self.state.lock().unwrap().chunks.get(chunk_key) {
             Some(info) => info.size_bytes,
             None       => return false,
         };
@@ -96,8 +96,8 @@ impl DoneFile {
         matches!(std::fs::metadata(chunk_path), Ok(m) if m.len() == expected && expected > 0)
     }
 
-    pub async fn mark_done(&self, chunk_key: &str, frames: u64, size_bytes: u64) -> Result<()> {
-        let mut state = self.state.lock().await;
+    pub fn mark_done(&self, chunk_key: &str, frames: u64, size_bytes: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
         state.chunks.insert(chunk_key.to_owned(), ChunkInfo { frames, size_bytes });
         write_json_atomic(&self.path, &*state)
     }
@@ -115,12 +115,12 @@ impl CrfCache {
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
-    pub async fn get(&self, chunk_key: &str) -> Option<f64> {
-        self.state.lock().await.get(chunk_key).copied()
+    pub fn get(&self, chunk_key: &str) -> Option<f64> {
+        self.state.lock().unwrap().get(chunk_key).copied()
     }
 
-    pub async fn insert(&self, chunk_key: &str, crf: f64) -> Result<()> {
-        let mut state = self.state.lock().await;
+    pub fn insert(&self, chunk_key: &str, crf: f64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
         state.insert(chunk_key.to_owned(), crf);
         write_json_atomic(&self.path, &*state)
     }

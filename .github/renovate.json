@@ -2,6 +2,7 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "dependencyDashboard": false,
+  "platformAutomerge": false,
   "labels": ["dependencies"],
   "packageRules": [
     {
@@ -10,12 +11,19 @@
       "commitMessagePrefix": "ci:"
     },
     {
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "minimumReleaseAge": "3 days",
+      "automerge": true
+    },
+    {
       "matchManagers": ["dockerfile", "docker-compose"],
       "commitMessagePrefix": "build(docker):"
     },
     {
       "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["patch"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "minimumReleaseAge": "3 days",
       "automerge": true
     },
     {
@@ -63,6 +71,14 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
+      "matchStrings": ["ARG VMAF_VERSION=(?<currentValue>[^\\n]+)"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Netflix/vmaf",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": ["ARG RUST_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "docker",
       "depNameTemplate": "rust",
@@ -98,6 +114,14 @@
       "matchStrings": ["VSHIP_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "git-refs",
       "depNameTemplate": "https://codeberg.org/Line-fr/Vship",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": ["VMAF_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
+      "datasourceTemplate": "github-releases",
+      "depNameTemplate": "Netflix/vmaf",
       "versioningTemplate": "semver"
     },
     {

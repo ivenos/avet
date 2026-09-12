@@ -98,11 +98,10 @@ struct SideData {
     white_point_y: Option<serde_json::Value>,
     min_luminance: Option<serde_json::Value>,
     max_luminance: Option<serde_json::Value>,
-    // Dolby Vision configuration record
     dv_profile: Option<serde_json::Value>,
 }
 
-pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
+pub fn detect(source_file: &Path) -> Result<HdrInfo> {
     let probe: ProbeOutput = crate::ext::ffprobe_json(
         &[
             "-v", "error",
@@ -117,7 +116,6 @@ pub async fn detect(source_file: &Path) -> Result<HdrInfo> {
         ],
         source_file,
     )
-    .await
     // Only called when the profile asks for HDR, so "no metadata" is not an answer here.
     .context("HDR detection")?;
 

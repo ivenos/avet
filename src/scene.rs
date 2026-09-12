@@ -8,26 +8,7 @@ use crate::config::{SceneDetectionConfig, SceneDetectionSpeedConfig};
 use crate::ext::external_bin;
 use crate::resume::SceneEntry;
 
-pub async fn detect(
-    source_file: &Path,
-    cfg: &SceneDetectionConfig,
-    vf_filter: Option<&str>,
-    fps: f64,
-) -> Result<Vec<SceneEntry>> {
-    let source = source_file.to_owned();
-    let cfg = cfg.clone();
-    let vf_filter = vf_filter.map(|s| s.to_owned());
-
-    let result = tokio::task::spawn_blocking(move || {
-        run_detection(&source, &cfg, vf_filter.as_deref(), fps)
-    })
-    .await
-    .context("spawn_blocking scene detection")??;
-
-    Ok(result)
-}
-
-fn run_detection(
+pub fn detect(
     source_file: &Path,
     cfg: &SceneDetectionConfig,
     vf_filter: Option<&str>,
@@ -58,7 +39,6 @@ fn run_detection(
         .context("start ffmpeg for scene detection")?;
 
     let stdout = ffmpeg.stdout.take().expect("ffmpeg stdout unavailable");
-    // Drain stderr on a background thread so its pipe buffer can't block ffmpeg.
     let stderr_handle = {
         let stderr = ffmpeg.stderr.take().expect("ffmpeg stderr unavailable");
         std::thread::spawn(move || {

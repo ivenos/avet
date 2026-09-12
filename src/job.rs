@@ -1,8 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::Semaphore;
 
 use crate::audio;
 use crate::config::{Config, TargetQualityConfig, VideoMode};
@@ -43,60 +42,56 @@ fn is_transient(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Per-job context, cloned as one Arc per chunk task.
-struct WorkerCtx {
-    source: PathBuf,
-    index: PathBuf,
-    temp_dir: PathBuf,
-    config: Arc<Config>,
-    opts: Arc<EncodeOptions>,
-    tq: Option<TargetQualityConfig>,
-    tq_display_model: Option<String>,
+/// Per-job context, shared by every chunk worker.
+struct WorkerCtx<'a> {
+    source: &'a Path,
+    temp: &'a TempDir,
+    config: &'a Config,
+    opts: &'a EncodeOptions,
+    tq_display_model: Option<&'static str>,
     tq_gpu_id: Option<u32>,
     source_width: u32,
     source_height: u32,
-    crf_cache: Option<Arc<CrfCache>>,
+    crf_cache: Option<CrfCache>,
     threads_per_worker: usize,
-    stem: String,
+    stem: &'a str,
     total_chunks: usize,
     total_frames: u64,
     /// Cumulative source byte sizes by frame for the size cap; empty when unused.
-    source_byte_index: Arc<Vec<u64>>,
+    source_byte_index: Vec<u64>,
+    done: DoneFile,
+    completed_chunks: AtomicUsize,
+    completed_frames: AtomicU64,
     /// Set when a chunk fails, so queued workers return instead of starting.
     cancel: AtomicBool,
 }
 
-pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
+pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     // Marking every video in the folder would keep them all skipped after the fix.
-    let config = Arc::new(Config::from_file(&job.encode_toml).context(Transient)?);
+    let config = Config::from_file(&job.encode_toml).context(Transient)?;
 
     let stem = job.stem();
 
-    wait_for_stable(&job.source_file, stem).await?;
+    wait_for_stable(&job.source_file, stem)?;
 
     let temp = TempDir::for_video(&ctx.output_dir, stem);
     temp.claim_source(&job.source_file, stem)?;
 
     if config.avxs.video == VideoMode::Copy {
-        return run_copy(job, ctx, &config, stem, &temp).await;
+        return run_copy(job, ctx, &config, stem, &temp);
     }
 
     if !temp.index_path.exists() {
         tracing::info!("[{stem}] indexing");
-        ffms2::run_ffmsindex(&job.source_file, &temp.index_path).await?;
+        ffms2::run_ffmsindex(&job.source_file, &temp.index_path)?;
         tracing::info!("[{stem}] indexing done");
     } else {
         tracing::info!("[{stem}] reusing existing index");
     }
 
-    let source_path = job.source_file.clone();
-    let index_path  = temp.index_path.clone();
-    let video_info  = tokio::task::spawn_blocking(move || {
-        ffms2::VideoSource::open(&source_path, &index_path, ffms2::OpenOpts::default())
-            .map(|vs| vs.info.clone())
-    })
-    .await
-    .context("spawn_blocking VideoSource")??;
+    let video_info = ffms2::VideoSource::open(&job.source_file, &temp.index_path, ffms2::OpenOpts::default())?
+        .info
+        .clone();
 
     let threads_per_worker = config.encoder_params
         .get("lp")
@@ -109,12 +104,11 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .unwrap_or(6);
     let num_workers = workers::calculate(&video_info, stem, threads_per_worker);
 
-    // FPS resolved before crop/keyint so duration_secs is valid
-    let (fps_num, fps_den) = probe_fps(&job.source_file).await?;
+    let (fps_num, fps_den) = probe_fps(&job.source_file)?;
     let fps = fps_num as f64 / fps_den as f64;
 
     let hdr_args: Vec<String> = if config.avxs.hdr {
-        let hdr = crate::hdr::detect(&job.source_file).await?;
+        let hdr = crate::hdr::detect(&job.source_file)?;
         // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
         if hdr.dv_profile == Some(5) {
             bail!(
@@ -142,7 +136,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let crop_str: Option<String> = if config.avxs.crop {
         let duration_secs = video_info.num_frames as f64 / fps;
-        crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem).await?
+        crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem)?
     } else {
         None
     };
@@ -163,7 +157,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         None
     };
 
-    let encode_opts = Arc::new(EncodeOptions {
+    let encode_opts = EncodeOptions {
         hdr_args,
         keyint: auto_keyint,
         scale: scale_target,
@@ -171,7 +165,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         fps_num,
         fps_den,
         target_bit_depth: config.avxs.bit_depth,
-    });
+    };
 
     let merged_args = encode::merged_encoder_args(&config, &encode_opts);
 
@@ -194,8 +188,7 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             &config.scene_detection,
             scene_vf.as_deref(),
             fps,
-        )
-        .await?;
+        )?;
         crate::resume::write_scenes(&temp.scenes_path, &scenes)?;
         tracing::info!("[{stem}] {} chunks", scenes.len());
         scenes
@@ -249,132 +242,95 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .collect();
     tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
-    let audio_plan = audio::plan(&job.source_file, &config.audio).await?;
+    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
     }
 
     // FFVship compares at source resolution, so the model follows the crop, not the scale.
     let reference_height = encode_opts.crop.map(|c| c.h).unwrap_or(video_info.height);
-    let (tq_display_model, tq_gpu_id, crf_cache): (Option<String>, Option<u32>, Option<Arc<CrfCache>>) =
+    let (tq_display_model, tq_gpu_id, crf_cache): (Option<&'static str>, Option<u32>, Option<CrfCache>) =
         if let Some(tq) = &config.target_quality {
             // A driver upgrade or a GPU in reset clears on its own.
-            let gpu = target_quality::ensure_available().await.context(Transient)?;
+            let gpu = target_quality::ensure_available().context(Transient)?;
             let display_model =
                 target_quality::display_model_for(reference_height, &encode_opts.hdr_args);
             tracing::info!(
                 "[{stem}] target quality: JOD {} floor (display {display_model}, {}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
                 tq.jod, gpu.describe(), tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset, tq.max_encoded_percent
             );
+            if let Some(c) = tq.max_cambi {
+                tracing::info!("[{stem}] target quality: CAMBI at most {c}");
+            }
+            if let Some(c) = tq.max_cambi_diff {
+                tracing::info!("[{stem}] target quality: CAMBI at most {c} above the encoder input");
+            }
             if config.encoder_params.contains_key("crf") {
                 tracing::info!("[{stem}] target quality: crf in encoder_params used only as a probe seed");
             }
-            (Some(display_model.to_string()), Some(gpu.id), Some(Arc::new(CrfCache::load_or_create(&temp.tq_path)?)))
+            (Some(display_model), Some(gpu.id), Some(CrfCache::load_or_create(&temp.tq_path)?))
         } else {
             (None, None, None)
         };
 
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
-    let done               = Arc::new(DoneFile::load_or_create(&temp.done_path)?);
-    let semaphore          = Arc::new(Semaphore::new(num_workers));
-    let completed_chunks   = Arc::new(AtomicUsize::new(0));
-    let completed_frames   = Arc::new(AtomicU64::new(0));
-    let mut set = tokio::task::JoinSet::new();
-
     let source_byte_index = if config.target_quality.is_some() {
-        Arc::new(probe_source_byte_index(&job.source_file, stem).await)
+        probe_source_byte_index(&job.source_file, stem)
     } else {
-        Arc::new(Vec::new())
+        Vec::new()
     };
 
-    let wctx = Arc::new(WorkerCtx {
-        source: job.source_file.clone(),
-        index: temp.index_path.clone(),
-        temp_dir: temp.path.clone(),
-        config: Arc::clone(&config),
-        opts: Arc::clone(&encode_opts),
-        tq: config.target_quality.clone(),
+    let wctx = WorkerCtx {
+        source: &job.source_file,
+        temp: &temp,
+        config: &config,
+        opts: &encode_opts,
         tq_display_model,
         tq_gpu_id,
         source_width: video_info.width,
         source_height: video_info.height,
         crf_cache,
         threads_per_worker,
-        stem: stem.to_owned(),
+        stem,
         total_chunks,
         total_frames,
         source_byte_index,
+        done: DoneFile::load_or_create(&temp.done_path)?,
+        completed_chunks: AtomicUsize::new(0),
+        completed_frames: AtomicU64::new(0),
         cancel: AtomicBool::new(false),
-    });
+    };
 
+    let mut pending = Vec::new();
     for scene in &scenes {
-        let chunk_key  = scene.padded_index();
-        let chunk_path = temp.chunk_path(&chunk_key);
-        let scene      = scene.clone();
-
-        if done.is_done(&chunk_key, &chunk_path).await {
-            completed_chunks.fetch_add(1, Ordering::Relaxed);
-            completed_frames.fetch_add(scene.frame_count(), Ordering::Relaxed);
+        let chunk_key = scene.padded_index();
+        if wctx.done.is_done(&chunk_key, &temp.chunk_path(&chunk_key)) {
+            wctx.completed_chunks.fetch_add(1, Ordering::Relaxed);
+            wctx.completed_frames.fetch_add(scene.frame_count(), Ordering::Relaxed);
             tracing::debug!("[{stem}] chunk {chunk_key} already done");
-            continue;
-        }
-
-        let w                = Arc::clone(&wctx);
-        let sem              = semaphore.clone();
-        let done             = done.clone();
-        let completed_chunks = completed_chunks.clone();
-        let completed_frames = completed_frames.clone();
-
-        set.spawn(async move {
-            let _permit = sem.acquire().await.context("acquire semaphore")?;
-
-            if w.cancel.load(Ordering::Relaxed) {
-                return anyhow::Ok(());
-            }
-
-            let scene_frames = scene.frame_count();
-            let crf_override = resolve_crf(&w, &chunk_key, &scene).await?;
-
-            let overrides  = encode::EncodeOverrides { crf: crf_override, preset: None };
-            let t0         = std::time::Instant::now();
-            let source     = w.source.clone();
-            let index      = w.index.clone();
-            let config     = Arc::clone(&w.config);
-            let opts       = Arc::clone(&w.opts);
-            let size_bytes = tokio::task::spawn_blocking(move || {
-                encode::encode_chunk(source, index, scene, chunk_path, &config, &opts, overrides)
-            })
-            .await
-            .context("spawn_blocking encode_chunk")??;
-
-            let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
-            done.mark_done(&chunk_key, scene_frames, size_bytes).await?;
-
-            let n_chunks = completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
-            let n_frames = completed_frames.fetch_add(scene_frames, Ordering::Relaxed) + scene_frames;
-            let pct      = n_frames * 100 / w.total_frames;
-            tracing::info!(
-                "[{}] chunk {n_chunks}/{} - {pct}% - {enc_fps:.1} fps - {:.1} MB",
-                w.stem, w.total_chunks, size_bytes as f64 / 1_048_576.0
-            );
-
-            anyhow::Ok(())
-        });
-    }
-
-    // Drain, never drop: aborting a JoinSet cannot stop a spawn_blocking closure.
-    let mut first_err: Option<anyhow::Error> = None;
-    while let Some(res) = set.join_next().await {
-        let outcome = res
-            .context("chunk task join")
-            .and_then(|inner| inner);
-        if let Err(e) = outcome {
-            wctx.cancel.store(true, Ordering::Relaxed);
-            first_err.get_or_insert(e);
+        } else {
+            pending.push(scene);
         }
     }
-    if let Some(e) = first_err {
+
+    let queue = Mutex::new(pending.into_iter());
+    let first_err = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..num_workers {
+            s.spawn(|| loop {
+                if wctx.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Some(scene) = queue.lock().unwrap().next() else { break };
+                if let Err(e) = encode_one(&wctx, scene) {
+                    wctx.cancel.store(true, Ordering::Relaxed);
+                    first_err.lock().unwrap().get_or_insert(e);
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
         return Err(e);
     }
 
@@ -383,11 +339,11 @@ pub async fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let video_only  = temp.video_path.clone();
     let chunk_paths: Vec<PathBuf> =
         scenes.iter().map(|s| temp.chunk_path(&s.padded_index())).collect();
-    encode::concat_chunks(&chunk_paths, &video_only, &temp.path).await?;
+    encode::concat_chunks(&chunk_paths, &video_only, &temp.path)?;
 
     tracing::info!("[{stem}] processing audio");
     let video = MuxVideo { path: &video_only, remove: true, expected_frames: Some(total_frames) };
-    finalize(job, ctx, &config, &temp, &audio_plan, video).await
+    finalize(job, ctx, &config, &temp, &audio_plan, video)
 }
 
 struct MuxVideo<'a> {
@@ -400,7 +356,7 @@ struct MuxVideo<'a> {
 }
 
 /// Shared tail of run/run_copy: process audio, mux, validate, archive source, clean up.
-async fn finalize(
+fn finalize(
     job: &Job,
     ctx: &JobContext,
     config: &Config,
@@ -409,10 +365,10 @@ async fn finalize(
     video: MuxVideo<'_>,
 ) -> Result<()> {
     let stem = job.stem();
-    audio::process_plan(&job.source_file, &temp.audio_path, audio_plan).await?;
+    audio::process_plan(&job.source_file, &temp.audio_path, audio_plan)?;
     let audio_path = &temp.audio_path;
 
-    let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles).await?;
+    let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles)?;
 
     let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
     // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
@@ -424,14 +380,14 @@ async fn finalize(
 
     // Into the temp dir first: the next scan reads a half-written output as "already done".
     tracing::info!("[{stem}] muxing to {}", final_output.display());
-    audio::mux_final(video.path, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel).await?;
+    audio::mux_final(video.path, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel)?;
 
     if video.remove {
         let _ = std::fs::remove_file(video.path);
     }
 
     tracing::info!("[{stem}] validating output");
-    encode::validate_output(&temp.mux_path, video.expected_frames).await?;
+    encode::validate_output(&temp.mux_path, video.expected_frames)?;
 
     std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
         format!("move {} to {}", temp.mux_path.display(), final_output.display())
@@ -480,56 +436,62 @@ fn free_path(path: &Path) -> Result<PathBuf> {
     bail!("no free name for {} after 1000 tries", path.display())
 }
 
+fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
+    let chunk_key    = scene.padded_index();
+    let scene_frames = scene.frame_count();
+    let crf_override = resolve_crf(w, &chunk_key, scene)?;
+
+    let overrides  = encode::EncodeOverrides { crf: crf_override, preset: None };
+    let t0         = std::time::Instant::now();
+    let size_bytes = encode::encode_chunk(
+        w.source, &w.temp.index_path, scene, &w.temp.chunk_path(&chunk_key), w.config, w.opts, overrides,
+    )?;
+
+    let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
+    w.done.mark_done(&chunk_key, scene_frames, size_bytes)?;
+
+    let n_chunks = w.completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
+    let n_frames = w.completed_frames.fetch_add(scene_frames, Ordering::Relaxed) + scene_frames;
+    let pct      = n_frames * 100 / w.total_frames;
+    tracing::info!(
+        "[{}] chunk {n_chunks}/{} - {pct}% - {enc_fps:.1} fps - {:.1} MB",
+        w.stem, w.total_chunks, size_bytes as f64 / 1_048_576.0
+    );
+    Ok(())
+}
+
 /// Cached CRF, else probe-and-solve; None when target quality is off.
-async fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
+fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
     let (Some(tq), Some(display_model), Some(gpu_id), Some(cache)) =
-        (&w.tq, &w.tq_display_model, &w.tq_gpu_id, &w.crf_cache) else {
+        (&w.config.target_quality, w.tq_display_model, w.tq_gpu_id, &w.crf_cache) else {
         return Ok(None);
     };
-    if let Some(c) = cache.get(chunk_key).await {
+    if let Some(c) = cache.get(chunk_key) {
         tracing::info!("[{}] chunk {chunk_key} using cached target crf {c}", w.stem);
         return Ok(Some(c));
     }
 
-    let source       = w.source.clone();
-    let index        = w.index.clone();
-    let temp_dir     = w.temp_dir.clone();
-    let config       = Arc::clone(&w.config);
-    let opts         = Arc::clone(&w.opts);
-    let tq            = tq.clone();
-    let display_model = display_model.clone();
-    let gpu_id        = *gpu_id;
-    let source_width  = w.source_width;
-    let source_height = w.source_height;
-    let scene         = scene.clone();
-    let stem          = w.stem.clone();
-    let n_threads     = w.threads_per_worker;
-    let byte_index    = Arc::clone(&w.source_byte_index);
-    let res = tokio::task::spawn_blocking(move || {
-        let ctx = target_quality::ProbeContext {
-            source: &source, index: &index, temp_dir: &temp_dir,
-            config: &config, opts: &opts, tq: &tq,
-            display_model: &display_model, gpu_id, source_width, source_height,
-            n_threads, stem: &stem, source_byte_index: &byte_index,
-        };
-        target_quality::solve_chunk_crf(&ctx, &scene)
-    })
-    .await
-    .context("spawn_blocking solve_chunk_crf")??;
+    let ctx = target_quality::ProbeContext {
+        source: w.source, index: &w.temp.index_path, temp_dir: &w.temp.path,
+        config: w.config, opts: w.opts, tq,
+        display_model, gpu_id, source_width: w.source_width, source_height: w.source_height,
+        n_threads: w.threads_per_worker, stem: w.stem, source_byte_index: &w.source_byte_index,
+    };
+    let res = target_quality::solve_chunk_crf(&ctx, scene)?;
 
-    cache.insert(chunk_key, res.crf).await?;
+    cache.insert(chunk_key, res.crf)?;
     match res.outcome {
         target_quality::SolveOutcome::Met => tracing::info!(
-            "[{}] chunk {chunk_key} target crf {} (JOD {:.3}, {:.0}% size)",
-            w.stem, res.crf, res.jod, res.size_pct
+            "[{}] chunk {chunk_key} target crf {} ({}, {:.0}% size)",
+            w.stem, res.crf, res.scores(), res.size_pct
         ),
         target_quality::SolveOutcome::CapBinding => tracing::warn!(
-            "[{}] chunk {chunk_key} crf {} capped by max_encoded_percent (JOD {:.3} below floor, {:.0}% size)",
-            w.stem, res.crf, res.jod, res.size_pct
+            "[{}] chunk {chunk_key} crf {} capped by max_encoded_percent, floor not held ({}, {:.0}% size)",
+            w.stem, res.crf, res.scores(), res.size_pct
         ),
         target_quality::SolveOutcome::FloorUnreachable => tracing::warn!(
-            "[{}] chunk {chunk_key} JOD floor unreachable, using crf {} (JOD {:.3})",
-            w.stem, res.crf, res.jod
+            "[{}] chunk {chunk_key} floor unreachable, using crf {} ({})",
+            w.stem, res.crf, res.scores()
         ),
     }
     Ok(Some(res.crf))
@@ -557,20 +519,20 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
     }
 }
 
-async fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir) -> Result<()> {
+fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir) -> Result<()> {
     let ignored = ignored_video_opts(&config.avxs);
     if !ignored.is_empty() {
         tracing::warn!("[{stem}] video = copy: ignoring {}", ignored.join(", "));
     }
 
-    let audio_plan = audio::plan(&job.source_file, &config.audio).await?;
+    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
     }
 
     tracing::info!("[{stem}] copy video, processing audio");
     let video = MuxVideo { path: &job.source_file, remove: false, expected_frames: None };
-    finalize(job, ctx, config, temp, &audio_plan, video).await
+    finalize(job, ctx, config, temp, &audio_plan, video)
 }
 
 fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
@@ -683,7 +645,7 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
 
 /// Size and mtime have to hold still for 3 s: NFS caches attributes for `acregmin`,
 /// so a shorter look at the size alone reads the same value twice.
-async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
+fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
     const INTERVAL_SECS: u64 = 3;
 
@@ -697,12 +659,11 @@ async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
         return Err(missing());
     }
 
-    let deadline = tokio::time::Instant::now()
-        + tokio::time::Duration::from_secs(TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
     let mut announced = false;
 
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(INTERVAL_SECS)).await;
+        std::thread::sleep(std::time::Duration::from_secs(INTERVAL_SECS));
         let next = file_state(path);
         // Moved away mid-wait it reads as (0, None) twice, which compares as stable.
         if next.0 == 0 {
@@ -717,7 +678,7 @@ async fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
         }
         state = next;
 
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             return Err(anyhow::Error::new(Transient).context(format!(
                 "still growing after {TIMEOUT_SECS}s: {}",
                 path.display()
@@ -735,7 +696,7 @@ fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
 }
 
 /// Cumulative source bytes by frame; empty on failure, which disables the size cap.
-async fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
+fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
     #[derive(serde::Deserialize)]
     struct Packets { #[serde(default)] packets: Vec<Pkt> }
     #[derive(serde::Deserialize)]
@@ -749,9 +710,7 @@ async fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
           "-show_entries", "packet=size", "-of", "json"],
         source,
         TIMEOUT_SECS,
-    )
-    .await
-    {
+    ) {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!("[{stem}] source packet-size probe failed: {e:#} - size cap disabled");
@@ -769,7 +728,7 @@ async fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
     cum
 }
 
-async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
+fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Probe { streams: Vec<Stream> }
     #[derive(serde::Deserialize)]
@@ -779,8 +738,7 @@ async fn probe_fps(source: &Path) -> Result<(u32, u32)> {
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "stream=avg_frame_rate", "-of", "json"],
         source,
-    )
-    .await?;
+    )?;
     let rate = p.streams.into_iter().next()
         .map(|s| s.avg_frame_rate)
         .context("ffprobe found no video stream")?;
@@ -922,20 +880,20 @@ mod output_param_tests {
         assert_eq!(std::fs::read(&first).unwrap(), b"season 1");
     }
 
-    #[tokio::test]
-    async fn a_source_that_disappears_mid_wait_is_transient() {
+    #[test]
+    fn a_source_that_disappears_mid_wait_is_transient() {
         // The file is fine; a marker would lock it out for good once it came back.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("film.mkv");
         std::fs::write(&path, b"data").unwrap();
 
         let gone = path.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
             std::fs::remove_file(&gone).unwrap();
         });
 
-        let err = wait_for_stable(&path, "film").await.unwrap_err();
+        let err = wait_for_stable(&path, "film").unwrap_err();
         assert!(is_transient(&err), "got: {err:#}");
     }
 

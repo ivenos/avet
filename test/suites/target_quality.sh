@@ -24,4 +24,7 @@ assert_log_contains "found only a software Vulkan device"
 assert_log_contains "llvmpipe"
 assert_file_not_exists "$O/test.mkv"
 
+docker run --rm --entrypoint vmaf "$AVXS_IMAGE" --version >/dev/null 2>&1 || \
+    fail "bundled vmaf does not start"
+
 test_done

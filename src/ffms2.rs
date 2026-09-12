@@ -438,7 +438,7 @@ pub struct VideoSource {
     pub info: VideoInfo,
 }
 
-// FFMS2 is not thread-safe; each worker owns its own VideoSource on a spawn_blocking thread.
+// FFMS2 is not thread-safe; each worker owns its own VideoSource on its own thread.
 unsafe impl Send for VideoSource {}
 
 impl Drop for VideoSource {
@@ -651,16 +651,16 @@ impl VideoSource {
     }
 }
 
-pub async fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
+pub fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
     const TIMEOUT_SECS: u64 = 3600;
 
     // Scratch name: the next run would read a partial file as "reusing existing index".
     let tmp = index_file.with_extension("ffindex.part");
     let _ = std::fs::remove_file(&tmp);
 
-    let mut cmd = tokio::process::Command::new(external_bin("ffmsindex"));
+    let mut cmd = std::process::Command::new(external_bin("ffmsindex"));
     cmd.arg("-f").arg(source_file).arg(&tmp);
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmsindex").await?;
+    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmsindex")?;
 
     if !out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
