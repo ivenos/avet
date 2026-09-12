@@ -12,7 +12,7 @@ env:
   GITHUB_IMAGE: ghcr.io/ivenos/avxs
   DOCKERHUB_IMAGE: ivenos/avxs
   # Kept in lockstep with the Dockerfile and appimage.yml by Renovate.
-  RUST_VERSION: "1.98.0"
+  RUST_VERSION: "1.98.1"
 
 # Jobs that publish opt into more below.
 permissions:
