@@ -14,7 +14,7 @@ encoder = "x264"
 preset = 12
 crf    = 50
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "parse encode.toml"
 
@@ -22,7 +22,7 @@ assert_log_contains    "parse encode.toml"
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf 'this is not valid toml !!!\n' > "$I/p/encode.toml"
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "parse encode.toml"
 
@@ -38,7 +38,7 @@ crf    = 50
 mode    = "encode"
 bitrate = "96k"
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio: codec required when mode = encode"
 
@@ -53,7 +53,7 @@ crf    = 50
 [audio.codec_rules]
 ac3 = { mode = "encode", codec = "aac" }
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio.codec_rules.ac3: bitrate required when mode = encode"
 
@@ -67,7 +67,7 @@ preset       = 12
 crf          = 50
 fast-decode  = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bool param: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bool param: no output"
 assert_log_contains     "fast-decode=1"
 assert_log_not_contains "fast-decode=true"
 
@@ -84,7 +84,7 @@ film-grain-denoise = 0
 tune             = 0
 fast-decode      = 1
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "param types: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "param types: no output"
 assert_log_contains "film-grain=8"
 assert_log_contains "film-grain-denoise=0"
 assert_log_contains "tune=0"
@@ -102,7 +102,7 @@ crf    = 50
 mode  = "encode"
 codec = "aac"
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio: bitrate required when mode = encode"
 
@@ -114,11 +114,11 @@ cat > "$I/p/encode.toml" << 'EOF'
 preset = 12
 crf    = 50
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "encoder is required"
 
-# -- avxs.bit_depth = 12: validation error ------------------------------------
+# -- avet.bit_depth = 12: validation error ------------------------------------
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -126,10 +126,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 bit_depth = 12
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "bit_depth"
 
@@ -141,10 +141,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 bitdepth = 10
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "unknown field"
 
@@ -160,11 +160,11 @@ crf    = 50
 [target_qualtiy]
 jod = 9.5
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "unknown field"
 
-# -- avxs.scale = 0 is rejected instead of becoming a no-op -------------------
+# -- avet.scale = 0 is rejected instead of becoming a no-op -------------------
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -172,15 +172,15 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 scale = 0
 EOF
-run_avxs_timed "$I" "$O" 15 "ERROR"
+run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
-assert_log_contains    "avxs.scale must be at least 64"
+assert_log_contains    "avet.scale must be at least 64"
 
 # -- a transient failure leaves no .failed marker -----------------------------
 # The profile is broken, not the file, so the next scan has to pick it up after the fix.
-assert_dir_not_exists "$O/.avxs_test"
+assert_dir_not_exists "$O/.avet_test"
 
 test_done

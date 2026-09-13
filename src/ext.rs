@@ -7,7 +7,7 @@ use std::process::{Command, Output, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// Resolves an external CLI tool: sibling of the avxs binary first, then PATH.
+/// Resolves an external CLI tool: sibling of the avet binary first, then PATH.
 pub fn external_bin(name: &str) -> OsString {
     let file_name = with_exe_suffix(name);
 

@@ -16,7 +16,7 @@ preset = 12
 [target_quality]
 jod = 9.5
 EOF
-run_avxs_timed "$I" "$O" 90 "requires a GPU"
+run_avet_timed "$I" "$O" 90 "requires a GPU"
 
 # "requires a GPU" alone also covers FFVship failing to start, so a broken bundle would
 # keep this green. This wording needs FFVship to have run and enumerated a device.
@@ -24,7 +24,7 @@ assert_log_contains "found only a software Vulkan device"
 assert_log_contains "llvmpipe"
 assert_file_not_exists "$O/test.mkv"
 
-docker run --rm --entrypoint vmaf "$AVXS_IMAGE" --version >/dev/null 2>&1 || \
+docker run --rm --entrypoint vmaf "$TEST_IMAGE" --version >/dev/null 2>&1 || \
     fail "bundled vmaf does not start"
 
 test_done

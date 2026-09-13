@@ -113,7 +113,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
     find src build.rs -type f -exec touch {} + && \
     cargo build --release --locked && \
-    cp /src/target/release/avxs /avxs
+    cp /src/target/release/avet /avet
 
 FROM alpine:3.24 AS runtime
 
@@ -131,7 +131,7 @@ RUN apk add --no-cache \
 COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
-COPY --from=builder /avxs                             /usr/local/bin/avxs
+COPY --from=builder /avet                             /usr/local/bin/avet
 # Not in Alpine's package manager.
 COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
 # FFVship + libvship, for target_quality.
@@ -140,8 +140,8 @@ COPY --from=builder /usr/local/lib/libvship.so       /usr/local/lib/
 COPY --from=builder /usr/local/bin/vmaf              /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
-ENV AVXS_INPUT_DIR=/input
-ENV AVXS_OUTPUT_DIR=/output
-ENV AVXS_POLL_INTERVAL=60
+ENV INPUT_DIR=/input
+ENV OUTPUT_DIR=/output
+ENV POLL_INTERVAL=60
 
-ENTRYPOINT ["/usr/local/bin/avxs"]
+ENTRYPOINT ["/usr/local/bin/avet"]

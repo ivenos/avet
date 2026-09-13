@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=avxs
+Name=avet
 Comment=AV1 encoding service
-Exec=avxs
-Icon=avxs
+Exec=avet
+Icon=avet
 Categories=AudioVideo;
 Terminal=true

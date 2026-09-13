@@ -242,7 +242,7 @@ pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String>
     args
 }
 
-/// Readable, and holding `expected_frames` when avxs encoded it (None for `video = copy`).
+/// Readable, and holding `expected_frames` when avet encoded it (None for `video = copy`).
 pub fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> {
     const TIMEOUT_SECS: u64 = 300;
 
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn concat_entry_is_absolute_and_escaped() {
         // A relative chunk path would be resolved against the list file's own directory.
-        let line = concat_entry(Path::new("output/.avxs_a/chunks/00001.ivf")).unwrap();
+        let line = concat_entry(Path::new("output/.avet_a/chunks/00001.ivf")).unwrap();
         let path = line.strip_prefix("file ").unwrap();
         assert!(path.starts_with('/'), "not absolute: {line}");
 

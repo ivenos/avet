@@ -140,11 +140,12 @@ pub struct TempDir {
     pub audio_path: PathBuf,
     pub video_path: PathBuf,
     pub mux_path: PathBuf,
+    pub timestamps_path: PathBuf,
 }
 
 impl TempDir {
     pub fn for_video(output_dir: &Path, video_stem: &str) -> Self {
-        let path = output_dir.join(format!(".avxs_{video_stem}"));
+        let path = output_dir.join(format!(".avet_{video_stem}"));
         let index_path       = path.join("frame-index.ffindex");
         let scenes_path      = path.join("scenes.json");
         let done_path        = path.join("done.json");
@@ -157,10 +158,11 @@ impl TempDir {
         let audio_path       = path.join("audio.mkv");
         let video_path       = path.join("video.mkv");
         let mux_path         = path.join("muxed.mkv");
+        let timestamps_path  = path.join("timestamps.txt");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
             fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache,
-            audio_path, video_path, mux_path,
+            audio_path, video_path, mux_path, timestamps_path,
         }
     }
 

@@ -136,7 +136,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "avxs"
+name = "avet"
 version = "0.0.0"
 dependencies = [
  "anyhow",

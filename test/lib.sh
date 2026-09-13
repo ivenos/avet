@@ -2,17 +2,17 @@
 # Shared test library. Source this file from each test case.
 #
 # Provides:
-#   run_avxs        INPUT OUTPUT EXPECTED_FILE [TIMEOUT_S]
-#   run_avxs_timed  INPUT OUTPUT WAIT_S [LOG_PATTERN]
+#   run_avet        INPUT OUTPUT EXPECTED_FILE [TIMEOUT_S]
+#   run_avet_timed  INPUT OUTPUT WAIT_S [LOG_PATTERN]
 #   assert_*        various assertion helpers
 #   test_done       call at end of each test case to exit with correct code
 #
 # Environment:
-#   AVXS_IMAGE      Docker image to use (default: avxs:test)
+#   TEST_IMAGE      Docker image to use (default: avet:test)
 #   FIXTURES_DIR    Path to test fixtures (default: sibling fixtures/ dir)
 #   VERBOSE=1       Print Docker logs on failure
 
-AVXS_IMAGE="${AVXS_IMAGE:-avxs:test}"
+TEST_IMAGE="${TEST_IMAGE:-avet:test}"
 # run.sh generates the fixtures and exports this; a suite run on its own has no source
 # for them, and failing here beats a cascade of "cp: no such file".
 if [ -z "${FIXTURES_DIR:-}" ] || [ ! -d "${FIXTURES_DIR:-}" ]; then
@@ -22,7 +22,7 @@ fi
 
 _FAIL=0
 _ERRORS=""
-AVXS_LOGS=""
+RUN_LOGS=""
 _ESC=$(printf '\033')
 
 # -- Failure tracking --------------------------------------------------------
@@ -35,21 +35,21 @@ fail() {
 
 # -- Docker helpers ----------------------------------------------------------
 
-# Run avxs and wait until EXPECTED_FILE appears (or TIMEOUT_S elapses).
-# Sets AVXS_LOGS with container stdout+stderr.
+# Run avet and wait until EXPECTED_FILE appears (or TIMEOUT_S elapses).
+# Sets RUN_LOGS with container stdout+stderr.
 # Returns 0 if the file appeared, 1 if timed out.
-run_avxs() {
+run_avet() {
     local input="$1" output="$2" expected="$3" timeout="${4:-120}"
-    AVXS_LOGS=""
+    RUN_LOGS=""
 
     local cid
     cid=$(docker run -d \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
-        -e AVXS_POLL_INTERVAL=999999 \
-        -e "RUST_LOG=${AVXS_RUST_LOG:-info}" \
-        "${AVXS_IMAGE}")
+        -e POLL_INTERVAL=999999 \
+        -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        "${TEST_IMAGE}")
 
     local elapsed=0
     while [ "$elapsed" -lt "$timeout" ]; do
@@ -74,29 +74,29 @@ run_avxs() {
         done
     fi
 
-    AVXS_LOGS=$(docker logs "$cid" 2>&1) || true
+    RUN_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
 
     # -s, not -e: every "expected 0 tracks" assertion reads a zero-byte file as a pass.
     [ -s "$expected" ] && return 0 || return 1
 }
 
-# Run avxs for up to WAIT seconds, then stop. With an optional LOG_PATTERN it
+# Run avet for up to WAIT seconds, then stop. With an optional LOG_PATTERN it
 # returns as soon as that pattern appears in the logs (capped at WAIT); without
 # one it waits the full WAIT. Useful for negative tests where no output is expected.
-# Always returns 0; sets AVXS_LOGS.
-run_avxs_timed() {
+# Always returns 0; sets RUN_LOGS.
+run_avet_timed() {
     local input="$1" output="$2" wait="${3:-15}" pattern="${4:-}"
-    AVXS_LOGS=""
+    RUN_LOGS=""
 
     local cid
     cid=$(docker run -d \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
-        -e AVXS_POLL_INTERVAL=999999 \
-        -e "RUST_LOG=${AVXS_RUST_LOG:-info}" \
-        "${AVXS_IMAGE}")
+        -e POLL_INTERVAL=999999 \
+        -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        "${TEST_IMAGE}")
 
     if [ -n "$pattern" ]; then
         local elapsed=0
@@ -110,7 +110,7 @@ run_avxs_timed() {
         sleep "$wait"
     fi
 
-    AVXS_LOGS=$(docker logs "$cid" 2>&1) || true
+    RUN_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 0
 }
@@ -335,12 +335,12 @@ assert_video_frames() {
 }
 
 assert_log_contains() {
-    printf '%s\n' "$AVXS_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" || \
+    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" || \
         fail "log does not contain: $1"
 }
 
 assert_log_not_contains() {
-    printf '%s\n' "$AVXS_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" && \
+    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" && \
         fail "log should NOT contain: $1" || true
 }
 
@@ -352,9 +352,9 @@ test_done() {
         exit 0
     fi
     printf "%s" "$_ERRORS"
-    if [ "${VERBOSE:-0}" = "1" ] && [ -n "$AVXS_LOGS" ]; then
+    if [ "${VERBOSE:-0}" = "1" ] && [ -n "$RUN_LOGS" ]; then
         printf "  [Docker logs]\n"
-        echo "$AVXS_LOGS" | while IFS= read -r line; do
+        echo "$RUN_LOGS" | while IFS= read -r line; do
             printf "  | %s\n" "$line"
         done
     fi

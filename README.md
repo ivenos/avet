@@ -1,12 +1,25 @@
-# avxs
+<div align="center">
 
-[![Docker Image Size](https://img.shields.io/docker/image-size/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
-[![Docker Pulls](https://img.shields.io/docker/pulls/ivenos/avxs)](https://hub.docker.com/r/ivenos/avxs)
-[![License](https://img.shields.io/badge/license-BSL_1.1-orange)](https://github.com/ivenos/avxs/blob/main/LICENSE)
-[![svt-av1](https://img.shields.io/badge/svt--av1-v4.2.0-purple)](https://gitlab.com/AOMediaCodec/SVT-AV1)
-[![svt-av1-hdr](https://img.shields.io/badge/svt--av1--hdr-0033340-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@00333404f455471aaa6ee2c927cac3c93efb76e3 -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/ivenos/avet/main/.github/assets/avet-logo-on-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/ivenos/avet/main/.github/assets/avet-logo-on-light.svg">
+  <img alt="avet" src="https://raw.githubusercontent.com/ivenos/avet/main/.github/assets/avet-logo-auto.svg" width="50%">
+</picture>
 
-avxs is an AV1 encoding service. It watches a folder, splits each video into scenes, encodes them in parallel with SVT-AV1 and writes a finished MKV with audio, subtitles and chapters carried over. It ships as a Docker image and as a Linux AppImage with every tool bundled.
+<a href="https://hub.docker.com/r/ivenos/avet"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/docker/size/ivenos/avet.svg?variant=secondary&amp;mode=dark"><img alt="Docker Image Size" src="https://shieldcn.dev/docker/size/ivenos/avet.svg?variant=secondary&amp;mode=light"></picture></a>
+<a href="https://hub.docker.com/r/ivenos/avet"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/docker/pulls/ivenos/avet.svg?variant=secondary&amp;mode=dark"><img alt="Docker Pulls" src="https://shieldcn.dev/docker/pulls/ivenos/avet.svg?variant=secondary&amp;mode=light"></picture></a>
+<a href="https://github.com/ivenos/avet/blob/main/LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/license-GPL_3.0.svg?variant=secondary&amp;mode=dark"><img alt="License" src="https://shieldcn.dev/badge/license-GPL_3.0.svg?variant=secondary&amp;mode=light"></picture></a>
+<a href="https://gitlab.com/AOMediaCodec/SVT-AV1"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/svt--av1-v4.2.0.svg?variant=secondary&amp;mode=dark"><img alt="svt-av1" src="https://shieldcn.dev/badge/svt--av1-v4.2.0.svg?variant=secondary&amp;mode=light"></picture></a>
+<a href="https://github.com/juliobbv-p/svt-av1-hdr"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/svt--av1--hdr-0033340.svg?variant=secondary&amp;mode=dark"><img alt="svt-av1-hdr" src="https://shieldcn.dev/badge/svt--av1--hdr-0033340.svg?variant=secondary&amp;mode=light"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@00333404f455471aaa6ee2c927cac3c93efb76e3 -->
+
+avet is an AV1 encoding service. It watches a folder, splits each video into scenes, encodes them in parallel with SVT-AV1 and writes a finished MKV with audio, subtitles and chapters carried over. It ships as a Docker image and as a Linux AppImage with every tool bundled.
+
+</div>
+
+---
+
+> [!WARNING]
+> This README describes avet 2.0, which is not released yet. The current release is avxs 1.0.0 with the image `ivenos/avxs:latest`, documented in its [README](https://github.com/ivenos/avet/blob/v1.0.0/README.md).
 
 ## Features
 
@@ -23,8 +36,8 @@ avxs is an AV1 encoding service. It watches a folder, splits each video into sce
 
 ```yaml
 services:
-  avxs:
-    image: ivenos/avxs:latest
+  avet:
+    image: ivenos/avet:latest
     user: "1000:1000"
     volumes:
       - ./input:/input
@@ -43,7 +56,7 @@ The arm64 image has no hardware Vulkan driver.
 
 ### AppImage
 
-Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avxs/releases/latest) and run it. It watches `input/` and `output/` in the working directory.
+Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory.
 
 ## Usage
 
@@ -56,28 +69,33 @@ input/
 │   └── The Movie (2021).mkv
 ├── anime/
 │   ├── encode.toml
-│   └── Episode 01.mkv
+│   └── The Show/
+│       └── Season 1/
+│           └── Episode 01.mkv
 └── processed/               # sources move here once encoded
 
 output/
 ├── The Movie (2021).mkv
-└── Episode 01.mkv
+└── The Show/
+    └── Season 1/
+        └── Episode 01.mkv
 ```
 
 - Supported extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. Only the first video track is encoded.
 - A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
-- Output files are named after the source, so two queued files with the same name wait until one is renamed.
-- Work in progress lives in `output/.avxs_<name>/`. Delete that folder to encode a file from scratch.
+- Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
+- Output files are named after the source, so two queued files with the same name in the same folder wait until one is renamed.
+- Work in progress lives in `.avet_<name>/` next to the output file. Delete that folder to encode a file from scratch.
 - A failure that can clear on its own, such as a typo in the profile, a timeout or a full disk, is retried on the next scan. Any other failure writes a `.failed` file into that folder, and the video is skipped until you delete it.
-- On `SIGTERM` or `SIGINT` avxs finishes the current file, then exits.
+- On `SIGTERM` or `SIGINT` avet finishes the current file, then exits.
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `AVXS_INPUT_DIR` | `./input`, `/input` in the image | Input directory |
-| `AVXS_OUTPUT_DIR` | `./output`, `/output` in the image | Output directory |
-| `AVXS_POLL_INTERVAL` | `60` | Seconds between scans |
+| `INPUT_DIR` | `./input`, `/input` in the image | Input directory |
+| `OUTPUT_DIR` | `./output`, `/output` in the image | Output directory |
+| `POLL_INTERVAL` | `60` | Seconds between scans |
 | `RUST_LOG` | `info` | Log level, e.g. `debug` |
 
 ## Configuration
@@ -91,7 +109,7 @@ encoder = "svt-av1"
 preset = 6
 crf    = 28
 
-[avxs]
+[avet]
 hdr       = true
 crop      = true
 keyint    = true
@@ -114,15 +132,15 @@ language_whitelist = ["eng", "jpn"]
 
 ### `encoder`
 
-`svt-av1` or `svt-av1-hdr`. Not needed with `avxs.video = "copy"`.
+`svt-av1` or `svt-av1-hdr`. Not needed with `avet.video = "copy"`.
 
 ### `[encoder_params]`
 
-Passed to the encoder as `--key value`; booleans become `1`/`0`. avxs reads two of them itself: `lp` (default `6`) together with free RAM sets how many chunks encode at once, and `crf` is the first probe when `[target_quality]` is set.
+Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: `lp` (default `6`) together with free RAM sets how many chunks encode at once, and `crf` is the first probe when `[target_quality]` is set.
 
 ### `[target_quality]`
 
-Replaces the fixed `crf`: avxs probes each chunk at a few CRF values and encodes at the highest one that still holds `jod`. CVVDP scores in JOD from 0 to 10, where 10 means no visible difference from the source.
+Replaces the fixed `crf`: avet probes each chunk at a few CRF values and encodes at the highest one that still holds `jod`. CVVDP scores in JOD from 0 to 10, where 10 means no visible difference from the source.
 
 ```toml
 [target_quality]
@@ -136,17 +154,17 @@ jod = 9.5
 | `max_crf` | `70` | Highest CRF to try (max `70`) |
 | `min_probes` | `2` | Probes before `tolerance` may stop the search |
 | `max_probes` | `7` | Maximum probes per chunk |
-| `tolerance` | `0.5` | Stop once a probe is at most this far above `jod` |
+| `tolerance` | `0.05` | Stop once a probe is at most this far above `jod` |
 | `probe_preset` | `13` | Encoder preset for probes |
 | `max_encoded_percent` | `90` | Maximum chunk size as a percent of the source's bytes for that chunk |
 | `max_cambi` | - | Maximum CAMBI of the encode, `>= 0` |
 | `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, `>= 0` |
 
 - `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged.
-- CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not.
+- CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both apply to the worst 5% of a chunk's frames and are measured without film grain.
 - If no probe holds every limit, the chunk uses the lowest CRF under `max_encoded_percent`.
 
-### `[avxs]`
+### `[avet]`
 
 | Key | Default | Description |
 |---|---|---|
@@ -156,7 +174,7 @@ jod = 9.5
 | `keyint` | `false` | Keyframe every ~5 s from the frame rate, unless `keyint` is in `[encoder_params]` |
 | `scale` | - | Maximum output height, at least `64`. Taller sources are scaled down with Lanczos |
 | `bit_depth` | - | Encoder input bit depth, `8` or `10`. Unset keeps the source depth, capped at 10 |
-| `keep_temp` | `false` | Keep `output/.avxs_<name>/` after a finished encode |
+| `keep_temp` | `false` | Keep `.avet_<name>/` after a finished encode |
 
 ### `[audio]`
 

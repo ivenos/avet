@@ -90,7 +90,7 @@ jobs:
           case "$VERSION" in
             *[!A-Za-z0-9._-]*|"") echo "::error::refusing unusual version name"; exit 1 ;;
           esac
-          echo "AVXS_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "APP_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install build dependencies
         run: |
@@ -193,7 +193,7 @@ jobs:
           ninja -C /tmp/vmaf/libvmaf/build
           sudo install -m755 /tmp/vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf
 
-      - name: Build avxs
+      - name: Build avet
         env:
           PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
         run: cargo build --release --locked
@@ -204,7 +204,7 @@ jobs:
           APPDIR="$PWD/AppDir"
           mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
 
-          cp target/release/avxs              "$APPDIR/usr/bin/"
+          cp target/release/avet              "$APPDIR/usr/bin/"
           cp /usr/local/bin/SvtAv1EncApp      "$APPDIR/usr/bin/"
           cp /usr/local/bin/SvtAv1EncApp-hdr  "$APPDIR/usr/bin/"
           cp /usr/local/bin/ffmsindex         "$APPDIR/usr/bin/"
@@ -218,35 +218,35 @@ jobs:
           cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
 
       - name: Build AppImage
-        # A release tag, not "continuous": the same avxs tag has to keep producing the
+        # A release tag, not "continuous": the same avet tag has to keep producing the
         # same artefact.
         run: |
           set -eux
           curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-${{ matrix.arch }}.AppImage"
           chmod +x "linuxdeploy-${{ matrix.arch }}.AppImage"
 
-          OUTPUT="avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" \
+          OUTPUT="avet-${APP_VERSION}-${{ matrix.arch }}.AppImage" \
           "./linuxdeploy-${{ matrix.arch }}.AppImage" \
             --appdir AppDir \
-            --desktop-file packaging/appimage/avxs.desktop \
-            --icon-file packaging/appimage/avxs.svg \
+            --desktop-file packaging/appimage/avet.desktop \
+            --icon-file packaging/appimage/avet.svg \
             --output appimage
 
       - name: Smoke test
         run: |
           set +e
           mkdir -p /tmp/smoke && cd /tmp/smoke
-          timeout 10 "$GITHUB_WORKSPACE/avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
+          timeout 10 "$GITHUB_WORKSPACE/avet-${APP_VERSION}-${{ matrix.arch }}.AppImage" 2>&1 | tee smoke.log
           set -e
-          grep -q "avxs started" smoke.log
+          grep -q "avet started" smoke.log
 
-      # avxs logs "avxs started" before touching a tool, so the smoke test above passes
+      # avet logs "avet started" before touching a tool, so the smoke test above passes
       # on an AppImage with nothing bundled.
       - name: Every bundled tool starts
         run: |
           set -eux
           cd /tmp
-          "$GITHUB_WORKSPACE/avxs-${AVXS_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract >/dev/null
+          "$GITHUB_WORKSPACE/avet-${APP_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract >/dev/null
           BIN="/tmp/squashfs-root/usr/bin"
 
           "$BIN/ffmpeg"           -hide_banner -version >/dev/null
@@ -269,13 +269,13 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
-          name: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
-          path: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
+          name: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
+          path: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
           if-no-files-found: error
 
       - name: Attach to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
-          files: avxs-${{ env.AVXS_VERSION }}-${{ matrix.arch }}.AppImage
+          files: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
           fail_on_unmatched_files: true

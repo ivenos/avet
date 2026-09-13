@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to avxs. Please fill in the sections below. -->
+<!-- Thanks for contributing to avet. Please fill in the sections below. -->
 
 ## Summary
 

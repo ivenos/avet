@@ -16,7 +16,7 @@ crf    = 50
 [subtitles]
 mode = "copy"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "copy: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "copy: no output"
 assert_subtitle_track_count "$O/test.mkv" 2
 
 # -- strip: no subtitle tracks in output ---------------------------------------
@@ -30,7 +30,7 @@ crf    = 50
 [subtitles]
 mode = "strip"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "strip: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "strip: no output"
 assert_subtitle_track_count "$O/test.mkv" 0
 
 # -- language_whitelist: only matching track kept ------------------------------
@@ -44,14 +44,14 @@ crf    = 50
 [subtitles]
 language_whitelist = ["deu"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
 assert_subtitle_track_count "$O/test.mkv" 1
 # Counting alone would pass with the English track kept. mkvmerge writes the
 # bibliographic form, so "deu" comes back out as "ger".
 assert_subtitle_language    "$O/test.mkv" 0 ger
 
 # -- whitelist written in the other ISO 639-2 spelling still matches ----------
-# The everyday case: feeding an avxs output back into the profile that produced it.
+# The everyday case: feeding an avet output back into the profile that produced it.
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
 ffmpeg -y -hide_banner -loglevel error -i "$FIXTURES_DIR/sdr_subtitles.mkv" \
     -map 0 -c copy -metadata:s:s:1 language=ger "$I/p/test.mkv" \
@@ -64,7 +64,7 @@ crf    = 50
 [subtitles]
 language_whitelist = ["deu"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "iso alias: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "iso alias: no output"
 assert_subtitle_track_count "$O/test.mkv" 1
 
 # -- source without subtitles + copy: 0 tracks, no error ----------------------
@@ -78,7 +78,7 @@ crf    = 50
 [subtitles]
 mode = "copy"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "no-sub source: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "no-sub source: no output"
 assert_subtitle_track_count "$O/test.mkv" 0
 
 # -- whitelist with no matching language: 0 subtitle tracks -------------------
@@ -92,7 +92,7 @@ crf    = 50
 [subtitles]
 language_whitelist = ["fra"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "sub whitelist no match: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "sub whitelist no match: no output"
 assert_subtitle_track_count "$O/test.mkv" 0
 
 # -- default (no [subtitles] section): all subtitle tracks preserved -----------
@@ -104,7 +104,7 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "sub default: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "sub default: no output"
 assert_subtitle_track_count "$O/test.mkv" 2
 
 test_done

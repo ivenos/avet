@@ -8,7 +8,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
 # -- no encode.toml: profile silently skipped ----------------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-run_avxs_timed "$I" "$O" 15
+run_avet_timed "$I" "$O" 15
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$I/p/test.mkv"
 assert_log_not_contains "ERROR"
@@ -24,7 +24,7 @@ crf    = 50
 EOF
 printf "sentinel" > "$O/test.mkv"
 SENTINEL_SIZE=$(wc -c < "$O/test.mkv")
-AVXS_RUST_LOG=debug run_avxs_timed "$I" "$O" 15 "skip: output exists"
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 15 "skip: output exists"
 CURRENT_SIZE=$(wc -c < "$O/test.mkv" 2>/dev/null || echo 0)
 [ "$CURRENT_SIZE" = "$SENTINEL_SIZE" ] || fail "existing output was overwritten"
 assert_file_exists     "$I/p/test.mkv"
@@ -40,10 +40,10 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs_timed "$I" "$O" 15
+run_avet_timed "$I" "$O" 15
 assert_file_not_exists "$O/test.mkv"
 
-# -- AVXS_POLL_INTERVAL env var is logged at startup --------------------------
+# -- POLL_INTERVAL env var is logged at startup -------------------------------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -52,20 +52,20 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-AVXS_LOGS=""
+RUN_LOGS=""
 CID=$(docker run -d \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \
-    -e AVXS_POLL_INTERVAL=42 \
+    -e POLL_INTERVAL=42 \
     -e RUST_LOG=info \
-    "${AVXS_IMAGE:-avxs:test}")
+    "${TEST_IMAGE:-avet:test}")
 ELAPSED=0
 while [ "$ELAPSED" -lt 120 ]; do
     [ -f "$O/test.mkv" ] && break
     sleep 1; ELAPSED=$((ELAPSED + 1))
 done
-AVXS_LOGS=$(docker logs "$CID" 2>&1) || true
+RUN_LOGS=$(docker logs "$CID" 2>&1) || true
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "poll_s=42"
 
@@ -79,23 +79,23 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/b.mkv" 240 || fail "extensions: no output"
+run_avet "$I" "$O" "$O/b.mkv" 240 || fail "extensions: no output"
 assert_file_nonempty "$O/a.mkv"
 assert_file_nonempty "$O/b.mkv"
 assert_file_exists   "$I/processed/a.mp4"
 assert_file_exists   "$I/processed/b.webm"
 
-# -- invalid AVXS_POLL_INTERVAL: warning logged, default used -----------------
+# -- invalid POLL_INTERVAL: warning logged, default used ----------------------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I" "$O"
 CID=$(docker run -d \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \
-    -e AVXS_POLL_INTERVAL=notanumber \
+    -e POLL_INTERVAL=notanumber \
     -e RUST_LOG=warn \
-    "${AVXS_IMAGE:-avxs:test}")
+    "${TEST_IMAGE:-avet:test}")
 sleep 5
-AVXS_LOGS=$(docker logs "$CID" 2>&1) || true
+RUN_LOGS=$(docker logs "$CID" 2>&1) || true
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "invalid value"
 
@@ -112,7 +112,7 @@ preset = 12
 crf    = 50
 EOF
 done
-run_avxs_timed "$I" "$O" 20 "share this name"
+run_avet_timed "$I" "$O" 20 "share this name"
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$I/a/test.mkv"
 assert_file_exists     "$I/b/test.mkv"
@@ -128,7 +128,7 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs_timed "$I" "$O" 20 "share this name"
+run_avet_timed "$I" "$O" 20 "share this name"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "share this name"
 

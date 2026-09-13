@@ -10,7 +10,7 @@ pub struct Config {
     #[serde(default)]
     pub encoder_params: HashMap<String, toml::Value>,
     #[serde(default)]
-    pub avxs: AvxsConfig,
+    pub avet: AvetConfig,
     #[serde(default)]
     pub audio: AudioConfig,
     #[serde(default)]
@@ -38,7 +38,7 @@ pub enum VideoMode {
 
 #[derive(Debug, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct AvxsConfig {
+pub struct AvetConfig {
     #[serde(default)]
     pub video: VideoMode,
     #[serde(default)]
@@ -300,7 +300,7 @@ impl SceneDetectionConfig {
             );
         }
         if let Some(h) = self.downscale_height {
-            // A zero edge reads as "keep the input size" to ffmpeg, same as avxs.scale.
+            // A zero edge reads as "keep the input size" to ffmpeg, same as avet.scale.
             if h < 64 {
                 bail!(
                     "scene_detection.downscale_height must be at least 64 (got {h}); \
@@ -353,7 +353,7 @@ impl Default for TargetQualityConfig {
             max_crf: 70,
             min_probes: 2,
             max_probes: 7,
-            tolerance: 0.5,
+            tolerance: 0.05,
             probe_preset: 13,
             max_encoded_percent: 90.0,
             max_cambi: None,
@@ -381,23 +381,23 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.avxs.video != VideoMode::Copy && self.encoder.is_none() {
-            bail!("encoder is required unless avxs.video = \"copy\"");
+        if self.avet.video != VideoMode::Copy && self.encoder.is_none() {
+            bail!("encoder is required unless avet.video = \"copy\"");
         }
-        if let Some(d) = self.avxs.bit_depth
+        if let Some(d) = self.avet.bit_depth
             && d != 8 && d != 10
         {
-            bail!("avxs.bit_depth must be 8 or 10 (got {d})");
+            bail!("avet.bit_depth must be 8 or 10 (got {d})");
         }
         // A zero edge reads as "keep the input size" to ffmpeg.
-        if let Some(h) = self.avxs.scale
+        if let Some(h) = self.avet.scale
             && h < 64
         {
-            bail!("avxs.scale must be at least 64 (got {h}); remove it to disable scaling");
+            bail!("avet.scale must be at least 64 (got {h}); remove it to disable scaling");
         }
         if let Some(tq) = &self.target_quality {
-            if self.avxs.video == VideoMode::Copy {
-                bail!("target_quality requires avxs.video = \"encode\"");
+            if self.avet.video == VideoMode::Copy {
+                bail!("target_quality requires avet.video = \"encode\"");
             }
             if tq.jod == 0.0 {
                 bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
@@ -506,7 +506,7 @@ mod tests {
     fn cfg_with_bit_depth(d: Option<u8>) -> Config {
         Config {
             encoder: Some(Encoder::SvtAv1),
-            avxs: AvxsConfig { bit_depth: d, ..Default::default() },
+            avet: AvetConfig { bit_depth: d, ..Default::default() },
             ..Default::default()
         }
     }
@@ -536,9 +536,9 @@ mod tests {
     #[test]
     fn video_mode_defaults_to_encode() {
         let c: Config = toml::from_str(r#"encoder = "svt-av1""#).unwrap();
-        assert_eq!(c.avxs.video, VideoMode::Encode);
-        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"").unwrap();
-        assert_eq!(c.avxs.video, VideoMode::Copy);
+        assert_eq!(c.avet.video, VideoMode::Encode);
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avet]\nvideo = \"copy\"").unwrap();
+        assert_eq!(c.avet.video, VideoMode::Copy);
     }
 
     #[test]
@@ -619,7 +619,7 @@ mod tests {
         c.validate().unwrap();
         let tq = c.target_quality.unwrap();
         assert_eq!((tq.min_crf, tq.max_crf, tq.min_probes, tq.max_probes, tq.probe_preset), (1, 70, 2, 7, 13));
-        assert_eq!((tq.tolerance, tq.max_encoded_percent), (0.5, 90.0));
+        assert_eq!((tq.tolerance, tq.max_encoded_percent), (0.05, 90.0));
         assert_eq!((tq.max_cambi, tq.max_cambi_diff), (None, None));
 
         let c = Config::from_str_for_test(
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn target_quality_requires_encode_video() {
         let c: Config = toml::from_str(
-            "encoder = \"svt-av1\"\n[avxs]\nvideo = \"copy\"\n[target_quality]\njod = 9.5",
+            "encoder = \"svt-av1\"\n[avet]\nvideo = \"copy\"\n[target_quality]\njod = 9.5",
         )
         .unwrap();
         assert!(c.validate().is_err());
@@ -745,12 +745,12 @@ mod tests {
     fn scale_below_the_minimum_is_rejected() {
         for bad in [0u32, 1, 63] {
             let c: Config = toml::from_str(&format!(
-                "encoder = \"svt-av1\"\n[avxs]\nscale = {bad}\n"
+                "encoder = \"svt-av1\"\n[avet]\nscale = {bad}\n"
             ))
             .unwrap();
             assert!(c.validate().is_err(), "scale = {bad} should be rejected");
         }
-        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avxs]\nscale = 720\n").unwrap();
+        let c: Config = toml::from_str("encoder = \"svt-av1\"\n[avet]\nscale = 720\n").unwrap();
         assert!(c.validate().is_ok());
     }
 
@@ -758,7 +758,7 @@ mod tests {
     fn unknown_keys_are_rejected_rather_than_ignored() {
         // A misspelled section used to parse as "feature not configured".
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_qualtiy]\njod = 9.5\n").is_err());
-        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avxs]\nbitdepth = 10\n").is_err());
+        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avet]\nbitdepth = 10\n").is_err());
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_quality]\nmax_probe = 2\n").is_err());
     }
 

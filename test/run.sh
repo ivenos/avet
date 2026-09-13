@@ -1,5 +1,5 @@
 #!/bin/sh
-# avxs integration test suite - single entry point.
+# avet integration test suite - single entry point.
 #
 # Builds the Docker image, generates fixtures in a temp dir, runs all test
 # cases. The fixtures directory is automatically removed on exit.
@@ -11,7 +11,7 @@
 #   ./test/run.sh audio              filter: only tests matching "audio"
 #
 # Environment:
-#   AVXS_IMAGE       Docker image tag (default: avxs:test)
+#   TEST_IMAGE       Docker image tag (default: avet:test)
 
 set -u
 
@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CASES_DIR="$SCRIPT_DIR/suites"
 
-export AVXS_IMAGE="${AVXS_IMAGE:-avxs:test}"
+export TEST_IMAGE="${TEST_IMAGE:-avet:test}"
 export VERBOSE=0
 
 NO_BUILD=0
@@ -47,10 +47,10 @@ NC='\033[0m'
 # -- 1. Build image ------------------------------------------------------------
 
 if [ "$NO_BUILD" -eq 0 ]; then
-    printf "=== Building %s ===\n" "$AVXS_IMAGE"
-    docker build -t "$AVXS_IMAGE" "$ROOT_DIR" || exit 1
-elif ! docker image inspect "$AVXS_IMAGE" >/dev/null 2>&1; then
-    printf "${RED}ERROR:${NC} image %s not found (drop --no-build or build manually)\n" "$AVXS_IMAGE"
+    printf "=== Building %s ===\n" "$TEST_IMAGE"
+    docker build -t "$TEST_IMAGE" "$ROOT_DIR" || exit 1
+elif ! docker image inspect "$TEST_IMAGE" >/dev/null 2>&1; then
+    printf "${RED}ERROR:${NC} image %s not found (drop --no-build or build manually)\n" "$TEST_IMAGE"
     exit 1
 fi
 
@@ -66,7 +66,7 @@ docker run --rm -i \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     --entrypoint sh \
-    "$AVXS_IMAGE" << 'GEN'
+    "$TEST_IMAGE" << 'GEN'
 set -e
 cd /out
 FF="ffmpeg -y -hide_banner -loglevel error"
@@ -158,6 +158,14 @@ $FF -f lavfi -i "testsrc2=size=640x360:rate=24" \
     -c:a aac -b:a 96k \
     sdr_long.mkv
 
+echo "  sdr_vfr.mkv"
+$FF -f lavfi -i "testsrc2=size=320x240:rate=60" \
+    -f lavfi -i "sine=frequency=440:sample_rate=48000" \
+    -t 4 -vf "select='gte(t\,2)+not(mod(n\,2))'" -fps_mode vfr \
+    -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+    -c:a aac -b:a 96k \
+    sdr_vfr.mkv
+
 echo "  hdr10.mkv"
 $FF -f lavfi -i "color=c=gray:size=1280x720:rate=24" \
     -t 10 \
@@ -183,7 +191,7 @@ fi
 
 PASS=0; FAIL=0; SKIP=0
 
-printf "\n=== avxs Integration Test Suite ===\n\n"
+printf "\n=== avet Integration Test Suite ===\n\n"
 
 for case_script in "$CASES_DIR"/*.sh; do
     [ -f "$case_script" ] || continue

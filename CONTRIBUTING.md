@@ -9,12 +9,12 @@ sudo apt-get install -y libffms2-dev nasm
 cargo build
 ```
 
-Running avxs outside the image also needs `ffmpeg`, `ffprobe`, `mkvmerge`,
+Running avet outside the image also needs `ffmpeg`, `ffprobe`, `mkvmerge`,
 `ffmsindex`, `FFVship`, `vmaf` and `SvtAv1EncApp` on `PATH`. The Docker image
 bundles all of them:
 
 ```bash
-docker build -t avxs:test .
+docker build -t avet:test .
 ```
 
 ## Tests
@@ -46,7 +46,7 @@ change. `test/local/` is gitignored for trying the image on your own samples.
 
 ## External tools
 
-`ext::external_bin` looks for a tool next to the avxs binary first, then on
+`ext::external_bin` looks for a tool next to the avet binary first, then on
 `PATH`. A new tool needs the call site, the runtime stage of the `Dockerfile`
 and the AppDir step in `.github/workflows/appimage.yml`.
 

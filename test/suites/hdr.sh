@@ -13,10 +13,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 hdr = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "HDR10: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10: no output"
 assert_log_contains    "HDR: HDR10"
 assert_color_transfer  "$O/test.mkv" "smpte2084"
 assert_color_primaries "$O/test.mkv" "bt2020"
@@ -30,10 +30,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 hdr = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "HLG: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HLG: no output"
 assert_log_contains    "HDR: HLG"
 assert_color_transfer  "$O/test.mkv" "arib-std-b67"
 assert_color_primaries "$O/test.mkv" "bt2020"
@@ -47,7 +47,7 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "hdr=false: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "hdr=false: no output"
 assert_log_not_contains "HDR:"
 assert_log_not_contains "color-primaries"
 
@@ -59,10 +59,10 @@ encoder = "svt-av1-hdr"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 hdr = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "svt-av1-hdr: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "svt-av1-hdr: no output"
 assert_file_nonempty    "$O/test.mkv"
 assert_log_contains     "HDR: HDR10"
 
@@ -74,10 +74,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 hdr = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "SDR+hdr: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "SDR+hdr: no output"
 assert_log_contains  "HDR: SDR"
 assert_file_nonempty "$O/test.mkv"
 

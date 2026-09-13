@@ -35,6 +35,25 @@ pub struct FFMS_Index {
 }
 
 #[repr(C)]
+pub struct FFMS_Track {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct FFMS_TrackTimeBase {
+    pub num: i64,
+    pub den: i64,
+}
+
+#[repr(C)]
+pub struct FFMS_FrameInfo {
+    pub pts: i64,
+    pub repeat_pict: c_int,
+    pub key_frame: c_int,
+    pub original_pts: i64,
+}
+
+#[repr(C)]
 pub struct FFMS_Frame {
     pub data: [*const u8; 4],
     pub linesize: [c_int; 4],
@@ -142,6 +161,10 @@ unsafe extern "C" {
         n: c_int,
         error_info: *mut RawErrorInfo,
     ) -> *const FFMS_Frame;
+    fn FFMS_GetTrackFromVideo(v: *mut FFMS_VideoSource) -> *mut FFMS_Track;
+    fn FFMS_GetNumFrames(t: *mut FFMS_Track) -> c_int;
+    fn FFMS_GetFrameInfo(t: *mut FFMS_Track, frame: c_int) -> *const FFMS_FrameInfo;
+    fn FFMS_GetTimeBase(t: *mut FFMS_Track) -> *const FFMS_TrackTimeBase;
 }
 
 struct ErrorInfo {
@@ -551,6 +574,24 @@ impl VideoSource {
         };
 
         Ok(VideoSource { ptr, info })
+    }
+
+    /// Milliseconds per frame, indexed like `FFMS_GetFrame`.
+    pub fn timestamps_ms(&self) -> Result<Vec<f64>> {
+        let track = unsafe { FFMS_GetTrackFromVideo(self.ptr) };
+        if track.is_null() {
+            bail!("FFMS_GetTrackFromVideo returned no track");
+        }
+        let tb = unsafe { &*FFMS_GetTimeBase(track) };
+        (0..unsafe { FFMS_GetNumFrames(track) })
+            .map(|n| {
+                let info = unsafe { FFMS_GetFrameInfo(track, n) };
+                if info.is_null() {
+                    bail!("FFMS_GetFrameInfo({n}) returned nothing");
+                }
+                Ok(unsafe { (*info).pts } as f64 * tb.num as f64 / tb.den as f64)
+            })
+            .collect()
     }
 
     /// div_ceil: a Y4M reader takes ceil(w/2) x ceil(h/2) from the header.

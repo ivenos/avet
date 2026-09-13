@@ -9,6 +9,7 @@ use crate::resume::TempDir;
 pub struct Job {
     pub encode_toml: PathBuf,
     pub source_file: PathBuf,
+    pub rel_dir: PathBuf,
 }
 
 impl Job {
@@ -18,6 +19,10 @@ impl Job {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("video")
+    }
+
+    pub fn output_dir(&self, output_root: &Path) -> PathBuf {
+        output_root.join(&self.rel_dir)
     }
 }
 
@@ -40,66 +45,83 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
             continue;
         }
 
-        for source_file in find_video_files(&profile_dir)? {
-            if output_exists(output_dir, &source_file) {
-                tracing::debug!(file = %source_file.display(), "skip: output exists");
+        for (source_file, rel_dir) in find_video_files(&profile_dir)? {
+            let job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir };
+            let job_output = job.output_dir(output_dir);
+            if output_exists(&job_output, &job.source_file) {
+                tracing::debug!(file = %job.source_file.display(), "skip: output exists");
                 continue;
             }
-            if let Some(marker) = failed_marker(output_dir, &source_file) {
-                let stem = source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("video");
-                tracing::warn!("[{stem}] permanently failed - delete {} to retry", marker.display());
+            if let Some(marker) = failed_marker(&job_output, &job.source_file) {
+                tracing::warn!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display());
                 continue;
             }
-            jobs.push(Job { encode_toml: encode_toml.clone(), source_file });
+            jobs.push(job);
         }
     }
 
-    Ok(drop_stem_collisions(jobs))
+    Ok(drop_name_collisions(jobs))
 }
 
-/// The stem names output, temp dir and archive, so two files sharing one both stop.
-fn drop_stem_collisions(jobs: Vec<Job>) -> Vec<Job> {
-    let mut seen: HashMap<&str, usize> = HashMap::new();
+/// Folder and stem name output, temp dir and archive, so two files sharing both stop.
+fn drop_name_collisions(jobs: Vec<Job>) -> Vec<Job> {
+    let name = |j: &Job| j.rel_dir.join(j.stem());
+    let mut seen: HashMap<PathBuf, usize> = HashMap::new();
     for job in &jobs {
-        *seen.entry(job.stem()).or_insert(0) += 1;
+        *seen.entry(name(job)).or_insert(0) += 1;
     }
 
-    let colliding: Vec<&str> = seen
-        .iter()
-        .filter(|&(_, &n)| n > 1)
-        .map(|(&stem, _)| stem)
+    let colliding: Vec<PathBuf> = seen
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(name, _)| name)
         .collect();
 
-    for stem in &colliding {
+    for c in &colliding {
         let paths: Vec<String> = jobs
             .iter()
-            .filter(|j| j.stem() == *stem)
+            .filter(|j| name(j) == *c)
             .map(|j| j.source_file.display().to_string())
             .collect();
         tracing::error!(
-            "[{stem}] skipping {} files that share this name - they would overwrite each \
+            "[{}] skipping {} files that share this name - they would overwrite each \
              other's output: {}",
+            c.display(),
             paths.len(),
             paths.join(", ")
         );
     }
 
-    if colliding.is_empty() {
-        return jobs;
-    }
-    let colliding: Vec<String> = colliding.into_iter().map(str::to_owned).collect();
     jobs.into_iter()
-        .filter(|j| !colliding.iter().any(|s| s == j.stem()))
+        .filter(|j| !colliding.contains(&name(j)))
         .collect()
 }
 
-fn find_video_files(dir: &Path) -> Result<Vec<PathBuf>> {
+fn find_video_files(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut files = Vec::new();
+    collect_video_files(dir, Path::new(""), &mut files)?;
+    files.sort_by(|a, b| (&a.1, a.0.file_name()).cmp(&(&b.1, b.0.file_name())));
+    Ok(files)
+}
+
+fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
     const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
 
-    let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let entry = entry.context("directory entry")?;
         let path = entry.path();
+        // DirEntry's type does not follow symlinks, so a link back up cannot loop.
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            match path.file_name().and_then(|n| n.to_str()) {
+                None => tracing::warn!("skipping folder with non-UTF8 name: {}", path.display()),
+                Some(name) if name.starts_with('.') => {}
+                Some(name) if name.contains(['\n', '\r']) => {
+                    tracing::warn!("skipping folder with a line break in its name: {}", path.display());
+                }
+                Some(name) => collect_video_files(&path, &rel.join(name), files)?,
+            }
+            continue;
+        }
         if !path.is_file() {
             continue;
         }
@@ -117,14 +139,13 @@ fn find_video_files(dir: &Path) -> Result<Vec<PathBuf>> {
                 tracing::warn!("skipping file with a line break in its name: {}", path.display());
                 continue;
             }
-            files.push(path);
+            files.push((path, rel.to_path_buf()));
         }
     }
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    Ok(files)
+    Ok(())
 }
 
-/// avxs never produces an empty output, so one is a leftover, not "already done".
+/// avet never produces an empty output, so one is a leftover, not "already done".
 fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
     let stem = source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let path = output_dir.join(format!("{stem}.mkv"));
@@ -151,12 +172,10 @@ fn failed_marker(output_dir: &Path, source_file: &Path) -> Option<PathBuf> {
     }
 }
 
-pub fn ensure_processed_dir(input_dir: &Path) -> Result<PathBuf> {
-    let processed = input_dir.join("processed");
-    if !processed.exists() {
-        std::fs::create_dir_all(&processed)
-            .with_context(|| format!("create {}", processed.display()))?;
-    }
+pub fn ensure_processed_dir(input_dir: &Path, rel_dir: &Path) -> Result<PathBuf> {
+    let processed = input_dir.join("processed").join(rel_dir);
+    std::fs::create_dir_all(&processed)
+        .with_context(|| format!("create {}", processed.display()))?;
     Ok(processed)
 }
 
@@ -260,6 +279,45 @@ mod tests {
         let jobs = scan(&input, &output).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].stem(), "other");
+    }
+
+    #[test]
+    fn a_folder_inside_a_profile_is_kept_as_the_job_folder() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        let s1 = profile.join("Show").join("Season 1");
+        let s2 = profile.join("Show").join("Season 2");
+        fs::create_dir_all(&s1).unwrap();
+        fs::create_dir_all(&s2).unwrap();
+        fs::create_dir_all(profile.join(".hidden")).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        fs::write(s1.join("Episode 01.mkv"), b"fake").unwrap();
+        fs::write(s2.join("Episode 01.mkv"), b"fake").unwrap();
+        fs::write(profile.join(".hidden").join("skip.mkv"), b"fake").unwrap();
+
+        let jobs = scan(&input, &output).unwrap();
+        let rel: Vec<_> = jobs.iter().map(|j| j.rel_dir.join(j.stem())).collect();
+        assert_eq!(rel, vec![
+            PathBuf::from("film"),
+            PathBuf::from("Show/Season 1/Episode 01"),
+            PathBuf::from("Show/Season 2/Episode 01"),
+        ]);
+
+        fs::create_dir_all(output.join("Show").join("Season 1")).unwrap();
+        fs::write(output.join("Show").join("Season 1").join("Episode 01.mkv"), b"done").unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_folder_symlinked_back_up_is_not_followed() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        std::os::unix::fs::symlink(&profile, profile.join("loop")).unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 1);
     }
 
     #[test]

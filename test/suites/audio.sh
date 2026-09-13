@@ -16,7 +16,7 @@ crf    = 50
 [audio]
 mode = "copy"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "copy: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "copy: no output"
 assert_audio_track_count "$O/test.mkv" 3
 assert_audio_codec       "$O/test.mkv" 0 aac
 assert_audio_codec       "$O/test.mkv" 1 ac3
@@ -35,7 +35,7 @@ mode    = "encode"
 codec   = "aac"
 bitrate = "96k"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "global encode: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "global encode: no output"
 assert_audio_track_count "$O/test.mkv" 3
 assert_audio_codec       "$O/test.mkv" 0 aac
 assert_audio_codec       "$O/test.mkv" 1 aac
@@ -54,7 +54,7 @@ mode = "copy"
 [audio.codec_rules]
 ac3 = { mode = "encode", codec = "aac", bitrate = "128k" }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "codec_rule: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "codec_rule: no output"
 assert_audio_track_count "$O/test.mkv" 3
 assert_audio_codec       "$O/test.mkv" 0 aac
 assert_audio_codec       "$O/test.mkv" 1 aac
@@ -72,7 +72,7 @@ crf    = 50
 mode               = "copy"
 language_whitelist = ["deu"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_codec       "$O/test.mkv" 0 ac3
 
@@ -90,7 +90,7 @@ language_whitelist = ["deu", "jpn"]
 [audio.codec_rules]
 ac3 = { mode = "encode", codec = "aac", bitrate = "128k" }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "whitelist+rule: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist+rule: no output"
 assert_audio_track_count "$O/test.mkv" 2
 assert_audio_codec       "$O/test.mkv" 0 aac
 assert_audio_codec       "$O/test.mkv" 1 aac
@@ -104,7 +104,7 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "no-audio: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "no-audio: no output"
 assert_audio_track_count "$O/test.mkv" 0
 
 # -- 7.1 copy: channel layout preserved ---------------------------------------
@@ -118,7 +118,7 @@ crf    = 50
 [audio]
 mode = "copy"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "7.1 copy: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "7.1 copy: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
@@ -136,7 +136,7 @@ mode    = "encode"
 codec   = "libopus"
 bitrate = "256k"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "7.1 encode: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "7.1 encode: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 opus
@@ -153,7 +153,7 @@ crf    = 50
 mode               = "copy"
 language_whitelist = ["fra"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "whitelist no match: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist no match: no output"
 assert_audio_track_count "$O/test.mkv" 0
 assert_log_contains      "audio omitted"
 
@@ -169,7 +169,7 @@ crf    = 50
 mode               = "copy"
 language_whitelist = ["fra"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "untagged track: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "untagged track: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
@@ -187,7 +187,7 @@ crf    = 50
 mode               = "copy"
 language_whitelist = ["fra"]
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "und track: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "und track: no output"
 assert_audio_track_count "$O/test.mkv" 1
 
 # -- lossless override: flac source to flac, no bitrate, options applied --------
@@ -206,7 +206,7 @@ bitrate = "128k"
 codec   = "flac"
 options = { compression_level = 12 }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "lossless override: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "lossless override: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
@@ -225,7 +225,7 @@ mode    = "encode"
 codec   = "libopus"
 bitrate = { mono = "64k", stereo = "128k", default = "96k" }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "per-layout: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "per-layout: no output"
 assert_audio_track_count "$O/test.mkv" 3
 assert_audio_codec       "$O/test.mkv" 0 opus
 assert_audio_codec       "$O/test.mkv" 1 opus
@@ -249,7 +249,7 @@ codec   = "flac"
 [audio.codec_rules]
 flac = { mode = "encode", codec = "libopus", bitrate = { "7.1" = "512k", default = "128k" } }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "rule beats lossless: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "rule beats lossless: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 opus
@@ -265,7 +265,7 @@ crf    = 50
 [audio]
 mode = "copy"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "title copy: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "title copy: no output"
 assert_audio_codec "$O/test.mkv" 0 ac3
 assert_audio_title "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1"
 
@@ -282,7 +282,7 @@ mode    = "encode"
 codec   = "libopus"
 bitrate = { "5.1" = "320k", default = "192k" }
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "title encode: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "title encode: no output"
 assert_audio_codec    "$O/test.mkv" 0 opus
 assert_audio_channels "$O/test.mkv" 0 6
 assert_audio_title    "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1 (Opus)"

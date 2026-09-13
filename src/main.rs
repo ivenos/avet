@@ -25,15 +25,15 @@ use tracing_subscriber::EnvFilter;
 fn main() -> Result<()> {
     init_logging();
 
-    let input_dir = env_path("AVXS_INPUT_DIR", "./input");
-    let output_dir = env_path("AVXS_OUTPUT_DIR", "./output");
-    let poll_interval = env_u64("AVXS_POLL_INTERVAL", 60).max(1);
+    let input_dir = env_path("INPUT_DIR", "./input");
+    let output_dir = env_path("OUTPUT_DIR", "./output");
+    let poll_interval = env_u64("POLL_INTERVAL", 60).max(1);
 
     tracing::info!(
         input = %input_dir.display(),
         output = %output_dir.display(),
         poll_s = poll_interval,
-        "avxs started"
+        "avet started"
     );
 
     ensure_dirs(&input_dir, &output_dir)?;
@@ -84,7 +84,7 @@ fn shutdown_signal() -> Arc<AtomicBool> {
     let mut signals = match Signals::new([SIGTERM, SIGINT]) {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("could not install signal handlers ({e}) - avxs will keep running on SIGTERM until it is killed");
+            tracing::error!("could not install signal handlers ({e}) - avet will keep running on SIGTERM until it is killed");
             return flag;
         }
     };

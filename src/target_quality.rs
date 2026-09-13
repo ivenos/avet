@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use crate::config::{Config, TargetQualityConfig};
 use crate::encode::{self, EncodeOptions};
@@ -16,7 +17,9 @@ const CRF_STEP: f64 = 0.25;
 // Seeds the first interpolation only; measured on 4K HDR SVT-AV1 near the target zone.
 const NOMINAL_JOD_PER_CRF: f64 = 0.025;
 
-/// By the signalled transfer, not `avxs.hdr`: an SDR source under that flag measures
+const CAMBI_PERCENTILE: f64 = 95.0;
+
+/// By the signalled transfer, not `avet.hdr`: an SDR source under that flag measures
 /// ~2.5 JOD low against an HDR display.
 pub fn display_model_for(output_height: u32, hdr_args: &[String]) -> &'static str {
     match signalled_transfer(hdr_args) {
@@ -108,7 +111,9 @@ pub struct ProbeContext<'a> {
     pub tq: &'a TargetQualityConfig,
     pub display_model: &'a str,
     pub gpu_id: u32,
-    /// Source dimensions, needed to turn avxs crop (offset+size) into FFVship edge crops.
+    /// Held around FFVship: a second run on the same GPU adds VRAM, not throughput.
+    pub gpu_lock: &'a Mutex<()>,
+    /// Source dimensions, needed to turn avet crop (offset+size) into FFVship edge crops.
     pub source_width: u32,
     pub source_height: u32,
     pub n_threads: usize,
@@ -151,8 +156,8 @@ impl Floor {
         Floor { jod: tq.jod, max_cambi: tq.max_cambi, max_cambi_diff: tq.max_cambi_diff }
     }
 
-    fn wants_cambi(&self) -> bool {
-        self.max_cambi.is_some() || self.max_cambi_diff.is_some()
+    fn needs_cambi(&self, jod: f64) -> bool {
+        (self.max_cambi.is_some() || self.max_cambi_diff.is_some()) && jod >= self.jod
     }
 
     fn holds(&self, p: &Probe) -> bool {
@@ -312,7 +317,8 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
     .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
     .with_context(|| format!("probe encode crf {crf}"))?;
 
-    let result = measure(&MeasureOpts {
+    let gpu = ctx.gpu_lock.lock().unwrap();
+    let jod = measure(&MeasureOpts {
         distorted: &probe,
         source: ctx.source,
         index: ctx.index,
@@ -325,9 +331,10 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
         gpu_id: ctx.gpu_id,
         n_threads: ctx.n_threads,
         tag: &tag,
-    })
-    .and_then(|jod| {
-        let cambi = Floor::new(ctx.tq).wants_cambi()
+    });
+    drop(gpu);
+    let result = jod.and_then(|jod| {
+        let cambi = Floor::new(ctx.tq).needs_cambi(jod)
             .then(|| measure_cambi(ctx, scene, &probe, &tag))
             .transpose()?;
         Ok((jod, cambi))
@@ -460,7 +467,7 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
 struct MeasureOpts<'a> {
     distorted: &'a Path,
     source: &'a Path,
-    /// avxs's existing FFMS2 index for the source, reused read-only by FFVship.
+    /// avet's existing FFMS2 index for the source, reused read-only by FFVship.
     index: &'a Path,
     work_dir: &'a Path,
     /// First source frame of the chunk; the probe holds those frames from 0.
@@ -504,7 +511,7 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
         .args(["-g", "3"])
         .arg("--json").arg(&json);
 
-    // avxs crop is offset+size in source space; FFVship wants per-edge amounts.
+    // avet crop is offset+size in source space; FFVship wants per-edge amounts.
     if let Some(c) = m.crop {
         let right = m.source_width.saturating_sub(c.x + c.w);
         let bottom = m.source_height.saturating_sub(c.y + c.h);
@@ -572,7 +579,8 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
         }
     };
     let mut decoder = match std::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"]).arg(probe)
+        // CAMBI only scores flat areas, and synthesized grain leaves none: it would read 0.
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-export_side_data", "film_grain", "-i"]).arg(probe)
         .args(["-map", "0:v:0", "-strict", "-1", "-f", "yuv4mpegpipe"]).arg(&fifo)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -668,20 +676,32 @@ fn cambi_feature(hdr_args: &[String]) -> &'static str {
 
 fn parse_cambi(raw: &str) -> Result<Cambi> {
     #[derive(serde::Deserialize)]
-    struct Root { pooled_metrics: HashMap<String, Stat> }
+    struct Root { frames: Vec<Frame> }
     #[derive(serde::Deserialize)]
-    struct Stat { mean: f64 }
+    struct Frame { metrics: HashMap<String, f64> }
 
     let root: Root = serde_json::from_str(raw).context("parse vmaf CAMBI json")?;
-    let pooled = &root.pooled_metrics;
-    let diff = pooled.get("cambi_full_reference").context("vmaf json has no cambi_full_reference")?;
-    // libvmaf appends non-default options to this name: `cambi_eotf_pq`.
-    let score = pooled
-        .iter()
-        .find(|(k, _)| k.starts_with("cambi") && *k != "cambi_source" && *k != "cambi_full_reference")
-        .map(|(_, s)| s)
-        .context("vmaf json has no CAMBI score")?;
-    Ok(Cambi { score: score.mean, diff: diff.mean })
+    let (mut scores, mut diffs) = (Vec::new(), Vec::new());
+    for frame in &root.frames {
+        let m = &frame.metrics;
+        diffs.push(*m.get("cambi_full_reference").context("vmaf json has no cambi_full_reference")?);
+        // libvmaf appends non-default options to this name: `cambi_eotf_pq`.
+        let score = m
+            .iter()
+            .find(|(k, _)| k.starts_with("cambi") && *k != "cambi_source" && *k != "cambi_full_reference")
+            .context("vmaf json has no CAMBI score")?;
+        scores.push(*score.1);
+    }
+    if scores.is_empty() {
+        bail!("vmaf json has no CAMBI frames");
+    }
+    Ok(Cambi { score: worst_frames(&mut scores), diff: worst_frames(&mut diffs) })
+}
+
+fn worst_frames(values: &mut [f64]) -> f64 {
+    values.sort_by(f64::total_cmp);
+    let rank = (values.len() as f64 * CAMBI_PERCENTILE / 100.0).ceil() as usize;
+    values[rank.clamp(1, values.len()) - 1]
 }
 
 fn make_fifo(path: &Path) -> Result<()> {
@@ -742,7 +762,7 @@ mod tests {
         assert_eq!(display_model_for(2160, &args("18")), "standard_hdr_hlg");
         assert_eq!(display_model_for(720, &args("18")), "standard_hdr_hlg");
 
-        // `avxs.hdr` on an SDR source signals bt709; an HDR display costs it ~2.5 JOD.
+        // `avet.hdr` on an SDR source signals bt709; an HDR display costs it ~2.5 JOD.
         assert_eq!(display_model_for(1080, &args("1")), "standard_fhd");
         assert_eq!(display_model_for(2160, &args("1")), "standard_4k");
 
@@ -893,6 +913,14 @@ mod tests {
     }
 
     #[test]
+    fn cambi_is_measured_only_for_a_probe_that_holds_jod() {
+        assert!(cambi(Some(5.0), None).needs_cambi(9.5));
+        assert!(cambi(None, Some(1.0)).needs_cambi(9.8));
+        assert!(!cambi(Some(5.0), Some(1.0)).needs_cambi(9.49));
+        assert!(!jod(9.5).needs_cambi(9.8));
+    }
+
+    #[test]
     fn a_missing_cambi_reading_never_holds_a_cambi_floor() {
         assert!(!cambi(Some(5.0), None).holds(&p(30.0, 9.9, 50.0)));
         assert!(!cambi(None, Some(1.0)).holds(&p(30.0, 9.9, 50.0)));
@@ -928,19 +956,31 @@ mod tests {
 
     #[test]
     fn parse_cambi_reads_the_total_under_either_name_and_the_diff() {
-        let raw = |total_key: &str| format!(r#"{{"version":"3f9e02a","fps":15.2,"frames":[],
-            "pooled_metrics":{{
-              "{total_key}":{{"min":7.1,"max":9.0,"mean":8.5,"harmonic_mean":7.9}},
-              "cambi_source":{{"min":0.0,"max":1.0,"mean":0.7,"harmonic_mean":0.0}},
-              "cambi_full_reference":{{"min":6.1,"max":8.0,"mean":7.8,"harmonic_mean":6.9}}}},
-            "aggregate_metrics":{{}}}}"#);
-        let expected = Cambi { score: 8.5, diff: 7.8 };
+        let raw = |total_key: &str| {
+            let frames: Vec<String> = (0..20)
+                .map(|i| format!(
+                    r#"{{"frameNum":{i},"metrics":{{"{total_key}":{},"cambi_source":0.5,"cambi_full_reference":{}}}}}"#,
+                    i as f64 * 0.5, i as f64 * 0.25,
+                ))
+                .collect();
+            format!(r#"{{"version":"3f9e02a","fps":15.2,"frames":[{}],"pooled_metrics":{{}},"aggregate_metrics":{{}}}}"#,
+                frames.join(","))
+        };
+        let expected = Cambi { score: 9.0, diff: 4.5 };
         assert_eq!(parse_cambi(&raw("cambi")).unwrap(), expected);
         // What libvmaf writes with eotf=pq, measured on v3.2.0.
         assert_eq!(parse_cambi(&raw("cambi_eotf_pq")).unwrap(), expected);
 
-        assert!(parse_cambi(r#"{"pooled_metrics":{"cambi":{"mean":1.0}}}"#).is_err());
-        assert!(parse_cambi(r#"{"pooled_metrics":{"cambi_full_reference":{"mean":1.0}}}"#).is_err());
+        assert!(parse_cambi(r#"{"frames":[]}"#).is_err());
+        assert!(parse_cambi(r#"{"frames":[{"metrics":{"cambi":1.0}}]}"#).is_err());
+        assert!(parse_cambi(r#"{"frames":[{"metrics":{"cambi_full_reference":1.0}}]}"#).is_err());
+    }
+
+    #[test]
+    fn worst_frames_is_a_nearest_rank_percentile() {
+        assert_eq!(worst_frames(&mut [3.0]), 3.0);
+        assert_eq!(worst_frames(&mut (1..=100).map(f64::from).collect::<Vec<_>>()), 95.0);
+        assert_eq!(worst_frames(&mut (1..=24).rev().map(f64::from).collect::<Vec<_>>()), 23.0);
     }
 
     #[test]

@@ -27,7 +27,7 @@
       "automerge": true
     },
     {
-      "matchPackageNames": ["ivenos/avxs"],
+      "matchPackageNames": ["ivenos/avet"],
       "enabled": false
     },
     {
@@ -146,19 +146,20 @@
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)README\\.md$/"],
-      "matchStrings": ["badge/svt--av1-(?<currentValue>v[0-9][^-]+)-purple"],
+      "matchStrings": ["badge/svt--av1-(?<currentValue>v[0-9][^-?]*)\\.svg\\?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1\" src=\"https://shieldcn\\.dev/badge/svt--av1-v[0-9][^-?]*\\.svg"],
       "datasourceTemplate": "gitlab-releases",
       "depNameTemplate": "AOMediaCodec/SVT-AV1",
-      "versioningTemplate": "semver"
+      "versioningTemplate": "semver",
+      "autoReplaceStringTemplate": "badge/svt--av1-{{{newValue}}}.svg?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1\" src=\"https://shieldcn.dev/badge/svt--av1-{{{newValue}}}.svg"
     },
     {
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)README\\.md$/"],
-      "matchStrings": ["badge/svt--av1--hdr-[0-9a-f]+-purple\\)\\]\\(https://github\\.com/juliobbv-p/svt-av1-hdr\\) <!-- renovate: juliobbv-p/svt-av1-hdr@(?<currentDigest>[0-9a-f]+) -->"],
+      "matchStrings": ["badge/svt--av1--hdr-[0-9a-f]+\\.svg\\?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1-hdr\" src=\"https://shieldcn\\.dev/badge/svt--av1--hdr-[0-9a-f]+\\.svg\\?variant=secondary&amp;mode=light\"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@(?<currentDigest>[0-9a-f]+) -->"],
       "currentValueTemplate": "main",
       "datasourceTemplate": "git-refs",
       "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr",
-      "autoReplaceStringTemplate": "badge/svt--av1--hdr-{{{replace '^(.{7}).*' '$1' newDigest}}}-purple)](https://github.com/juliobbv-p/svt-av1-hdr) <!-- renovate: juliobbv-p/svt-av1-hdr@{{{newDigest}}} -->"
+      "autoReplaceStringTemplate": "badge/svt--av1--hdr-{{{replace '^(.{7}).*' '$1' newDigest}}}.svg?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1-hdr\" src=\"https://shieldcn.dev/badge/svt--av1--hdr-{{{replace '^(.{7}).*' '$1' newDigest}}}.svg?variant=secondary&amp;mode=light\"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@{{{newDigest}}} -->"
     }
   ]
 }

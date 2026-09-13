@@ -50,6 +50,7 @@ struct WorkerCtx<'a> {
     opts: &'a EncodeOptions,
     tq_display_model: Option<&'static str>,
     tq_gpu_id: Option<u32>,
+    gpu_lock: Mutex<()>,
     source_width: u32,
     source_height: u32,
     crf_cache: Option<CrfCache>,
@@ -74,10 +75,10 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     wait_for_stable(&job.source_file, stem)?;
 
-    let temp = TempDir::for_video(&ctx.output_dir, stem);
+    let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     temp.claim_source(&job.source_file, stem)?;
 
-    if config.avxs.video == VideoMode::Copy {
+    if config.avet.video == VideoMode::Copy {
         return run_copy(job, ctx, &config, stem, &temp);
     }
 
@@ -89,9 +90,10 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] reusing existing index");
     }
 
-    let video_info = ffms2::VideoSource::open(&job.source_file, &temp.index_path, ffms2::OpenOpts::default())?
-        .info
-        .clone();
+    let video_source = ffms2::VideoSource::open(&job.source_file, &temp.index_path, ffms2::OpenOpts::default())?;
+    let video_info = video_source.info.clone();
+    let source_timestamps = video_source.timestamps_ms()?;
+    drop(video_source);
 
     let threads_per_worker = config.encoder_params
         .get("lp")
@@ -107,12 +109,21 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let (fps_num, fps_den) = probe_fps(&job.source_file)?;
     let fps = fps_num as f64 / fps_den as f64;
 
-    let hdr_args: Vec<String> = if config.avxs.hdr {
+    let timestamps = match vfr_timestamps(&source_timestamps, fps_num, fps_den, stem) {
+        Some(ts) => {
+            tracing::info!("[{stem}] variable frame rate: keeping the source timestamps");
+            write_timestamps(&temp.timestamps_path, &ts)?;
+            Some(temp.timestamps_path.as_path())
+        }
+        None => None,
+    };
+
+    let hdr_args: Vec<String> = if config.avet.hdr {
         let hdr = crate::hdr::detect(&job.source_file)?;
         // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
         if hdr.dv_profile == Some(5) {
             bail!(
-                "Dolby Vision profile 5 has no HDR10 base layer, so avxs cannot encode it \
+                "Dolby Vision profile 5 has no HDR10 base layer, so avet cannot encode it \
                  correctly. Convert the source to profile 8 or to plain HDR10 first."
             );
         }
@@ -134,7 +145,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         Vec::new()
     };
 
-    let crop_str: Option<String> = if config.avxs.crop {
+    let crop_str: Option<String> = if config.avet.crop {
         let duration_secs = video_info.num_frames as f64 / fps;
         crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem)?
     } else {
@@ -145,11 +156,11 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         video_info.width,
         video_info.height,
         crop_str.as_deref(),
-        config.avxs.scale,
+        config.avet.scale,
         stem,
     );
 
-    let auto_keyint: Option<u32> = if config.avxs.keyint {
+    let auto_keyint: Option<u32> = if config.avet.keyint {
         let ki = (fps * 5.0).round().max(1.0) as u32;
         tracing::info!("[{stem}] auto-keyint: {ki} ({fps:.3} fps, keyframe every ~5s)");
         Some(ki)
@@ -164,7 +175,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         crop,
         fps_num,
         fps_den,
-        target_bit_depth: config.avxs.bit_depth,
+        target_bit_depth: config.avet.bit_depth,
     };
 
     let merged_args = encode::merged_encoder_args(&config, &encode_opts);
@@ -288,6 +299,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         opts: &encode_opts,
         tq_display_model,
         tq_gpu_id,
+        gpu_lock: Mutex::new(()),
         source_width: video_info.width,
         source_height: video_info.height,
         crf_cache,
@@ -342,14 +354,16 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     encode::concat_chunks(&chunk_paths, &video_only, &temp.path)?;
 
     tracing::info!("[{stem}] processing audio");
-    let video = MuxVideo { path: &video_only, remove: true, expected_frames: Some(total_frames) };
+    let video = MuxVideo { path: &video_only, timestamps, remove: true, expected_frames: Some(total_frames) };
     finalize(job, ctx, &config, &temp, &audio_plan, video)
 }
 
 struct MuxVideo<'a> {
     /// The merged encode (run) or the untouched source (run_copy).
     path: &'a Path,
-    /// Delete `path` after muxing; true only when it is avxs's own temp file.
+    /// Timecodes v2 file replacing the encode's constant frame rate.
+    timestamps: Option<&'a Path>,
+    /// Delete `path` after muxing; true only when it is avet's own temp file.
     remove: bool,
     /// Frames the finished file has to hold; None for `video = copy`.
     expected_frames: Option<u64>,
@@ -370,7 +384,7 @@ fn finalize(
 
     let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles)?;
 
-    let final_output = ctx.output_dir.join(format!("{stem}.mkv"));
+    let final_output = job.output_dir(&ctx.output_dir).join(format!("{stem}.mkv"));
     // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
     match std::fs::metadata(&final_output) {
         Ok(m) if m.len() > 0 => bail!("output already exists: {}", final_output.display()),
@@ -380,7 +394,7 @@ fn finalize(
 
     // Into the temp dir first: the next scan reads a half-written output as "already done".
     tracing::info!("[{stem}] muxing to {}", final_output.display());
-    audio::mux_final(video.path, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel)?;
+    audio::mux_final(video.path, video.timestamps, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel)?;
 
     if video.remove {
         let _ = std::fs::remove_file(video.path);
@@ -398,7 +412,7 @@ fn finalize(
         tracing::error!("[{stem}] output is in place, but archiving the source failed: {e:#}");
     }
 
-    if !config.avxs.keep_temp
+    if !config.avet.keep_temp
         && let Err(e) = std::fs::remove_dir_all(&temp.path)
     {
         tracing::error!("[{stem}] could not remove temp dir {}: {e:#}", temp.path.display());
@@ -410,12 +424,25 @@ fn finalize(
 
 /// Never over an existing file: two seasons can each have an `Episode 01.mkv`.
 fn archive_source(job: &Job, ctx: &JobContext) -> Result<()> {
-    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir)?;
+    let processed_dir = crate::scanner::ensure_processed_dir(&ctx.input_dir, &job.rel_dir)?;
     let name = job.source_file.file_name().context("source has no file name")?;
     let dest = free_path(&processed_dir.join(name))?;
 
     std::fs::rename(&job.source_file, &dest)
-        .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))
+        .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))?;
+    remove_emptied_dirs(job);
+    Ok(())
+}
+
+fn remove_emptied_dirs(job: &Job) {
+    let Some(profile) = job.encode_toml.parent() else { return };
+    let mut dir = job.source_file.parent();
+    while let Some(d) = dir.filter(|d| *d != profile && d.starts_with(profile)) {
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 /// `path` if free, else the same name with a `.2`, `.3`, ... before the extension.
@@ -474,7 +501,8 @@ fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Opt
     let ctx = target_quality::ProbeContext {
         source: w.source, index: &w.temp.index_path, temp_dir: &w.temp.path,
         config: w.config, opts: w.opts, tq,
-        display_model, gpu_id, source_width: w.source_width, source_height: w.source_height,
+        display_model, gpu_id, gpu_lock: &w.gpu_lock,
+        source_width: w.source_width, source_height: w.source_height,
         n_threads: w.threads_per_worker, stem: w.stem, source_byte_index: &w.source_byte_index,
     };
     let res = target_quality::solve_chunk_crf(&ctx, scene)?;
@@ -506,7 +534,7 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
 
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 
-    let temp = TempDir::for_video(&ctx.output_dir, stem);
+    let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     if let Err(e) = temp.create_dirs() {
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
     }
@@ -520,7 +548,7 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
 }
 
 fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir) -> Result<()> {
-    let ignored = ignored_video_opts(&config.avxs);
+    let ignored = ignored_video_opts(&config.avet);
     if !ignored.is_empty() {
         tracing::warn!("[{stem}] video = copy: ignoring {}", ignored.join(", "));
     }
@@ -531,11 +559,11 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
     }
 
     tracing::info!("[{stem}] copy video, processing audio");
-    let video = MuxVideo { path: &job.source_file, remove: false, expected_frames: None };
+    let video = MuxVideo { path: &job.source_file, timestamps: None, remove: false, expected_frames: None };
     finalize(job, ctx, config, temp, &audio_plan, video)
 }
 
-fn ignored_video_opts(a: &crate::config::AvxsConfig) -> Vec<&'static str> {
+fn ignored_video_opts(a: &crate::config::AvetConfig) -> Vec<&'static str> {
     let mut v = Vec::new();
     if a.hdr { v.push("hdr"); }
     if a.crop { v.push("crop"); }
@@ -728,6 +756,35 @@ fn probe_source_byte_index(source: &Path, stem: &str) -> Vec<u64> {
     cum
 }
 
+/// Rebased to 0, or None while every frame is within half a frame of the encoder's rate.
+fn vfr_timestamps(ts: &[f64], fps_num: u32, fps_den: u32, stem: &str) -> Option<Vec<f64>> {
+    let first = *ts.first()?;
+    let frame_ms = 1000.0 * fps_den as f64 / fps_num as f64;
+    let rebased: Vec<f64> = ts.iter().map(|t| t - first).collect();
+
+    let constant = rebased
+        .iter()
+        .enumerate()
+        .all(|(i, t)| (t - i as f64 * frame_ms).abs() <= frame_ms / 2.0);
+    if constant {
+        return None;
+    }
+    if !rebased.windows(2).all(|w| w[1] > w[0]) {
+        tracing::warn!("[{stem}] source timestamps are not increasing - using a constant frame rate");
+        return None;
+    }
+    Some(rebased)
+}
+
+fn write_timestamps(path: &Path, ts: &[f64]) -> Result<()> {
+    use std::fmt::Write;
+    let mut text = String::from("# timestamp format v2\n");
+    for t in ts {
+        let _ = writeln!(text, "{t:.3}");
+    }
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+}
+
 fn probe_fps(source: &Path) -> Result<(u32, u32)> {
     #[derive(serde::Deserialize)]
     struct Probe { streams: Vec<Stream> }
@@ -811,7 +868,7 @@ mod failure_class_tests {
     fn a_rejected_profile_is_transient_through_the_real_path() {
         let dir = tempfile::TempDir::new().unwrap();
         let toml = dir.path().join("encode.toml");
-        std::fs::write(&toml, "encoder = \"svt-av1\"\n[avxs]\nscale = 0\n").unwrap();
+        std::fs::write(&toml, "encoder = \"svt-av1\"\n[avet]\nscale = 0\n").unwrap();
 
         let err = Config::from_file(&toml).context(Transient).unwrap_err();
         assert!(err.to_string().contains("retrying") || format!("{err:#}").contains("scale"));
@@ -878,6 +935,53 @@ mod output_param_tests {
         assert_eq!(free_path(&first).unwrap(), dir.path().join("Episode 01.3.mkv"));
 
         assert_eq!(std::fs::read(&first).unwrap(), b"season 1");
+    }
+
+    #[test]
+    fn archiving_the_last_episode_removes_its_empty_folders_but_not_the_profile() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("input").join("p");
+        let season = profile.join("Show").join("Season 1");
+        std::fs::create_dir_all(&season).unwrap();
+        std::fs::write(profile.join("encode.toml"), b"").unwrap();
+        std::fs::write(season.join("Episode 01.mkv"), b"e1").unwrap();
+        std::fs::write(season.join("Episode 02.mkv"), b"e2").unwrap();
+
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output") };
+        let job = |name: &str| Job {
+            encode_toml: profile.join("encode.toml"),
+            source_file: season.join(name),
+            rel_dir: PathBuf::from("Show/Season 1"),
+        };
+
+        archive_source(&job("Episode 01.mkv"), &ctx).unwrap();
+        assert!(season.is_dir(), "a folder still holding a video was removed");
+
+        archive_source(&job("Episode 02.mkv"), &ctx).unwrap();
+        assert!(!profile.join("Show").exists());
+        assert!(profile.is_dir());
+        let archived = ctx.input_dir.join("processed/Show/Season 1");
+        assert_eq!(std::fs::read(archived.join("Episode 02.mkv")).unwrap(), b"e2");
+    }
+
+    #[test]
+    fn only_timestamps_that_drift_from_the_frame_rate_are_kept() {
+        // 23.976 fps in a millisecond timebase: rounding, not a variable rate.
+        let cfr: Vec<f64> = (0..10_000).map(|i| (i as f64 * 1001.0 / 24.0).round() + 80.0).collect();
+        assert_eq!(vfr_timestamps(&cfr, 24000, 1001, "t"), None);
+
+        let vfr: Vec<f64> = (0..30).map(|i| i as f64 * 1000.0 / 30.0)
+            .chain((0..60).map(|i| 1000.0 + i as f64 * 1000.0 / 60.0))
+            .map(|t| t + 500.0)
+            .collect();
+        let kept = vfr_timestamps(&vfr, 45, 1, "t").expect("variable rate not detected");
+        assert_eq!(kept[0], 0.0);
+        assert!((kept[30] - 1000.0).abs() < 1e-9);
+
+        let mut backwards = vfr.clone();
+        backwards.swap(40, 41);
+        assert_eq!(vfr_timestamps(&backwards, 45, 1, "t"), None);
+        assert_eq!(vfr_timestamps(&[], 24, 1, "t"), None);
     }
 
     #[test]

@@ -43,7 +43,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: avxs image tag
+      label: avet image tag
       placeholder: "e.g. latest, dev, v0.2.1"
     validations:
       required: true

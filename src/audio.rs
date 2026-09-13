@@ -384,6 +384,7 @@ pub fn process_plan(source_file: &Path, audio_path: &Path, plan: &AudioPlan) -> 
 
 pub fn mux_final(
     video_path: &Path,
+    timestamps: Option<&Path>,
     audio_path: &Path,
     source_file: &Path,
     output_path: &Path,
@@ -407,6 +408,11 @@ pub fn mux_final(
     }
     cmd.args(["--no-audio", "--no-subtitles", "--no-chapters",
               "--no-global-tags", "--no-track-tags"]);
+    if let Some(ts) = timestamps {
+        let mut spec = std::ffi::OsString::from("0:");
+        spec.push(ts);
+        cmd.arg("--timestamps").arg(spec);
+    }
     cmd.arg(video_path);
 
     if has_audio {

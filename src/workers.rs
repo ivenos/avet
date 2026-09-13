@@ -175,14 +175,14 @@ mod tests {
         assert_eq!(dirs, vec![PathBuf::from("/sys/fs/cgroup")]);
 
         // A systemd unit or a k8s pod carries the limit on an ancestor.
-        let dirs: Vec<_> = cgroup_dirs("/sys/fs/cgroup", Some("/system.slice/avxs.service"))
+        let dirs: Vec<_> = cgroup_dirs("/sys/fs/cgroup", Some("/system.slice/avet.service"))
             .collect();
         assert_eq!(
             dirs,
             vec![
                 PathBuf::from("/sys/fs/cgroup"),
                 PathBuf::from("/sys/fs/cgroup/system.slice"),
-                PathBuf::from("/sys/fs/cgroup/system.slice/avxs.service"),
+                PathBuf::from("/sys/fs/cgroup/system.slice/avet.service"),
             ]
         );
 
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn own_cgroup_paths_reads_both_hierarchies() {
-        let sample = "0::/system.slice/avxs.service\n\
+        let sample = "0::/system.slice/avet.service\n\
                       4:memory:/docker/abc123\n";
         let map: std::collections::HashMap<String, String> = sample
             .lines()
@@ -202,7 +202,7 @@ mod tests {
                 Some((parts.next()?.to_string(), parts.next()?.to_string()))
             })
             .collect();
-        assert_eq!(map.get("").map(String::as_str), Some("/system.slice/avxs.service"));
+        assert_eq!(map.get("").map(String::as_str), Some("/system.slice/avet.service"));
         assert_eq!(map.get("memory").map(String::as_str), Some("/docker/abc123"));
     }
 

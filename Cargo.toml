@@ -1,11 +1,12 @@
 [package]
-name = "avxs"
+name = "avet"
 version = "0.0.0"          # placeholder - real version is the git tag (Docker/AppImage releases)
 edition = "2024"
+license = "GPL-3.0-only"
 rust-version = "1.95"          # MSRV floor; the build toolchain (Docker/CI RUST_VERSION) can be newer
 
 [[bin]]
-name = "avxs"
+name = "avet"
 path = "src/main.rs"
 
 [dependencies]

@@ -14,7 +14,7 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "codec: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "codec: no output"
 assert_video_codec "$O/test.mkv" av1
 
 # -- manual keyint in encoder_params: auto-keyint logged but not injected ------
@@ -26,10 +26,10 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 keyint = 240
-[avxs]
+[avet]
 keyint = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "keyint override: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "keyint override: no output"
 assert_log_contains     "auto-keyint"
 assert_log_contains     "keyint=240"
 
@@ -42,10 +42,10 @@ encoder = "svt-av1"
 preset           = 12
 crf              = 50
 color-primaries  = 1
-[avxs]
+[avet]
 hdr = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "HDR override: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR override: no output"
 assert_log_contains     "color-primaries=1"
 assert_color_primaries  "$O/test.mkv" "bt709"
 
@@ -57,10 +57,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 keyint = true
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "auto-keyint: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "auto-keyint: no output"
 assert_log_contains "auto-keyint"
 assert_log_contains "keyint="
 
@@ -72,10 +72,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 bit_depth = 10
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8 to 10: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8 to 10: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p10le"
 assert_log_contains  "bit-depth conversion: 8-bit to 10-bit"
 
@@ -87,10 +87,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 bit_depth = 8
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10 to 8: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10 to 8: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p"
 assert_log_contains  "bit-depth conversion: 10-bit to 8-bit"
 
@@ -102,10 +102,10 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-[avxs]
+[avet]
 bit_depth = 8
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth matching: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth matching: no output"
 assert_video_pix_fmt    "$O/test.mkv" "yuv420p"
 assert_log_not_contains "bit-depth conversion"
 
@@ -113,17 +113,34 @@ assert_log_not_contains "bit-depth conversion"
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_named_audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
-[avxs]
+[avet]
 video = "copy"
 [audio]
 mode    = "encode"
 codec   = "libopus"
 bitrate = "256k"
 EOF
-run_avxs "$I" "$O" "$O/test.mkv" 120 || fail "video copy: no output"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "video copy: no output"
 assert_log_contains "copy video"
 assert_video_codec  "$O/test.mkv" h264
 assert_audio_codec  "$O/test.mkv" 0 opus
 assert_audio_title  "$O/test.mkv" 0 "Deutsch Dolby Digital 5.1 (Opus)"
+
+# -- variable frame rate: the output keeps the source timestamps --------------
+I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_vfr.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+EOF
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "vfr: no output"
+assert_log_contains "variable frame rate"
+assert_video_frames "$O/test.mkv" 180
+PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 \
+    "$O/test.mkv" 2>/dev/null | sort -n | sed -n '61p;180p' | tr '\n' ' ')
+echo "$PTS" | awk '{ exit !($1 > 1.99 && $1 < 2.01 && $2 > 3.97 && $2 < 3.99) }' || \
+    fail "vfr: frames 60 and 179 at ${PTS}s, expected 2.0 and 3.983"
 
 test_done
