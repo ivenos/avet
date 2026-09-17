@@ -1,11 +1,14 @@
 mod audio;
+mod av1;
 mod config;
 mod crop;
 mod encode;
 mod ext;
 mod ffms2;
 mod hdr;
+mod hevc;
 mod job;
+mod mkv;
 mod resume;
 mod scanner;
 mod scene;

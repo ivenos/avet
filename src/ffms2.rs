@@ -85,9 +85,9 @@ pub struct FFMS_Frame {
     pub content_light_level_max: c_uint,
     pub content_light_level_average: c_uint,
     pub flip: c_int,
-    pub dolby_vision_rpu: *mut u8,
+    pub dolby_vision_rpu: *const u8,
     pub dolby_vision_rpu_size: c_int,
-    pub hdr10_plus: *mut u8,
+    pub hdr10_plus: *const u8,
     pub hdr10_plus_size: c_int,
 }
 
@@ -191,6 +191,17 @@ impl ErrorInfo {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).to_string()
     }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FrameHdrMetadata {
+    pub dovi_rpu: Option<Vec<u8>>,
+    pub hdr10plus: Option<Vec<u8>>,
+}
+
+unsafe fn side_data(ptr: *const u8, size: c_int) -> Option<Vec<u8>> {
+    let len = usize::try_from(size).ok().filter(|&n| n > 0)?;
+    (!ptr.is_null()).then(|| unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
 }
 
 pub fn get_pixel_format(name: &str) -> c_int {
@@ -519,28 +530,28 @@ impl VideoSource {
         let out_h = unsafe { (*first_frame).encoded_height };
         let resizer = FFMS_RESIZER_BICUBIC;
 
-        // SVT-AV1 accepts only 8/10-bit input, so 12/16-bit sources are clamped.
+        // SVT-AV1 accepts only 8/10-bit 4:2:0, so deeper and wider sources are converted.
         let target_depth = opts.target_bit_depth
             .or((pixel_format.bit_depth > 10).then_some(10u8));
+        let depth = target_depth.unwrap_or(pixel_format.bit_depth.min(10) as u8);
 
-        if let Some(depth) = target_depth
-            && depth as u32 != pixel_format.bit_depth
-        {
-            match pixfmt_for(pixel_format.subsampling, depth) {
+        if depth as u32 != pixel_format.bit_depth || pixel_format.subsampling != PixelSubsampling::Yuv420 {
+            match pixfmt_for(PixelSubsampling::Yuv420, depth) {
                 Some(pf) => {
-                    tracing::info!(
-                        "bit-depth conversion: {}-bit to {}-bit",
-                        pixel_format.bit_depth, depth
-                    );
-                    pixel_format.pix_fmt = pf;
-                    pixel_format.bit_depth = depth as u32;
+                    if depth as u32 != pixel_format.bit_depth {
+                        tracing::info!(
+                            "bit-depth conversion: {}-bit to {}-bit",
+                            pixel_format.bit_depth, depth
+                        );
+                    }
+                    if pixel_format.subsampling != PixelSubsampling::Yuv420 {
+                        tracing::info!("chroma conversion: {:?} to Yuv420", pixel_format.subsampling);
+                    }
+                    pixel_format = PixelFormat { pix_fmt: pf, bit_depth: depth as u32, subsampling: PixelSubsampling::Yuv420 };
                 }
                 None => {
                     unsafe { FFMS_DestroyVideoSource(ptr) }
-                    bail!(
-                        "no pixfmt available for {:?} at {}-bit",
-                        pixel_format.subsampling, depth
-                    );
+                    bail!("no pixfmt available for 4:2:0 at {depth}-bit");
                 }
             }
         }
@@ -617,6 +628,7 @@ impl VideoSource {
         start: u64,
         end: u64,
         crop: Option<Crop>,
+        mut hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
     ) -> Result<()> {
         let info = &self.info;
         let cs = info.pixel_format.y4m_colorspace();
@@ -661,6 +673,12 @@ impl VideoSource {
             writer.write_all(b"FRAME\n").context("write FRAME marker")?;
 
             let frame_ref = unsafe { &*frame };
+            if let Some(out) = hdr_metadata.as_deref_mut() {
+                out.push(FrameHdrMetadata {
+                    dovi_rpu: unsafe { side_data(frame_ref.dolby_vision_rpu, frame_ref.dolby_vision_rpu_size) },
+                    hdr10plus: unsafe { side_data(frame_ref.hdr10_plus, frame_ref.hdr10_plus_size) },
+                });
+            }
             for plane_idx in 0..3usize {
                 let plane_data = frame_ref.data[plane_idx];
                 let linesize   = frame_ref.linesize[plane_idx];

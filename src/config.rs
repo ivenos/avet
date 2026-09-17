@@ -42,7 +42,7 @@ pub struct AvetConfig {
     #[serde(default)]
     pub video: VideoMode,
     #[serde(default)]
-    pub hdr: bool,
+    pub dv: bool,
     #[serde(default)]
     pub crop: bool,
     #[serde(default)]
@@ -760,6 +760,13 @@ mod tests {
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_qualtiy]\njod = 9.5\n").is_err());
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avet]\nbitdepth = 10\n").is_err());
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_quality]\nmax_probe = 2\n").is_err());
+    }
+
+    #[test]
+    fn dv_stands_alone() {
+        let c = Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\ndv = true\n").unwrap();
+        assert!(c.avet.dv);
+        assert!(Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\nhdr = true\n").is_err());
     }
 
     #[test]

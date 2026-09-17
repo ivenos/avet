@@ -6,60 +6,83 @@ use std::process::Command;
 use crate::config::{SubtitleConfig, SubtitleMode};
 use crate::ext::external_bin;
 
-pub enum SubtitleSelection {
-    Strip,
-    All,
-    Indices(Vec<usize>),
+const MATROSKA_SUBTITLES: &[&str] = &[
+    "subrip", "text", "ass", "webvtt", "dvd_subtitle", "dvb_subtitle", "hdmv_pgs_subtitle",
+    "hdmv_text_subtitle", "arib_caption",
+];
+
+#[derive(Default)]
+pub struct SubtitlePlan {
+    pub extract: Vec<(usize, Option<&'static str>)>,
+    pub from_source: Vec<u64>,
 }
 
-#[derive(Deserialize)]
-struct SubProbe { streams: Vec<SubStream> }
-#[derive(Deserialize)]
-struct SubStream { #[serde(default)] tags: SubTags }
-#[derive(Deserialize, Default)]
-struct SubTags { language: Option<String> }
-
-pub fn select_tracks(source: &Path, config: &SubtitleConfig) -> Result<SubtitleSelection> {
+pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
     if config.mode == SubtitleMode::Strip {
-        return Ok(SubtitleSelection::Strip);
-    }
-    if config.language_whitelist.is_empty() {
-        return Ok(SubtitleSelection::All);
+        return Ok(SubtitlePlan::default());
     }
 
-    let probe = probe_subtitle_langs(source)?;
-    let indices: Vec<usize> = probe.streams.iter().enumerate()
-        .filter(|(_, s)| {
-            crate::config::language_selected(
-                &config.language_whitelist,
-                s.tags.language.as_deref(),
-            )
-        })
-        .map(|(i, _)| i)
-        .collect();
+    #[derive(Deserialize)]
+    struct Probe { streams: Vec<Stream> }
+    #[derive(Deserialize)]
+    struct Stream {
+        id: Option<String>,
+        codec_name: Option<String>,
+        #[serde(default)]
+        tags: Tags,
+    }
+    #[derive(Deserialize, Default)]
+    struct Tags { language: Option<String> }
 
-    Ok(SubtitleSelection::Indices(indices))
-}
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "s",
+          "-show_entries", "stream=id,codec_name:stream_tags=language", "-of", "json"],
+        source,
+    )
+    .context("probe subtitle streams")?;
 
-/// ffprobe subtitle languages, retried since the probe can fail transiently.
-fn probe_subtitle_langs(source: &Path) -> Result<SubProbe> {
-    let args = &["-v", "error", "-select_streams", "s",
-                 "-show_entries", "stream_tags=language", "-of", "json"];
-    let mut last = String::new();
-    for attempt in 1..=3 {
-        match crate::ext::ffprobe_json::<SubProbe>(args, source) {
-            Ok(p) => return Ok(p),
-            Err(e) => {
-                last = e.to_string();
-                tracing::warn!("ffprobe subtitle probe attempt {attempt}/3 failed: {last}");
-                std::thread::sleep(std::time::Duration::from_millis(500));
+    let selected = |language: Option<&str>| {
+        crate::config::language_selected(&config.language_whitelist, language)
+    };
+    let mut plan = SubtitlePlan::default();
+    let mut unsupported = Vec::new();
+    for (index, stream) in probe.streams.into_iter().enumerate() {
+        let codec = stream.codec_name.unwrap_or_else(|| "unknown".into());
+        if MATROSKA_SUBTITLES.contains(&codec.as_str()) {
+            if selected(stream.tags.language.as_deref()) {
+                plan.extract.push((index, None));
             }
+        } else if codec == "mov_text" {
+            if selected(stream.tags.language.as_deref()) {
+                plan.extract.push((index, Some("srt")));
+            }
+        } else {
+            unsupported.push((stream.id, codec));
         }
     }
-    bail!("ffprobe subtitle probe failed after 3 attempts: {last}");
+    if unsupported.is_empty() {
+        return Ok(plan);
+    }
+
+    // mkvmerge's track number (PID, MP4 track ID, Matroska track number) is ffprobe's stream ID.
+    let tracks = identify_subtitles(source)?;
+    for (id, codec) in unsupported {
+        let number = id.as_deref()
+            .and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+        let matching: Vec<&(u64, Option<u64>, Option<String>)> =
+            tracks.iter().filter(|(_, n, _)| number.is_some() && *n == number).collect();
+        if matching.is_empty() {
+            tracing::warn!("subtitle stream {} ({codec}) cannot be stored in Matroska - skipped",
+                id.as_deref().unwrap_or("?"));
+        }
+        plan.from_source.extend(
+            matching.into_iter().filter(|(_, _, language)| selected(language.as_deref())).map(|(tid, _, _)| *tid),
+        );
+    }
+    Ok(plan)
 }
 
-pub(crate) fn probe_track_ids(source: &Path, subtitle_indices: &[usize]) -> Result<Vec<u64>> {
+fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<String>)>> {
     let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.args(["--identify", "--identification-format", "json"]).arg(source);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
@@ -72,23 +95,21 @@ pub(crate) fn probe_track_ids(source: &Path, subtitle_indices: &[usize]) -> Resu
     #[derive(Deserialize)]
     struct Identify { tracks: Vec<Track> }
     #[derive(Deserialize)]
-    struct Track { id: u64, #[serde(rename = "type")] track_type: String }
+    struct Track {
+        id: u64,
+        #[serde(rename = "type")]
+        track_type: String,
+        #[serde(default)]
+        properties: Properties,
+    }
+    #[derive(Deserialize, Default)]
+    struct Properties { number: Option<u64>, language: Option<String> }
 
     let identified: Identify = serde_json::from_slice(&out.stdout)
         .context("parse mkvmerge identify output")?;
 
-    let subtitle_ids: Vec<u64> = identified.tracks.iter()
+    Ok(identified.tracks.into_iter()
         .filter(|t| t.track_type == "subtitles")
-        .map(|t| t.id)
-        .collect();
-
-    Ok(subtitle_indices.iter()
-        .filter_map(|&i| match subtitle_ids.get(i) {
-            Some(&id) => Some(id),
-            None => {
-                tracing::warn!("subtitle index {i} out of range ({} tracks) - skipped", subtitle_ids.len());
-                None
-            }
-        })
+        .map(|t| (t.id, t.properties.number, t.properties.language))
         .collect())
 }

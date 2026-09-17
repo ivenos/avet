@@ -11,10 +11,10 @@ on:
         description: "Version for the artifact names, e.g. v1.0.0. Empty uses dev-<sha>."
         required: false
   pull_request:
-    paths: [".github/workflows/appimage.yml"]
+    paths: [".github/workflows/appimage.yml", "packaging/ffms2-frame-hdr-metadata.patch"]
   push:
     branches: [main]
-    paths: [".github/workflows/appimage.yml"]
+    paths: [".github/workflows/appimage.yml", "packaging/ffms2-frame-hdr-metadata.patch"]
 
 env:
   SVT_AV1_VERSION: v4.2.0
@@ -163,6 +163,7 @@ jobs:
           git clone --depth 1 --branch "$FFMS2_VERSION" \
             https://github.com/FFMS/ffms2.git /tmp/ffms2
           cd /tmp/ffms2
+          git apply "$GITHUB_WORKSPACE/packaging/ffms2-frame-hdr-metadata.patch"
           mkdir -p src/config
           autoreconf -fiv
           PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \

@@ -199,4 +199,27 @@ TEST_RUST_LOG=debug run_avet "$I" "$O" "$O/test.mkv" 90 || fail "done resume: se
 assert_log_contains  "already done"
 assert_file_nonempty "$O/test.mkv"
 
+# -- edge cases: a single picture, a name at the 255-byte limit, a file without video ------------
+I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/one_frame.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "one frame: no output"
+assert_video_frames "$O/test.mkv" 1
+assert_frames_match "$O/test.mkv" "$FIXTURES_DIR/one_frame.mkv"
+assert_audio_samples_identical "$O/test.mkv" "$FIXTURES_DIR/one_frame.mkv" 0
+
+I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
+long=$(printf '%0250d' 0 | tr 0 x)
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/$long.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/$long.mkv" 120 || fail "long name: no output"
+assert_file_exists "$I/processed/$long.mkv"
+
+I="$WORKDIR/14/in"; O="$WORKDIR/14/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/audio_only.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_file_not_exists "$O/test.mkv"
+grep -q "no video track" "$O/.avet_test/.failed" 2>/dev/null || fail "audio only: .failed does not name the missing video"
+
 test_done

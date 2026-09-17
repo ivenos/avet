@@ -20,7 +20,7 @@ fn load_json_or_default<T: DeserializeOwned + Default>(path: &Path, what: &str) 
 }
 
 /// Temp file + rename, flushed first, or a power loss leaves zero bytes behind.
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     use std::io::Write;
 
     let json = serde_json::to_string_pretty(value)?;
@@ -126,6 +126,25 @@ impl CrfCache {
     }
 }
 
+/// `.avet_<stem>`, shortened with a hash of the stem where that passes the 255-byte name limit.
+fn temp_dir_name(stem: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    const NAME_MAX: usize = 255;
+
+    let name = format!(".avet_{stem}");
+    if name.len() <= NAME_MAX {
+        return name;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    stem.hash(&mut h);
+    let suffix = format!("-{:016x}", h.finish());
+    let mut end = NAME_MAX - suffix.len();
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &name[..end])
+}
+
 pub struct TempDir {
     pub path: PathBuf,
     pub index_path: PathBuf,
@@ -137,15 +156,17 @@ pub struct TempDir {
     pub failed_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
-    pub audio_path: PathBuf,
+    pub tracks_path: PathBuf,
+    pub remux_path: PathBuf,
     pub video_path: PathBuf,
     pub mux_path: PathBuf,
     pub timestamps_path: PathBuf,
+    pub hdr10plus_path: PathBuf,
 }
 
 impl TempDir {
     pub fn for_video(output_dir: &Path, video_stem: &str) -> Self {
-        let path = output_dir.join(format!(".avet_{video_stem}"));
+        let path = output_dir.join(temp_dir_name(video_stem));
         let index_path       = path.join("frame-index.ffindex");
         let scenes_path      = path.join("scenes.json");
         let done_path        = path.join("done.json");
@@ -155,14 +176,16 @@ impl TempDir {
         let failed_path      = path.join(".failed");
         let chunks_dir       = path.join("chunks");
         let crop_cache       = path.join("crop.cache");
-        let audio_path       = path.join("audio.mkv");
-        let video_path       = path.join("video.mkv");
+        let tracks_path      = path.join("tracks.mkv");
+        let remux_path       = path.join("source.mkv");
+        let video_path       = path.join("video.ivf");
         let mux_path         = path.join("muxed.mkv");
         let timestamps_path  = path.join("timestamps.txt");
+        let hdr10plus_path   = path.join("hdr10plus.json");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
             fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache,
-            audio_path, video_path, mux_path, timestamps_path,
+            tracks_path, remux_path, video_path, mux_path, timestamps_path, hdr10plus_path,
         }
     }
 
@@ -225,6 +248,20 @@ mod tests {
         assert_eq!(back[0].end_frame, 9);
 
         assert!(!path.with_extension("json.tmp").exists(), "scratch file left behind");
+    }
+
+    #[test]
+    fn a_long_name_still_gets_a_temp_dir_of_its_own() {
+        assert_eq!(temp_dir_name("Film"), ".avet_Film");
+        let long = "ü".repeat(125) + "x";
+        let a = temp_dir_name(&long);
+        let b = temp_dir_name(&("ü".repeat(125) + "y"));
+        assert!(a.len() <= 255 && b.len() <= 255, "{} and {} bytes", a.len(), b.len());
+        assert_ne!(a, b);
+        assert_eq!(a, temp_dir_name(&long));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        TempDir::for_video(dir.path(), &long).create_dirs().unwrap();
     }
 
     #[test]

@@ -19,8 +19,7 @@ const NOMINAL_JOD_PER_CRF: f64 = 0.025;
 
 const CAMBI_PERCENTILE: f64 = 95.0;
 
-/// By the signalled transfer, not `avet.hdr`: an SDR source under that flag measures
-/// ~2.5 JOD low against an HDR display.
+/// By the signalled transfer: an SDR source measures ~2.5 JOD low against an HDR display.
 pub fn display_model_for(output_height: u32, hdr_args: &[String]) -> &'static str {
     match signalled_transfer(hdr_args) {
         Some("18") => "standard_hdr_hlg",
@@ -304,13 +303,14 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
 fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
+    let opts = EncodeOptions { dynamic_hdr: Default::default(), hdr10plus_frames: None, ..ctx.opts.clone() };
     let size_bytes = encode::encode_chunk(
         ctx.source,
         ctx.index,
         scene,
         &probe,
         ctx.config,
-        ctx.opts,
+        &opts,
         encode::EncodeOverrides { crf: Some(crf), preset: Some(ctx.tq.probe_preset) },
     )
     // Nothing else in the temp dir's housekeeping knows about probe files.
@@ -608,7 +608,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
         vs.info.fps_num = opts.fps_num;
         vs.info.fps_den = opts.fps_den;
         let mut out = std::io::BufWriter::with_capacity(256 * 1024, sink);
-        vs.write_y4m_range(&mut out, start, end, opts.crop)
+        vs.write_y4m_range(&mut out, start, end, opts.crop, None)
     });
 
     let vmaf_err = drain(vmaf.stderr.take());
@@ -762,7 +762,7 @@ mod tests {
         assert_eq!(display_model_for(2160, &args("18")), "standard_hdr_hlg");
         assert_eq!(display_model_for(720, &args("18")), "standard_hdr_hlg");
 
-        // `avet.hdr` on an SDR source signals bt709; an HDR display costs it ~2.5 JOD.
+        // An SDR source signals bt709; an HDR display costs it ~2.5 JOD.
         assert_eq!(display_model_for(1080, &args("1")), "standard_fhd");
         assert_eq!(display_model_for(2160, &args("1")), "standard_4k");
 

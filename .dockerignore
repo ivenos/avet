@@ -3,6 +3,7 @@ target/
 .github/
 test/
 packaging/
+!packaging/ffms2-frame-hdr-metadata.patch
 docs.md
 README.md
 LICENSE

@@ -15,6 +15,7 @@ serde_json         = "1.0"
 toml               = "1.1"
 anyhow             = "1.0"
 av-scenechange     = "0.24"
+dolby_vision       = "3.4"
 y4m                = "0.8"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3",  features = ["fmt", "env-filter"] }
@@ -22,6 +23,7 @@ signal-hook        = "0.4"
 
 [dev-dependencies]
 tempfile = "3.27"
+proptest = "1.11"
 
 [profile.release]
 opt-level     = 3

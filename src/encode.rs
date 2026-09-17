@@ -1,12 +1,13 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
-use std::io::{BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufWriter, Read};
+use std::path::Path;
 use std::process::Stdio;
 
 use crate::config::{Config, Encoder};
-use crate::ffms2::{Crop, OpenOpts, VideoSource};
+use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, VideoSource};
 use crate::ext::external_bin;
+use crate::hdr::{DynamicHdr, Geometry};
 use crate::resume::SceneEntry;
 
 /// Per-call overrides; CRF is fractional, the SVT-AV1 encoders accept 0.25 steps.
@@ -31,6 +32,9 @@ pub struct EncodeOptions {
     pub fps_den: u32,
     /// Forced encoder input bit depth (8 or 10); None = pass source through.
     pub target_bit_depth: Option<u8>,
+    pub dynamic_hdr: DynamicHdr,
+    /// Replaces what FFMS2 decodes, which loses a carried HDR10+ value at every seek.
+    pub hdr10plus_frames: Option<crate::hevc::Hdr10PlusFrames>,
 }
 
 pub fn encode_chunk(
@@ -63,18 +67,58 @@ pub fn encode_chunk(
     vs.info.fps_num = opts.fps_num;
     vs.info.fps_den = opts.fps_den;
 
+    let mut hdr_metadata = Vec::new();
+    let capture = opts.dynamic_hdr.any().then_some(&mut hdr_metadata);
     match opts.scale {
         Some(scale) => encode_scaled(
             &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, scene, opts.crop, scale,
+            &mut vs, scene, opts.crop, scale, capture,
         )?,
         None => encode_direct(
             &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, scene, opts.crop,
+            &mut vs, scene, opts.crop, capture,
         )?,
     }
 
+    if opts.dynamic_hdr.any() {
+        let geometry = Geometry { width: vs.info.width, height: vs.info.height, crop: opts.crop, scale: opts.scale };
+        if let Some(table) = &opts.hdr10plus_frames {
+            let from = scene.start_frame as usize;
+            for (i, frame) in hdr_metadata.iter_mut().enumerate() {
+                frame.hdr10plus = table.get(from + i).cloned().flatten().map(|m| m.to_vec());
+            }
+        }
+        insert_hdr_metadata(output_path, &hdr_metadata, opts.dynamic_hdr, geometry, scene)?;
+    }
+
     chunk_size(output_path)
+}
+
+fn insert_hdr_metadata(
+    chunk: &Path,
+    frames: &[FrameHdrMetadata],
+    carry: DynamicHdr,
+    geometry: Geometry,
+    scene: &SceneEntry,
+) -> Result<()> {
+    let without_rpu = frames.iter().filter(|f| f.dovi_rpu.is_none()).count();
+    if carry.dolby_vision && without_rpu > 0 {
+        tracing::warn!(
+            "chunk {:05}: {without_rpu} of {} frames have no Dolby Vision metadata",
+            scene.index + 1, frames.len()
+        );
+    }
+
+    let messages = frames
+        .iter()
+        .map(|f| crate::hdr::t35_messages(f, carry, geometry))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("HDR metadata of chunk {:05}", scene.index + 1))?;
+    if messages.iter().all(Vec::is_empty) {
+        return Ok(());
+    }
+    crate::av1::insert_t35_metadata(chunk, &messages)
+        .with_context(|| format!("add HDR metadata to chunk {:05}", scene.index + 1))
 }
 
 /// FFMS2 Y4M piped straight into the encoder.
@@ -85,6 +129,7 @@ fn encode_direct(
     vs: &mut VideoSource,
     scene: &SceneEntry,
     crop: Option<Crop>,
+    hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
 ) -> Result<()> {
     let mut child = std::process::Command::new(encoder_bin)
         .args(encoder_args)
@@ -104,7 +149,7 @@ fn encode_direct(
     });
 
     let mut stdin = BufWriter::with_capacity(256 * 1024, child.stdin.take().expect("encoder stdin unavailable"));
-    let write_res = vs.write_y4m_range(&mut stdin, scene.start_frame, scene.end_frame, crop);
+    let write_res = vs.write_y4m_range(&mut stdin, scene.start_frame, scene.end_frame, crop, hdr_metadata);
     drop(stdin);
 
     let status = child.wait().context("wait for encoder")?;
@@ -127,6 +172,7 @@ fn encode_scaled(
     scene: &SceneEntry,
     crop: Option<Crop>,
     scale: (u32, u32),
+    hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
 ) -> Result<()> {
     let mut ff = spawn_scaler(scale)?;
 
@@ -148,7 +194,7 @@ fn encode_scaled(
     let enc_err_t = std::thread::spawn(move || { let mut s = String::new(); let _ = enc_err.read_to_string(&mut s); s });
 
     let mut ff_in = BufWriter::with_capacity(256 * 1024, ff.stdin.take().expect("ffmpeg stdin unavailable"));
-    let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, crop);
+    let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, crop, hdr_metadata);
     drop(ff_in);
 
     let ff_status  = ff.wait().context("wait for ffmpeg scaler")?;
@@ -294,60 +340,11 @@ fn video_packet_count(path: &Path) -> Result<u64> {
         .context("ffprobe reported no video frame count for the output")
 }
 
-/// Absolute, because the demuxer resolves against the list file's own directory, and
-/// escaped for the concat parser, not the shell.
-fn concat_entry(path: &Path) -> Result<String> {
-    let abs = std::path::absolute(path)
-        .with_context(|| format!("absolute path for {}", path.display()))?;
-    let path_str = abs.to_str()
-        .with_context(|| format!("non-UTF8 chunk path: {}", abs.display()))?;
-    let escaped: String = path_str
-        .chars()
-        .flat_map(|c| {
-            let escape = matches!(c, '\\' | '\'' | '"' | ' ' | '\t' | '#');
-            escape.then_some('\\').into_iter().chain(std::iter::once(c))
-        })
-        .collect();
-    Ok(format!("file {escaped}"))
-}
-
-pub fn concat_chunks(
-    chunk_paths: &[PathBuf],
-    output_path: &Path,
-    list_dir: &Path,
-) -> Result<()> {
-    // Generous: a stream copy of the whole video. It bounds a wedge, not the runtime.
-    const TIMEOUT_SECS: u64 = 3600;
-
-    let list_path = list_dir.join("concat_list.txt");
-
-    {
-        let mut f = std::fs::File::create(&list_path).context("create concat_list.txt")?;
-        for p in chunk_paths {
-            writeln!(f, "{}", concat_entry(p)?).context("write concat_list.txt")?;
-        }
-    }
-
-    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(["-f", "concat", "-safe", "0", "-i"])
-        .arg(&list_path)
-        .args(["-c:v", "copy", "-map_metadata", "-1", "-an", "-sn"])
-        .arg(output_path);
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg concat")?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffmpeg concat failed:\n{stderr}");
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     fn params(pairs: &[(&str, i64)]) -> HashMap<String, toml::Value> {
         pairs.iter().map(|(k, v)| (k.to_string(), toml::Value::Integer(*v))).collect()
@@ -355,17 +352,6 @@ mod tests {
 
     fn cfg(encoder_params: HashMap<String, toml::Value>) -> Config {
         Config { encoder: Some(Encoder::SvtAv1), encoder_params, ..Default::default() }
-    }
-
-    #[test]
-    fn concat_entry_is_absolute_and_escaped() {
-        // A relative chunk path would be resolved against the list file's own directory.
-        let line = concat_entry(Path::new("output/.avet_a/chunks/00001.ivf")).unwrap();
-        let path = line.strip_prefix("file ").unwrap();
-        assert!(path.starts_with('/'), "not absolute: {line}");
-
-        let line = concat_entry(Path::new("/tmp/Movie \"Title\" #1/c.ivf")).unwrap();
-        assert_eq!(line, "file /tmp/Movie\\ \\\"Title\\\"\\ \\#1/c.ivf");
     }
 
     #[test]

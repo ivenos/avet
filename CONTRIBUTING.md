@@ -23,11 +23,15 @@ docker build -t avet:test .
 cargo test --locked           # unit tests
 ./test/run.sh                 # build the image, then run test/suites/
 ./test/run.sh --no-build      # reuse the existing image
+./test/run.sh -j 4            # at most 4 suites at once, half the CPU cores by default
 ./test/run.sh audio           # only suites matching "audio"
 ```
 
 The integration suites test the binary inside the image, so rebuild it after a
-change. `test/local/` is gitignored for trying the image on your own samples.
+change. Assertions use the image's own ffmpeg and mkvtoolnix, fixtures come from
+`test/fixtures.sh`, and `test/suites/selftest.sh` checks that every assertion
+fails on a broken file. `test/local/` is gitignored for trying the image on your
+own samples.
 
 ## Code style
 
@@ -73,8 +77,9 @@ gets the AppImages. Release notes follow Keep a Changelog
 
 `Cargo.lock` is committed and CI builds with `--locked`. The pinned sources
 (SVT-AV1, SVT-AV1-HDR, FFMS2, Vship, libvmaf, Rust) are set in both the
-`Dockerfile` and `.github/workflows/appimage.yml`; change them together. FFmpeg
-in `appimage.yml` follows the image's Alpine version and is bumped by hand. Base
+`Dockerfile` and `.github/workflows/appimage.yml`; change them together. Both
+apply `packaging/ffms2-frame-hdr-metadata.patch` to FFMS2. FFmpeg in
+`appimage.yml` follows the image's Alpine version and is bumped by hand. Base
 images and GitHub Actions stay on version tags.
 
 ## Pull requests

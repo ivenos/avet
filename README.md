@@ -26,7 +26,7 @@ avet is an AV1 encoding service. It watches a folder, splits each video into sce
 - Scene-based parallel encoding with [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr)
 - Resumes from the last finished chunk after a restart
 - Target quality: a CRF per chunk from a [CVVDP](https://codeberg.org/Line-fr/Vship) score, with optional [CAMBI](https://github.com/Netflix/vmaf/blob/master/resource/doc/cambi.md) banding limits (GPU required)
-- HDR10, HLG, HDR10+ and Dolby Vision profiles 7 and 8
+- HDR10, HLG, HDR10+ and Dolby Vision profiles 5, 7 and 8
 - Automatic crop, downscale and keyframe interval
 - Per-track audio and subtitle rules with language filters
 
@@ -82,6 +82,7 @@ output/
 ```
 
 - Supported extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. Only the first video track is encoded.
+- Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Aspect ratio, rotation, the colour description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
 - A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
 - Output files are named after the source, so two queued files with the same name in the same folder wait until one is renamed.
@@ -110,7 +111,6 @@ preset = 6
 crf    = 28
 
 [avet]
-hdr       = true
 crop      = true
 keyint    = true
 scale     = 1080
@@ -169,7 +169,7 @@ jod = 9.5
 | Key | Default | Description |
 |---|---|---|
 | `video` | `"encode"` | `"copy"` passes the video through and only processes audio and subtitles |
-| `hdr` | `false` | Pass HDR metadata to the encoder. HDR10+ and Dolby Vision 7 and 8 keep their HDR10 base layer; Dolby Vision 5 is refused |
+| `dv` | `false` | Carry Dolby Vision into the output as AV1 profile 10, converting profile 7 to 8.1 first. Without it, Dolby Vision 7 and 8 keep only their HDR10 base layer and Dolby Vision 5 is refused |
 | `crop` | `false` | Remove black bars |
 | `keyint` | `false` | Keyframe every ~5 s from the frame rate, unless `keyint` is in `[encoder_params]` |
 | `scale` | - | Maximum output height, at least `64`. Taller sources are scaled down with Lanczos |
@@ -188,6 +188,8 @@ jod = 9.5
 
 - The whitelist matches both spellings (`deu` and `ger`). Tracks without a language or tagged `und` are always kept.
 - Re-encoded tracks get the codec added to their title, e.g. `English 5.1 (Opus)`.
+- Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM.
+- Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1.
 
 `[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.
 
@@ -204,7 +206,7 @@ eac3 = { mode = "encode", codec = "libopus", bitrate = "192k" }
 | `mode` | `"copy"` | `"copy"` or `"strip"` |
 | `language_whitelist` | `[]` | Same rules as for audio |
 
-Chapters are always kept.
+Chapters are always kept. Subtitle tracks Matroska cannot hold, such as TTML, are skipped.
 
 ### `[scene_detection]`
 

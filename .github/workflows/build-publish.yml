@@ -45,17 +45,14 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked
 
-  integration:
+  # Built once here, then shared: every suite below runs on its own runner in parallel.
+  image:
     runs-on: ubuntu-latest
-    needs: test
     timeout-minutes: 45
+    outputs:
+      suites: ${{ steps.suites.outputs.list }}
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -66,19 +63,56 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          load: true
           tags: avet:test
+          outputs: type=docker,dest=${{ runner.temp }}/avet-test.tar
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
 
+      - name: Upload test image
+        uses: actions/upload-artifact@v7
+        with:
+          name: avet-test-image
+          path: ${{ runner.temp }}/avet-test.tar
+          if-no-files-found: error
+          retention-days: 1
+
+      # From the directory, so a new suite gets its runner without touching this file.
+      - name: List suites
+        id: suites
+        run: |
+          echo "list=$(find test/suites -name '*.sh' -printf '%f\n' | sed 's/\.sh$//' | sort | jq -Rsc 'split("\n")[:-1]')" >> "$GITHUB_OUTPUT"
+
+  integration:
+    name: integration (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    needs: image
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.image.outputs.suites) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download test image
+        uses: actions/download-artifact@v8
+        with:
+          name: avet-test-image
+          path: ${{ runner.temp }}
+
+      - name: Load test image
+        run: docker load -i "$RUNNER_TEMP/avet-test.tar"
+
       - name: Run integration tests
-        run: ./test/run.sh --no-build
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: ./test/run.sh --no-build "$SUITE"
 
   # The arm64 side of what the integration job proves for amd64. On pushes too: changes
   # land as direct pushes to main, and a PR-only job would miss them.
   build-arm64:
     name: Build arm64 (no push)
-    needs: [test, integration]
+    needs: test
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:

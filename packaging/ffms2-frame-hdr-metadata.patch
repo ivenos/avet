@@ -1,0 +1,16 @@
+diff --git a/src/core/videosource.cpp b/src/core/videosource.cpp
+index 018c005..4600640 100644
+--- a/src/core/videosource.cpp
++++ b/src/core/videosource.cpp
+@@ -139,6 +139,11 @@ FFMS_Frame *FFMS_VideoSource::OutputFrame(AVFrame *Frame) {
+     /* MasteringDisplayMinLuminance can be 0 */
+     LocalFrame.HasMasteringDisplayLuminance = !!LocalFrame.MasteringDisplayMaxLuminance;
+ 
++    LocalFrame.DolbyVisionRPU = nullptr;
++    LocalFrame.DolbyVisionRPUSize = 0;
++    LocalFrame.HDR10Plus = nullptr;
++    LocalFrame.HDR10PlusSize = 0;
++
+     const AVFrameSideData *DolbyVisionRPUSideData = av_frame_get_side_data(Frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
+     if (DolbyVisionRPUSideData) {
+         if (DolbyVisionRPUSideData->size > RPUBufferSize) {

@@ -7,6 +7,7 @@ use crate::audio;
 use crate::config::{Config, TargetQualityConfig, VideoMode};
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
+use crate::hdr::DynamicHdr;
 use crate::resume::{CrfCache, DoneFile, SceneEntry, TempDir};
 use crate::scanner::Job;
 use crate::scene;
@@ -82,15 +83,16 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         return run_copy(job, ctx, &config, stem, &temp);
     }
 
+    let video_file = frame_accurate_source(&job.source_file, &temp, stem)?;
     if !temp.index_path.exists() {
         tracing::info!("[{stem}] indexing");
-        ffms2::run_ffmsindex(&job.source_file, &temp.index_path)?;
+        ffms2::run_ffmsindex(&video_file, &temp.index_path)?;
         tracing::info!("[{stem}] indexing done");
     } else {
         tracing::info!("[{stem}] reusing existing index");
     }
 
-    let video_source = ffms2::VideoSource::open(&job.source_file, &temp.index_path, ffms2::OpenOpts::default())?;
+    let video_source = ffms2::VideoSource::open(&video_file, &temp.index_path, ffms2::OpenOpts::default())?;
     let video_info = video_source.info.clone();
     let source_timestamps = video_source.timestamps_ms()?;
     drop(video_source);
@@ -106,48 +108,89 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .unwrap_or(6);
     let num_workers = workers::calculate(&video_info, stem, threads_per_worker);
 
-    let (fps_num, fps_den) = probe_fps(&job.source_file)?;
+    let source_video = probe_source_video(&job.source_file)?;
+    let (fps_num, fps_den) = (source_video.fps_num, source_video.fps_den);
     let fps = fps_num as f64 / fps_den as f64;
 
     let timestamps = match vfr_timestamps(&source_timestamps, fps_num, fps_den, stem) {
         Some(ts) => {
             tracing::info!("[{stem}] variable frame rate: keeping the source timestamps");
-            write_timestamps(&temp.timestamps_path, &ts)?;
+            write_timestamps(&temp.timestamps_path, &ts, source_video.offset_ms)?;
             Some(temp.timestamps_path.as_path())
         }
         None => None,
     };
 
-    let hdr_args: Vec<String> = if config.avet.hdr {
-        let hdr = crate::hdr::detect(&job.source_file)?;
-        // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
-        if hdr.dv_profile == Some(5) {
-            bail!(
-                "Dolby Vision profile 5 has no HDR10 base layer, so avet cannot encode it \
-                 correctly. Convert the source to profile 8 or to plain HDR10 first."
-            );
+    let hdr = crate::hdr::detect(&job.source_file)?;
+    let chroma_center = hdr.chroma_center;
+    let dv = config.avet.dv;
+    // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
+    if hdr.dv_profile == Some(5) && !dv {
+        bail!(
+            "Dolby Vision profile 5 has no HDR10 base layer, so avet cannot encode it \
+             without its RPU. Set avet.dv = true, or convert the source to \
+             profile 8 or to plain HDR10 first."
+        );
+    }
+    match (hdr.dv_profile, hdr.hdr_type.as_str()) {
+        (Some(p), _) if dv => tracing::info!(
+            "[{stem}] HDR: Dolby Vision profile {p} (carried as AV1 profile 10)"
+        ),
+        (Some(p), _) => tracing::info!(
+            "[{stem}] HDR: Dolby Vision profile {p} (RPU dropped, HDR10 base layer kept)"
+        ),
+        (None, "Dolby Vision") if dv => tracing::warn!(
+            "[{stem}] HDR: Dolby Vision of unknown profile (carried as AV1 profile 10)"
+        ),
+        (None, "Dolby Vision") => tracing::warn!(
+            "[{stem}] HDR: Dolby Vision of unknown profile (RPU dropped; the base layer \
+             is only a valid HDR10 picture on profiles 7 and 8)"
+        ),
+        (None, "HDR10+") => tracing::info!(
+            "[{stem}] HDR: HDR10+ (dynamic metadata carried)"
+        ),
+        (None, "SDR") => {}
+        (None, t) => tracing::info!("[{stem}] HDR: {t}"),
+    }
+    if hdr.hdr10plus && hdr.hdr_type != "HDR10+" {
+        tracing::info!("[{stem}] HDR: also HDR10+ (dynamic metadata carried)");
+    }
+    let missing = hdr.missing_static_metadata();
+    if !missing.is_empty() {
+        tracing::warn!("[{stem}] HDR metadata incomplete - missing: {}", missing.join(", "));
+    }
+    // Only what the source has: a profile's HDR10 encodes keep their fingerprint.
+    let dynamic_hdr = DynamicHdr {
+        hdr10plus: hdr.hdr10plus,
+        dolby_vision: dv && hdr.hdr_type == "Dolby Vision",
+    };
+    let hdr_args = hdr.encoder_args();
+    let hevc_source = hdr.codec_name == "hevc";
+
+    let hdr10plus_frames = if dynamic_hdr.hdr10plus && hevc_source {
+        tracing::info!("[{stem}] HDR10+: reading it from the bitstream");
+        match crate::hevc::hdr10plus_frames(&job.source_file, &temp.hdr10plus_path) {
+            Ok(frames) if frames.len() == video_info.num_frames as usize => Some(frames),
+            Ok(frames) => {
+                tracing::warn!(
+                    "[{stem}] HDR10+: the bitstream holds {} pictures, the index {} - using the decoder's values",
+                    frames.len(), video_info.num_frames
+                );
+                None
+            }
+            Err(e) if is_transient(&e) => return Err(e),
+            Err(e) => {
+                tracing::warn!("[{stem}] HDR10+: could not read it from the bitstream - using the decoder's values: {e:#}");
+                None
+            }
         }
-        match (hdr.dv_profile, hdr.hdr_type.as_str()) {
-            (Some(p), _) => tracing::info!(
-                "[{stem}] HDR: Dolby Vision profile {p} (RPU dropped, HDR10 base layer kept)"
-            ),
-            (None, "Dolby Vision") => tracing::warn!(
-                "[{stem}] HDR: Dolby Vision of unknown profile (RPU dropped; the base layer \
-                 is only a valid HDR10 picture on profiles 7 and 8)"
-            ),
-            (None, "HDR10+") => tracing::info!(
-                "[{stem}] HDR: HDR10+ (dynamic metadata dropped, static HDR10 kept)"
-            ),
-            (None, t) => tracing::info!("[{stem}] HDR: {t}"),
-        }
-        hdr.encoder_args()
     } else {
-        Vec::new()
+        None
     };
 
     let crop_str: Option<String> = if config.avet.crop {
         let duration_secs = video_info.num_frames as f64 / fps;
-        crate::crop::detect(&job.source_file, duration_secs, &temp.crop_cache, stem)?
+        crate::crop::detect(&video_file, duration_secs, &temp.crop_cache, stem)?
     } else {
         None
     };
@@ -176,6 +219,8 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         fps_num,
         fps_den,
         target_bit_depth: config.avet.bit_depth,
+        dynamic_hdr,
+        hdr10plus_frames,
     };
 
     let merged_args = encode::merged_encoder_args(&config, &encode_opts);
@@ -195,7 +240,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     } else {
         tracing::info!("[{stem}] scene detection");
         let scenes = scene::detect(
-            &job.source_file,
+            &video_file,
             &config.scene_detection,
             scene_vf.as_deref(),
             fps,
@@ -293,7 +338,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     };
 
     let wctx = WorkerCtx {
-        source: &job.source_file,
+        source: &video_file,
         temp: &temp,
         config: &config,
         opts: &encode_opts,
@@ -351,16 +396,37 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let video_only  = temp.video_path.clone();
     let chunk_paths: Vec<PathBuf> =
         scenes.iter().map(|s| temp.chunk_path(&s.padded_index())).collect();
-    encode::concat_chunks(&chunk_paths, &video_only, &temp.path)?;
+    crate::av1::concat_ivf(&chunk_paths, &video_only)?;
 
     tracing::info!("[{stem}] processing audio");
-    let video = MuxVideo { path: &video_only, timestamps, remove: true, expected_frames: Some(total_frames) };
+    let mut video_args = crate::hdr::mkvmerge_colour_args(&merged_args, 0);
+    if chroma_center {
+        video_args.extend(["--chroma-siting".into(), "0:2,2".into()]);
+    }
+    // mkvmerge ignores --sync on a track that gets a timestamps file, which carries it instead.
+    if timestamps.is_none() && source_video.offset_ms != 0 {
+        video_args.extend(["--sync".into(), format!("0:{}", source_video.offset_ms)]);
+    }
+    let (out_w, out_h) = scale_target
+        .or(encode_opts.crop.map(|c| (c.w, c.h)))
+        .unwrap_or((video_info.width, video_info.height));
+    video_args.extend(source_video.display_args(out_w, out_h));
+    let video = MuxVideo {
+        path: &video_only,
+        args: video_args,
+        timestamps,
+        source_shift_ms: -source_video.matroska_start_ms,
+        remove: true,
+        expected_frames: Some(total_frames),
+    };
     finalize(job, ctx, &config, &temp, &audio_plan, video)
 }
 
 struct MuxVideo<'a> {
-    /// The merged encode (run) or the untouched source (run_copy).
+    /// The merged encode (run), or the source or its Matroska copy (run_copy).
     path: &'a Path,
+    args: Vec<String>,
+    source_shift_ms: i64,
     /// Timecodes v2 file replacing the encode's constant frame rate.
     timestamps: Option<&'a Path>,
     /// Delete `path` after muxing; true only when it is avet's own temp file.
@@ -379,10 +445,8 @@ fn finalize(
     video: MuxVideo<'_>,
 ) -> Result<()> {
     let stem = job.stem();
-    audio::process_plan(&job.source_file, &temp.audio_path, audio_plan)?;
-    let audio_path = &temp.audio_path;
-
-    let subtitle_sel = crate::subtitle::select_tracks(&job.source_file, &config.subtitles)?;
+    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
+    audio::extract(&job.source_file, &temp.tracks_path, audio_plan, &subtitles.extract)?;
 
     let final_output = job.output_dir(&ctx.output_dir).join(format!("{stem}.mkv"));
     // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
@@ -394,7 +458,16 @@ fn finalize(
 
     // Into the temp dir first: the next scan reads a half-written output as "already done".
     tracing::info!("[{stem}] muxing to {}", final_output.display());
-    audio::mux_final(video.path, video.timestamps, audio_path, &job.source_file, &temp.mux_path, &subtitle_sel)?;
+    audio::mux_final(
+        video.path, &video.args, video.timestamps, &temp.tracks_path, &job.source_file,
+        video.source_shift_ms, &subtitles.from_source, &temp.mux_path,
+    )?;
+    if video.expected_frames.is_none() {
+        realign_copied_video(&job.source_file, temp, stem)?;
+    }
+    if let Err(e) = crate::mkv::trim_av1_codec_private(&temp.mux_path) {
+        tracing::warn!("[{stem}] could not remove frame metadata from the AV1 codec private data: {e:#}");
+    }
 
     if video.remove {
         let _ = std::fs::remove_file(video.path);
@@ -420,6 +493,130 @@ fn finalize(
 
     tracing::info!("[{stem}] done");
     Ok(())
+}
+
+/// FFMS2 puts the frames of AVI video with runs of B-frames out of order, having only decode
+/// times to go by; with timestamps generated into a Matroska copy it does not.
+fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct Probe { #[serde(default)] streams: Vec<Stream>, #[serde(default)] format: Format }
+    #[derive(serde::Deserialize)]
+    struct Stream { #[serde(default)] has_b_frames: u32 }
+    #[derive(serde::Deserialize, Default)]
+    struct Format { #[serde(default)] format_name: String }
+
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0",
+          "-show_entries", "stream=has_b_frames:format=format_name", "-of", "json"],
+        source,
+    )?;
+    let Some(video) = probe.streams.first() else { return Ok(source.to_path_buf()) };
+    if probe.format.format_name != "avi" || video.has_b_frames == 0 {
+        return Ok(source.to_path_buf());
+    }
+    if temp.remux_path.exists() {
+        return Ok(temp.remux_path.clone());
+    }
+
+    tracing::info!("[{stem}] AVI with B-frames: working from a Matroska copy of the video");
+    let _ = std::fs::remove_file(&temp.index_path);
+    let part = temp.remux_path.with_extension("mkv.part");
+    let mut cmd = std::process::Command::new(crate::ext::external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-fflags", "+genpts", "-i"])
+        .arg(source)
+        .args(["-map", "0:v:0", "-c", "copy", "-f", "matroska"])
+        .arg(&part);
+    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "ffmpeg remux")?;
+    if !out.status.success() {
+        bail!("ffmpeg remux failed:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+    std::fs::rename(&part, &temp.remux_path)
+        .with_context(|| format!("move {} to {}", part.display(), temp.remux_path.display()))?;
+    Ok(temp.remux_path.clone())
+}
+
+/// mkvmerge's time zero for a copied FLV, MP4 edit list or wrapping MPEG-TS is not ffmpeg's,
+/// which the audio and extracted subtitles are on.
+fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Format { #[serde(default)] format: FormatStart }
+    #[derive(serde::Deserialize, Default)]
+    struct FormatStart { start_time: Option<String> }
+
+    let format: Format = crate::ext::ffprobe_json(
+        &["-v", "error", "-show_entries", "format=start_time", "-of", "json"],
+        source,
+    )?;
+    let source_start = format.format.start_time.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    let (Some(first), Some(actual)) = (first_video_pts(source)?, first_video_pts(&temp.mux_path)?) else {
+        return Ok(());
+    };
+    // Can be negative: frames an MP4 edit list skips still play from the copied stream.
+    let expected = first - source_start;
+    let lead = (-expected).max(0.0);
+    let video_ms = ((expected + lead - actual) * 1000.0).round() as i64;
+    let others_ms = (lead * 1000.0).round() as i64;
+    if video_ms.abs() <= 1 && others_ms == 0 {
+        return Ok(());
+    }
+    tracing::info!("[{stem}] moving the copied video by {video_ms} ms and the rest by {others_ms} ms");
+
+    let muxed = track_types(&temp.mux_path)?;
+    let extracted = if temp.tracks_path.exists() { track_types(&temp.tracks_path)?.len() } else { 0 };
+    let videos = muxed.iter().take_while(|t| *t == "video").count();
+
+    let realigned = temp.path.join("realigned.mkv");
+    let mut cmd = std::process::Command::new(crate::ext::external_bin("mkvmerge"));
+    cmd.arg("-o").arg(&realigned);
+    for id in 0..muxed.len() {
+        let ms = if id >= videos && id < videos + extracted { others_ms } else { video_ms };
+        cmd.arg("--sync").arg(format!("{id}:{ms}"));
+    }
+    if others_ms != 0 && crate::audio::has_chapters(&temp.mux_path)? {
+        cmd.arg("--chapter-sync").arg(others_ms.to_string());
+    }
+    cmd.arg(&temp.mux_path);
+    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
+    if out.status.code().unwrap_or(2) >= 2 {
+        bail!("mkvmerge failed:\n{}", String::from_utf8_lossy(&out.stdout));
+    }
+    std::fs::rename(&realigned, &temp.mux_path)
+        .with_context(|| format!("move {} to {}", realigned.display(), temp.mux_path.display()))
+}
+
+/// The earliest time among the first packets; AVI gives presentation times to B-frames alone.
+fn first_video_pts(path: &Path) -> Result<Option<f64>> {
+    #[derive(serde::Deserialize)]
+    struct Packets { #[serde(default)] packets: Vec<Packet> }
+    #[derive(serde::Deserialize)]
+    struct Packet { pts_time: Option<String>, dts_time: Option<String> }
+
+    let probe: Packets = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#32",
+          "-show_entries", "packet=pts_time,dts_time", "-of", "json"],
+        path,
+    )?;
+    let earliest = |time: fn(&Packet) -> Option<&String>| {
+        probe.packets.iter().filter_map(|p| time(p)?.parse::<f64>().ok()).reduce(f64::min)
+    };
+    if probe.packets.iter().all(|p| p.pts_time.is_some()) {
+        Ok(earliest(|p| p.pts_time.as_ref()))
+    } else {
+        Ok(earliest(|p| p.dts_time.as_ref()))
+    }
+}
+
+fn track_types(path: &Path) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Identify { tracks: Vec<Track> }
+    #[derive(serde::Deserialize)]
+    struct Track { #[serde(rename = "type")] track_type: String }
+
+    let mut cmd = std::process::Command::new(crate::ext::external_bin("mkvmerge"));
+    cmd.args(["--identify", "--identification-format", "json"]).arg(path);
+    let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
+    let identify: Identify = serde_json::from_slice(&out.stdout).context("parse mkvmerge identify output")?;
+    Ok(identify.tracks.into_iter().map(|t| t.track_type).collect())
 }
 
 /// Never over an existing file: two seasons can each have an `Episode 01.mkv`.
@@ -559,13 +756,19 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
     }
 
     tracing::info!("[{stem}] copy video, processing audio");
-    let video = MuxVideo { path: &job.source_file, timestamps: None, remove: false, expected_frames: None };
+    let source_shift_ms = -probe_source_video(&job.source_file)?.matroska_start_ms;
+    // mkvmerge times the B-frames of an AVI no better than FFMS2 orders them.
+    let video_file = frame_accurate_source(&job.source_file, temp, stem)?;
+    let video = MuxVideo {
+        path: &video_file, args: Vec::new(), timestamps: None, source_shift_ms,
+        remove: false, expected_frames: None,
+    };
     finalize(job, ctx, config, temp, &audio_plan, video)
 }
 
 fn ignored_video_opts(a: &crate::config::AvetConfig) -> Vec<&'static str> {
     let mut v = Vec::new();
-    if a.hdr { v.push("hdr"); }
+    if a.dv { v.push("dv"); }
     if a.crop { v.push("crop"); }
     if a.keyint { v.push("keyint"); }
     if a.scale.is_some() { v.push("scale"); }
@@ -591,6 +794,14 @@ fn compute_output_params(
             );
         }
         n
+    })
+    // SVT-AV1 drops an odd last column or row itself; doing it here keeps every stage aligned.
+    .or_else(|| {
+        let even = Crop { w: src_w & !1, h: src_h & !1, x: 0, y: 0 };
+        ((even.w, even.h) != (src_w, src_h)).then(|| {
+            tracing::info!("[{stem}] odd frame size {src_w}x{src_h}: encoding {}x{}", even.w, even.h);
+            even
+        })
     });
 
     let (eff_w, eff_h) = match src_crop {
@@ -639,7 +850,7 @@ fn profile_fingerprint(
     tq: Option<&TargetQualityConfig>,
 ) -> String {
     use std::hash::{Hash, Hasher};
-    let parts = [
+    let mut parts = vec![
         format!("{encoder:?}"),
         merged_args.join(" "),
         format!("{:?}", opts.scale),
@@ -648,6 +859,9 @@ fn profile_fingerprint(
         format!("{scene_cfg:?}"),
         format!("{tq:?}"),
     ];
+    if opts.dynamic_hdr.any() {
+        parts.push(format!("{:?}", opts.dynamic_hdr));
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     parts.join("|").hash(&mut h);
     format!("{:016x}", h.finish())
@@ -776,30 +990,100 @@ fn vfr_timestamps(ts: &[f64], fps_num: u32, fps_den: u32, stem: &str) -> Option<
     Some(rebased)
 }
 
-fn write_timestamps(path: &Path, ts: &[f64]) -> Result<()> {
+fn write_timestamps(path: &Path, ts: &[f64], offset_ms: i64) -> Result<()> {
     use std::fmt::Write;
     let mut text = String::from("# timestamp format v2\n");
     for t in ts {
-        let _ = writeln!(text, "{t:.3}");
+        let _ = writeln!(text, "{:.3}", t + offset_ms as f64);
     }
     std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
-fn probe_fps(source: &Path) -> Result<(u32, u32)> {
-    #[derive(serde::Deserialize)]
-    struct Probe { streams: Vec<Stream> }
-    #[derive(serde::Deserialize)]
-    struct Stream { avg_frame_rate: String }
+/// What the video stream needs beyond its frames to play back where and how it did.
+#[derive(Debug, PartialEq)]
+struct SourceVideo {
+    fps_num: u32,
+    fps_den: u32,
+    /// First frame after the container start, which ffmpeg rebases the audio to.
+    offset_ms: i64,
+    /// mkvmerge reads a Matroska source's own tracks and chapters without that rebase.
+    matroska_start_ms: i64,
+    sar: Option<(u32, u32)>,
+    /// Degrees counter-clockwise, as ffprobe reports the display matrix.
+    rotation: i64,
+}
 
-    let p: Probe = crate::ext::ffprobe_json(
+impl SourceVideo {
+    fn display_args(&self, width: u32, height: u32) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some((n, d)) = self.sar.filter(|&(n, d)| n > 0 && d > 0 && n != d) {
+            let display_width = (u64::from(width) * u64::from(n) + u64::from(d) / 2) / u64::from(d);
+            args.extend(["--display-dimensions".into(), format!("0:{display_width}x{height}")]);
+        }
+        if self.rotation != 0 {
+            args.extend(["--projection-pose-roll".into(), format!("0:{}", self.rotation)]);
+        }
+        args
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct VideoProbe { streams: Vec<VideoProbeStream>, #[serde(default)] format: VideoProbeFormat }
+#[derive(serde::Deserialize)]
+struct VideoProbeStream {
+    avg_frame_rate: String,
+    start_time: Option<String>,
+    sample_aspect_ratio: Option<String>,
+    #[serde(default)]
+    side_data_list: Vec<VideoProbeSideData>,
+}
+#[derive(serde::Deserialize)]
+struct VideoProbeSideData { rotation: Option<f64> }
+#[derive(serde::Deserialize, Default)]
+struct VideoProbeFormat { #[serde(default)] format_name: String, start_time: Option<String> }
+
+fn probe_source_video(source: &Path) -> Result<SourceVideo> {
+    let probe: VideoProbe = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "v:0",
-          "-show_entries", "stream=avg_frame_rate", "-of", "json"],
+          "-show_entries", "stream=avg_frame_rate,start_time,sample_aspect_ratio",
+          "-show_entries", "stream_side_data=rotation",
+          "-show_entries", "format=format_name,start_time",
+          "-of", "json"],
         source,
     )?;
-    let rate = p.streams.into_iter().next()
-        .map(|s| s.avg_frame_rate)
-        .context("ffprobe found no video stream")?;
+    SourceVideo::from_probe(probe)
+}
 
+impl SourceVideo {
+    fn from_probe(probe: VideoProbe) -> Result<Self> {
+        let stream = probe.streams.into_iter().next().context("ffprobe found no video stream")?;
+        let (fps_num, fps_den) = parse_fps(&stream.avg_frame_rate)?;
+
+        let ms = |t: Option<&str>| t.and_then(|t| t.parse::<f64>().ok()).map(|s| (s * 1000.0).round() as i64);
+        let container_start = ms(probe.format.start_time.as_deref()).unwrap_or(0);
+        let video_start = ms(stream.start_time.as_deref()).unwrap_or(container_start);
+
+        let sar = stream.sample_aspect_ratio.as_deref()
+            .and_then(|r| r.split_once(':'))
+            .and_then(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?)));
+        let rotation = stream.side_data_list.iter()
+            .find_map(|s| s.rotation)
+            .map(|r| (r.round() as i64).rem_euclid(360))
+            .map(|r| if r > 180 { r - 360 } else { r })
+            .unwrap_or(0);
+
+        Ok(SourceVideo {
+            fps_num,
+            fps_den,
+            offset_ms: (video_start - container_start).max(0),
+            matroska_start_ms: if probe.format.format_name.contains("matroska") { container_start } else { 0 },
+            sar,
+            rotation,
+        })
+    }
+}
+
+fn parse_fps(rate: &str) -> Result<(u32, u32)> {
     if let Some((n, d)) = rate.split_once('/') {
         let n: u32 = n.trim().parse().context("parse fps numerator")?;
         let d: u32 = d.trim().parse().context("parse fps denominator")?;
@@ -841,6 +1125,13 @@ mod tests {
 
         let tq = crate::config::TargetQualityConfig { jod: 9.6, ..Default::default() };
         assert_ne!(base, profile_fingerprint(enc, &args, &opts(), &sc, Some(&tq)));
+
+        let mut o = opts();
+        o.dynamic_hdr = DynamicHdr { hdr10plus: true, dolby_vision: false };
+        let hdr10plus = profile_fingerprint(enc, &args, &o, &sc, None);
+        assert_ne!(base, hdr10plus);
+        o.dynamic_hdr.dolby_vision = true;
+        assert_ne!(hdr10plus, profile_fingerprint(enc, &args, &o, &sc, None));
     }
 }
 
@@ -896,6 +1187,55 @@ mod output_param_tests {
         assert_eq!((crop.w, crop.h, crop.x, crop.y), (1920, 800, 0, 140));
         assert_eq!(vf.as_deref(), Some("crop=1920:800:0:140"));
         assert_eq!(scale, None);
+    }
+
+    fn source_video(json: &str) -> SourceVideo {
+        SourceVideo::from_probe(serde_json::from_str(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn stream_offsets_are_measured_from_the_container_start() {
+        let ts = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "start_time": "1.721000"}],
+            "format": {"format_name": "mpegts", "start_time": "1.400000"}}"#);
+        assert_eq!((ts.offset_ms, ts.matroska_start_ms), (321, 0));
+
+        // mkvmerge keeps a Matroska source's own timeline, so its start has to be undone.
+        let mkv = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "start_time": "5.300000"}],
+            "format": {"format_name": "matroska,webm", "start_time": "5.000000"}}"#);
+        assert_eq!((mkv.offset_ms, mkv.matroska_start_ms), (300, 5000));
+
+        let bare = source_video(r#"{"streams": [{"avg_frame_rate": "24000/1001"}]}"#);
+        assert_eq!((bare.fps_num, bare.fps_den, bare.offset_ms, bare.matroska_start_ms), (24000, 1001, 0, 0));
+    }
+
+    #[test]
+    fn aspect_and_rotation_become_mkvmerge_options() {
+        let anamorphic = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "64:45"}]}"#);
+        assert_eq!(anamorphic.display_args(720, 576), ["--display-dimensions", "0:1024x576"]);
+        assert_eq!(anamorphic.display_args(360, 288), ["--display-dimensions", "0:512x288"]);
+
+        let square = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "1:1"}]}"#);
+        assert!(square.display_args(1920, 1080).is_empty());
+        let unknown = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "0:1"}]}"#);
+        assert!(unknown.display_args(1920, 1080).is_empty());
+
+        let rotated = |r: &str| source_video(&format!(
+            r#"{{"streams": [{{"avg_frame_rate": "30/1", "side_data_list": [{{"rotation": {r}}}]}}]}}"#
+        )).rotation;
+        assert_eq!([rotated("90"), rotated("-90"), rotated("270"), rotated("180"), rotated("-180"), rotated("0")],
+                   [90, -90, -90, 180, 180, 0]);
+        assert_eq!(source_video(r#"{"streams": [{"avg_frame_rate": "30/1", "side_data_list": [{"rotation": 90}]}]}"#)
+            .display_args(640, 360), ["--projection-pose-roll", "0:90"]);
+    }
+
+    #[test]
+    fn an_odd_frame_size_loses_its_last_column_and_row_up_front() {
+        let (scale, crop, vf) = compute_output_params(321, 181, None, None, "t");
+        assert_eq!(crop, Some(Crop { w: 320, h: 180, x: 0, y: 0 }));
+        assert_eq!(vf.as_deref(), Some("crop=320:180:0:0"));
+        assert_eq!(scale, None);
+
+        assert_eq!(compute_output_params(320, 180, None, None, "t").1, None);
     }
 
     #[test]

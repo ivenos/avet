@@ -107,4 +107,46 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "sub default: no output"
 assert_subtitle_track_count "$O/test.mkv" 2
 
+run_subs() { # NAME FIXTURE [SUBTITLE_LINES]
+    I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"
+    SRC="$FIXTURES_DIR/$2"
+    cp "$SRC" "$I/p/test.${2##*.}"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n%b' "${3:-}" > "$I/p/encode.toml"
+    run_avet "$I" "$O" "$O/test.mkv" 120 || fail "$1: no output"
+}
+
+# -- bitmap and timed text from every container: the same tracks, shown at the same time -------
+run_subs bitmap subs_bitmap.mkv
+assert_subtitle_track_count "$O/test.mkv" 3
+assert_tracks_match "$O/test.mkv" "$SRC" s
+for i in 0 1 2; do
+    assert_subtitle_events_match "$O/test.mkv" "s:$i" "$SRC" "s:$i"
+done
+
+for fixture in subs_bitmap.m2ts subs_dvb.ts subs_text.mp4; do
+    run_subs "$fixture" "$fixture"
+    assert_subtitle_track_count "$O/test.mkv" 2
+    [ "$fixture" = subs_text.mp4 ] || assert_tracks_match "$O/test.mkv" "$SRC" s
+    for i in 0 1; do
+        assert_subtitle_events_match "$O/test.mkv" "s:$i" "$SRC" "s:$i"
+    done
+done
+assert_subtitle_language "$O/test.mkv" 0 eng
+assert_subtitle_language "$O/test.mkv" 1 ger
+
+run_subs whitelist_dvb subs_dvb.ts '[subtitles]\nlanguage_whitelist = ["deu"]\n'
+assert_subtitle_track_count "$O/test.mkv" 1
+assert_subtitle_language "$O/test.mkv" 0 ger
+assert_subtitle_events_match "$O/test.mkv" s:0 "$SRC" s:0
+
+# -- a TTML track Matroska cannot hold goes, and the whitelist still picks the right track -----
+run_subs ttml subs_ttml.mp4 '[subtitles]\nlanguage_whitelist = ["eng"]\n'
+assert_log_contains "(ttml) cannot be stored in Matroska - skipped"
+assert_subtitle_track_count "$O/test.mkv" 1
+assert_subtitle_language "$O/test.mkv" 0 eng
+assert_subtitle_events_match "$O/test.mkv" s:0 "$SRC" s:1
+
+run_subs ttml_ger subs_ttml.mp4 '[subtitles]\nlanguage_whitelist = ["deu"]\n'
+assert_subtitle_track_count "$O/test.mkv" 0
+
 test_done

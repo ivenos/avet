@@ -1,20 +1,30 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use dolby_vision::rpu::dovi_rpu::DoviRpu;
+use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
+use dolby_vision::rpu::ConversionMode;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::ffms2::{Crop, FrameHdrMetadata};
+
 #[derive(Debug, Default, Clone)]
 pub struct HdrInfo {
+    pub codec_name: String,
     pub hdr_type: String,
     pub color_primaries: Option<u32>,
     pub transfer_characteristics: Option<u32>,
     pub matrix_coefficients: Option<u32>,
     pub chroma_sample_position: Option<u32>,
+    /// JPEG's siting, which AV1 cannot signal but Matroska can.
+    pub chroma_center: bool,
     /// Only set for full range. Studio is the encoder default and the common case.
     pub color_range: Option<u32>,
     pub content_light_level: Option<String>,
     pub mastering_display: Option<String>,
     /// Dolby Vision profile from the DOVI configuration record, when there is one.
     pub dv_profile: Option<u32>,
+    /// HDR10+ on the first frame; also set under Dolby Vision, which wins `hdr_type`.
+    pub hdr10plus: bool,
 }
 
 impl HdrInfo {
@@ -23,6 +33,17 @@ impl HdrInfo {
     }
 
     pub fn encoder_args(&self) -> Vec<String> {
+        let mut args = self.colour_args();
+        if let Some(ref cll) = self.content_light_level {
+            args.extend_from_slice(&["--content-light".into(), cll.clone()]);
+        }
+        if let Some(ref mdl) = self.mastering_display {
+            args.extend_from_slice(&["--mastering-display".into(), mdl.clone()]);
+        }
+        args
+    }
+
+    fn colour_args(&self) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         if let Some(cp) = self.color_primaries {
             args.extend_from_slice(&["--color-primaries".into(), cp.to_string()]);
@@ -39,13 +60,17 @@ impl HdrInfo {
         if let Some(cr) = self.color_range {
             args.extend_from_slice(&["--color-range".into(), cr.to_string()]);
         }
-        if let Some(ref cll) = self.content_light_level {
-            args.extend_from_slice(&["--content-light".into(), cll.clone()]);
-        }
-        if let Some(ref mdl) = self.mastering_display {
-            args.extend_from_slice(&["--mastering-display".into(), mdl.clone()]);
-        }
         args
+    }
+
+    /// HLG has no static metadata by design.
+    pub fn missing_static_metadata(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.is_hdr() && self.hdr_type != "HLG" {
+            if self.content_light_level.is_none() { missing.push("MaxCLL/MaxFALL"); }
+            if self.mastering_display.is_none()   { missing.push("Mastering Display"); }
+        }
+        missing
     }
 }
 
@@ -59,6 +84,8 @@ struct ProbeOutput {
 
 #[derive(Deserialize, Default)]
 struct ProbeStream {
+    #[serde(default)]
+    codec_name: String,
     #[serde(default)]
     color_primaries: String,
     #[serde(default)]
@@ -107,7 +134,7 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
             "-v", "error",
             "-select_streams", "v:0",
             "-read_intervals", "%+#1",
-            "-show_entries", "stream=color_primaries,color_transfer,color_space,chroma_location,color_range",
+            "-show_entries", "stream=codec_name,color_primaries,color_transfer,color_space,chroma_location,color_range",
             // Sections accumulate, so this does not replace the two around it.
             "-show_entries", "stream_side_data=dv_profile",
             "-show_frames",
@@ -122,10 +149,12 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
     let stream = probe.streams.into_iter().next().unwrap_or_default();
 
     let mut info = HdrInfo {
+        codec_name: stream.codec_name.clone(),
         color_primaries: map_color_primaries(&stream.color_primaries),
         transfer_characteristics: map_transfer(&stream.color_transfer),
         matrix_coefficients: map_matrix(&stream.color_space),
         chroma_sample_position: map_chroma(&stream.chroma_location),
+        chroma_center: stream.chroma_location == "center",
         color_range: map_color_range(&stream.color_range),
         ..Default::default()
     };
@@ -144,9 +173,10 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         .find_map(|s| s.dv_profile.as_ref())
         .map(|v| val_to_i64(v) as u32);
 
+    info.hdr10plus = has_side_type("hdr10+");
     info.hdr_type = if info.dv_profile.is_some() || has_side_type("dolby") {
         "Dolby Vision".into()
-    } else if has_side_type("hdr10+") {
+    } else if info.hdr10plus {
         "HDR10+".into()
     } else if stream.color_transfer == "smpte2084" {
         "HDR10".into()
@@ -176,24 +206,151 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
             let (rx, ry)   = (val_to_f64(rx),  val_to_f64(ry));
             let (wpx, wpy) = (val_to_f64(wpx), val_to_f64(wpy));
             let (lmx, lmn) = (val_to_f64(lmx), val_to_f64(lmn));
+            // Unrounded: the source's 1/50000 steps fall between 4-decimal ones.
             info.mastering_display = Some(format!(
-                "G({gx:.4},{gy:.4})B({bx:.4},{by:.4})R({rx:.4},{ry:.4})\
-                 WP({wpx:.4},{wpy:.4})L({lmx:.4},{lmn:.4})"
+                "G({gx},{gy})B({bx},{by})R({rx},{ry})WP({wpx},{wpy})L({lmx},{lmn})"
             ));
         }
     }
 
-    // HLG has no static metadata by design; warn only for HDR10/HDR10+/DV.
-    if info.is_hdr() && info.hdr_type != "HLG"
-        && (info.content_light_level.is_none() || info.mastering_display.is_none())
-    {
-        let mut missing = Vec::new();
-        if info.content_light_level.is_none() { missing.push("MaxCLL/MaxFALL"); }
-        if info.mastering_display.is_none()   { missing.push("Mastering Display"); }
-        tracing::warn!("HDR metadata incomplete - missing: {}", missing.join(", "));
-    }
-
     Ok(info)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct DynamicHdr {
+    pub hdr10plus: bool,
+    pub dolby_vision: bool,
+}
+
+impl DynamicHdr {
+    pub fn any(self) -> bool {
+        self.hdr10plus || self.dolby_vision
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Geometry {
+    pub width: u32,
+    pub height: u32,
+    pub crop: Option<Crop>,
+    pub scale: Option<(u32, u32)>,
+}
+
+const HDR10PLUS_T35_HEADER: [u8; 6] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+
+/// ITU-T T.35 messages for one frame, country code first, in the order SVT-AV1 writes them.
+pub fn t35_messages(frame: &FrameHdrMetadata, carry: DynamicHdr, geometry: Geometry) -> Result<Vec<Vec<u8>>> {
+    let mut messages = Vec::new();
+    if carry.dolby_vision
+        && let Some(rpu) = &frame.dovi_rpu
+    {
+        messages.push(dovi_t35(rpu, geometry)?);
+    }
+    if carry.hdr10plus
+        && let Some(st2094_40) = &frame.hdr10plus
+    {
+        messages.push([&HDR10PLUS_T35_HEADER[..], st2094_40].concat());
+    }
+    Ok(messages)
+}
+
+fn dovi_t35(nal_payload: &[u8], geometry: Geometry) -> Result<Vec<u8>> {
+    let mut rpu = DoviRpu::parse_unspec62_nalu(nal_payload).context("parse Dolby Vision RPU")?;
+    match rpu.dovi_profile {
+        5 | 8 => {}
+        7 => rpu.convert_with_mode(ConversionMode::To81).context("convert Dolby Vision profile 7 to 8.1")?,
+        p => bail!("Dolby Vision profile {p} has no AV1 form"),
+    }
+    let active_area = rpu.vdr_dm_data.as_ref().and_then(|dm| match dm.get_block(5) {
+        Some(ExtMetadataBlock::Level5(l5)) => Some((
+            l5.active_area_left_offset, l5.active_area_right_offset,
+            l5.active_area_top_offset, l5.active_area_bottom_offset,
+        )),
+        _ => None,
+    });
+    if let Some(offsets) = active_area {
+        let (left, right, top, bottom) = remap_active_area(offsets, geometry);
+        if (left, right, top, bottom) != offsets {
+            rpu.set_active_area_offsets(left, right, top, bottom)?;
+        }
+    }
+    rpu.write_av1_rpu_metadata_obu_t35_complete().context("write Dolby Vision RPU for AV1")
+}
+
+fn remap_active_area((left, right, top, bottom): (u16, u16, u16, u16), g: Geometry) -> (u16, u16, u16, u16) {
+    let c = g.crop.unwrap_or(Crop { w: g.width, h: g.height, x: 0, y: 0 });
+    let (out_w, out_h) = g.scale.unwrap_or((c.w, c.h));
+    let fit = |offset: u16, cut: u32, kept: u32, out: u32| {
+        let px = u64::from(u32::from(offset).saturating_sub(cut).min(kept));
+        let kept = u64::from(kept.max(1));
+        ((px * u64::from(out) + kept / 2) / kept) as u16
+    };
+    (
+        fit(left, c.x, c.w, out_w),
+        fit(right, g.width.saturating_sub(c.x + c.w), c.w, out_w),
+        fit(top, c.y, c.h, out_h),
+        fit(bottom, g.height.saturating_sub(c.y + c.h), c.h, out_h),
+    )
+}
+
+/// The colour flags among `encoder_args` as mkvmerge options for `track`. mkvmerge takes
+/// none of them from an IVF input.
+pub fn mkvmerge_colour_args(encoder_args: &[String], track: u32) -> Vec<String> {
+    let value = |flag: &str| {
+        encoder_args.chunks(2).find(|p| p.len() == 2 && p[0] == flag).map(|p| p[1].as_str())
+    };
+    let number = |flag: &str| value(flag).and_then(|v| v.parse::<u32>().ok());
+
+    let mut args = Vec::new();
+    let mut push = |flag: &str, v: String| {
+        args.push(flag.to_string());
+        args.push(format!("{track}:{v}"));
+    };
+    let described = ["--color-primaries", "--transfer-characteristics", "--matrix-coefficients"]
+        .iter()
+        .any(|f| number(f).is_some());
+
+    if let Some(v) = number("--matrix-coefficients") {
+        push("--color-matrix-coefficients", v.to_string());
+    }
+    if let Some(v) = number("--transfer-characteristics") {
+        push("--color-transfer-characteristics", v.to_string());
+    }
+    if let Some(v) = number("--color-primaries") {
+        push("--color-primaries", v.to_string());
+    }
+    if described {
+        // SVT-AV1: 0 studio, 1 full. Matroska: 1 broadcast, 2 full.
+        let range = if number("--color-range") == Some(1) { 2 } else { 1 };
+        push("--color-range", range.to_string());
+    }
+    // Horizontal, then vertical: 1 is co-sited, 2 is half a sample off.
+    match number("--chroma-sample-position") {
+        Some(1) => push("--chroma-siting", "1,2".into()),
+        Some(2) => push("--chroma-siting", "1,1".into()),
+        _ => {}
+    }
+    if let Some((max_cll, max_fall)) = value("--content-light").and_then(|v| v.split_once(',')) {
+        push("--max-content-light", max_cll.trim().to_string());
+        push("--max-frame-light", max_fall.trim().to_string());
+    }
+    if let Some(md) = value("--mastering-display").and_then(parse_mastering_display) {
+        let [g, b, r, wp, l] = md;
+        push("--chromaticity-coordinates", format!("{},{},{},{},{},{}", r.0, r.1, g.0, g.1, b.0, b.1));
+        push("--white-color-coordinates", format!("{},{}", wp.0, wp.1));
+        push("--max-luminance", l.0.to_string());
+        push("--min-luminance", l.1.to_string());
+    }
+    args
+}
+
+fn parse_mastering_display(s: &str) -> Option<[(f64, f64); 5]> {
+    let pair = |label: &str| -> Option<(f64, f64)> {
+        let rest = &s[s.find(label)? + label.len()..];
+        let (a, b) = rest[..rest.find(')')?].split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    };
+    Some([pair("G(")?, pair("B(")?, pair("R(")?, pair("WP(")?, pair("L(")?])
 }
 
 // ffprobe name to ITU-T H.273 numeric code (same values used by SVT-AV1)
@@ -381,6 +538,132 @@ mod tests {
             .find_map(|s| s.dv_profile.as_ref())
             .map(|v| val_to_i64(v) as u32);
         assert_eq!(profile, Some(5));
+    }
+
+    fn geometry(crop: Option<Crop>, scale: Option<(u32, u32)>) -> Geometry {
+        Geometry { width: 1920, height: 1080, crop, scale }
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn active_area_never_leaves_the_picture(
+            (w, h, x, y, cw, ch) in (2u32..4096, 2u32..4096).prop_flat_map(|(w, h)| {
+                (Just(w), Just(h), 0..w, 0..h).prop_flat_map(|(w, h, x, y)| (Just(w), Just(h), Just(x), Just(y), 1..=w - x, 1..=h - y))
+            }),
+            scale in prop::option::of(0.05f64..1.0),
+            offsets in (0u16..8192, 0u16..8192, 0u16..8192, 0u16..8192),
+        ) {
+            let crop = Crop { w: cw, h: ch, x, y };
+            let out = scale.map(|f| (((cw as f64 * f) as u32).max(1), ((ch as f64 * f) as u32).max(1)));
+            let g = Geometry { width: w, height: h, crop: Some(crop), scale: out };
+            let (l, r, t, b) = remap_active_area(offsets, g);
+            let (ow, oh) = out.unwrap_or((cw, ch));
+            prop_assert!(u32::from(l) <= ow && u32::from(r) <= ow && u32::from(t) <= oh && u32::from(b) <= oh);
+
+            let untouched = Geometry { width: w, height: h, crop: None, scale: None };
+            let clamp = |v: u16, max: u32| v.min(max as u16);
+            prop_assert_eq!(remap_active_area(offsets, untouched), (clamp(offsets.0, w), clamp(offsets.1, w), clamp(offsets.2, h), clamp(offsets.3, h)));
+        }
+
+        #[test]
+        fn mastering_display_values_survive_the_round_trip(
+            v in prop::collection::vec(0.0f64..1.0, 8),
+            max in 1.0f64..10000.0,
+            min in 0.0f64..1.0,
+        ) {
+            let s = format!("G({},{})B({},{})R({},{})WP({},{})L({max},{min})", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            let parsed = parse_mastering_display(&s).unwrap();
+            prop_assert_eq!(parsed, [(v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7]), (max, min)]);
+        }
+    }
+
+    #[test]
+    fn active_area_follows_crop_and_scale() {
+        let bars = (0, 0, 140, 140);
+        assert_eq!(remap_active_area(bars, geometry(None, None)), bars);
+
+        let exact = Crop { w: 1920, h: 800, x: 0, y: 140 };
+        assert_eq!(remap_active_area(bars, geometry(Some(exact), None)), (0, 0, 0, 0));
+
+        let partial = Crop { w: 1920, h: 1000, x: 0, y: 40 };
+        assert_eq!(remap_active_area(bars, geometry(Some(partial), None)), (0, 0, 100, 100));
+
+        assert_eq!(remap_active_area(bars, geometry(None, Some((1280, 720)))), (0, 0, 93, 93));
+        assert_eq!(remap_active_area(bars, geometry(Some(partial), Some((960, 500)))), (0, 0, 50, 50));
+    }
+
+    fn ffms2_rpu(offsets: (u16, u16, u16, u16)) -> Vec<u8> {
+        use dolby_vision::rpu::generate::GenerateConfig;
+        let mut rpu = DoviRpu::profile81_config(&GenerateConfig { length: 1, ..Default::default() }).unwrap();
+        rpu.set_active_area_offsets(offsets.0, offsets.1, offsets.2, offsets.3).unwrap();
+        // FFMS2 drops the two NAL header bytes and keeps emulation prevention.
+        rpu.write_hevc_unspec62_nalu().unwrap()[2..].to_vec()
+    }
+
+    fn l5(t35: &[u8]) -> (u16, u16, u16, u16) {
+        let rpu = DoviRpu::parse_itu_t35_dovi_metadata_obu(t35).unwrap();
+        match rpu.vdr_dm_data.unwrap().get_block(5) {
+            Some(ExtMetadataBlock::Level5(b)) => (
+                b.active_area_left_offset, b.active_area_right_offset,
+                b.active_area_top_offset, b.active_area_bottom_offset,
+            ),
+            _ => panic!("no L5 block"),
+        }
+    }
+
+    #[test]
+    fn t35_messages_wrap_both_kinds_and_skip_what_is_not_carried() {
+        let frame = FrameHdrMetadata {
+            dovi_rpu: Some(ffms2_rpu((0, 0, 140, 140))),
+            hdr10plus: Some(vec![0x01, 0x40, 0x00]),
+        };
+        let both = DynamicHdr { hdr10plus: true, dolby_vision: true };
+        let crop = Crop { w: 1920, h: 800, x: 0, y: 140 };
+
+        let messages = t35_messages(&frame, both, geometry(Some(crop), None)).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0][..3], [0xB5, 0x00, 0x3B]);
+        assert_eq!(l5(&messages[0]), (0, 0, 0, 0));
+        assert_eq!(messages[1], [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04, 0x01, 0x40, 0x00]);
+
+        let uncropped = t35_messages(&frame, both, geometry(None, None)).unwrap();
+        assert_eq!(l5(&uncropped[0]), (0, 0, 140, 140));
+
+        let hdr10plus_only = DynamicHdr { hdr10plus: true, dolby_vision: false };
+        let messages = t35_messages(&frame, hdr10plus_only, geometry(None, None)).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0][2], 0x3C);
+    }
+
+    #[test]
+    fn colour_flags_become_mkvmerge_options() {
+        let args: Vec<String> = [
+            "--crf", "30",
+            "--color-primaries", "9", "--transfer-characteristics", "16",
+            "--matrix-coefficients", "9", "--chroma-sample-position", "2",
+            "--content-light", "1000,400",
+            "--mastering-display", "G(0.2650,0.6900)B(0.1500,0.0600)R(0.6800,0.3200)WP(0.3127,0.3290)L(1000.0000,0.0050)",
+        ].iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(mkvmerge_colour_args(&args, 0), [
+            "--color-matrix-coefficients", "0:9",
+            "--color-transfer-characteristics", "0:16",
+            "--color-primaries", "0:9",
+            "--color-range", "0:1",
+            "--chroma-siting", "0:1,1",
+            "--max-content-light", "0:1000",
+            "--max-frame-light", "0:400",
+            "--chromaticity-coordinates", "0:0.68,0.32,0.265,0.69,0.15,0.06",
+            "--white-color-coordinates", "0:0.3127,0.329",
+            "--max-luminance", "0:1000",
+            "--min-luminance", "0:0.005",
+        ]);
+
+        let full = ["--color-primaries", "1", "--color-range", "1"].map(String::from);
+        assert!(mkvmerge_colour_args(&full, 0).windows(2).any(|w| w == ["--color-range", "0:2"]));
+        assert!(mkvmerge_colour_args(&["--crf".to_string(), "30".to_string()], 0).is_empty());
     }
 
     #[test]

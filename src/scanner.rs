@@ -115,9 +115,6 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
             match path.file_name().and_then(|n| n.to_str()) {
                 None => tracing::warn!("skipping folder with non-UTF8 name: {}", path.display()),
                 Some(name) if name.starts_with('.') => {}
-                Some(name) if name.contains(['\n', '\r']) => {
-                    tracing::warn!("skipping folder with a line break in its name: {}", path.display());
-                }
                 Some(name) => collect_video_files(&path, &rel.join(name), files)?,
             }
             continue;
@@ -130,13 +127,8 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
             && EXTENSIONS.contains(&ext.as_str())
         {
             // Skip non-UTF8 stems: they'd collide on the fallback name and break temp-dir layout.
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            if path.file_stem().and_then(|s| s.to_str()).is_none() {
                 tracing::warn!("skipping file with non-UTF8 name: {}", path.display());
-                continue;
-            };
-            // The stem reaches ffmpeg's concat list, whose parser cannot escape one.
-            if stem.contains(['\n', '\r']) {
-                tracing::warn!("skipping file with a line break in its name: {}", path.display());
                 continue;
             }
             files.push((path, rel.to_path_buf()));
@@ -205,6 +197,20 @@ mod tests {
         let jobs = scan(&input, &output).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source_file.file_name().unwrap(), "film.mkv");
+    }
+
+    #[test]
+    fn names_with_a_line_break_are_picked_up() {
+        let (_tmp, input, output) = make_dirs();
+        let folder = input.join("p").join("Show\nPart 2");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(input.join("p").join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(folder.join("film\r\n.mkv"), b"fake").unwrap();
+
+        let jobs = scan(&input, &output).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].stem(), "film\r\n");
+        assert_eq!(jobs[0].rel_dir, PathBuf::from("Show\nPart 2"));
     }
 
     #[test]

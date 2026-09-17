@@ -132,4 +132,19 @@ run_avet_timed "$I" "$O" 20 "share this name"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "share this name"
 
+# -- line breaks in folder and file names are encoded like any other name -----
+I="$WORKDIR/9/in"; O="$WORKDIR/9/out"
+NL=$(printf 'Part\nTwo')
+mkdir -p "$I/p/$NL" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/$NL/$NL.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+EOF
+run_avet "$I" "$O" "$O/$NL/$NL.mkv" 120 || fail "line break in name: no output"
+assert_video_codec       "$O/$NL/$NL.mkv" av1
+assert_audio_track_count "$O/$NL/$NL.mkv" 1
+
 test_done

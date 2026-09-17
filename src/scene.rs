@@ -112,11 +112,7 @@ pub fn detect(
         tracing::warn!("ffmpeg scene detection: {}", ffmpeg_stderr.trim());
     }
 
-    if results.frame_count == 0 {
-        bail!("scene detection: no frames processed");
-    }
-
-    let scenes = build_scene_entries(&results.scene_changes, results.frame_count);
+    let scenes = build_scene_entries(&results.scene_changes, results.frame_count.max(1));
 
     Ok(match cfg.effective_extra_split_frames(fps) {
         Some(max) => apply_extra_split(scenes, max),
@@ -193,6 +189,12 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].start_frame, 0);
         assert_eq!(entries[0].end_frame, 99);
+    }
+
+    #[test]
+    fn a_single_frame_is_one_chunk() {
+        let entries = build_scene_entries(&[], 1);
+        assert_eq!((entries.len(), entries[0].start_frame, entries[0].end_frame), (1, 0, 0));
     }
 
     #[test]

@@ -8,14 +8,8 @@ ARG VSHIP_VERSION=v5.1.1
 ARG VMAF_VERSION=v3.2.1
 ARG RUST_VERSION=1.98.1
 
-FROM alpine:3.24 AS builder
+FROM alpine:3.24 AS base
 
-ARG SVT_AV1_VERSION
-ARG SVT_AV1_HDR_REF
-ARG FFMS2_VERSION
-ARG VSHIP_VERSION
-ARG VMAF_VERSION
-ARG RUST_VERSION
 ARG TARGETARCH
 
 # clang + vulkan build FFVship; nasm/yasm are x86-only, arm64 uses NEON.
@@ -38,9 +32,10 @@ RUN apk add --no-cache \
         ca-certificates && \
     [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
-ENV PATH="/root/.cargo/bin:${PATH}"
+FROM base AS svt-av1
+
+ARG SVT_AV1_VERSION
+ARG TARGETARCH
 
 RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
         https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt-av1 && \
@@ -53,6 +48,11 @@ RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
     cmake --build /svt-av1/build --parallel $(nproc) && \
     cmake --install /svt-av1/build && \
     rm -rf /svt-av1
+
+FROM base AS svt-av1-hdr
+
+ARG SVT_AV1_HDR_REF
+ARG TARGETARCH
 
 RUN git clone --filter=blob:none --no-checkout \
         https://github.com/juliobbv-p/svt-av1-hdr.git /svt-av1-hdr && \
@@ -67,16 +67,26 @@ RUN git clone --filter=blob:none --no-checkout \
     cmake --install /svt-av1-hdr/build && \
     rm -rf /svt-av1-hdr
 
+FROM base AS ffms2
+
+ARG FFMS2_VERSION
+
+COPY packaging/ffms2-frame-hdr-metadata.patch /tmp/
 # Shared, not static: C++ static-init crashes when embedded in a Rust binary.
 RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
         https://github.com/FFMS/ffms2.git /ffms2 && \
     cd /ffms2 && \
+    git apply /tmp/ffms2-frame-hdr-metadata.patch && \
     mkdir -p src/config && \
     autoreconf -fiv && \
     ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no && \
     make -j$(nproc) && \
     make install && \
     rm -rf /ffms2
+
+FROM ffms2 AS vship
+
+ARG VSHIP_VERSION
 
 RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
         https://codeberg.org/Line-fr/Vship.git /vship && \
@@ -86,6 +96,10 @@ RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
     install -m755 FFVship /usr/local/bin/FFVship && \
     install -m755 libvship.so /usr/local/lib/libvship.so && \
     rm -rf /vship
+
+FROM base AS vmaf
+
+ARG VMAF_VERSION
 
 # Without the VMAF models busybox xxd suffices; v3.2.0's tests break on vcs_version.h.
 RUN git clone --depth 1 --branch ${VMAF_VERSION} \
@@ -99,6 +113,15 @@ RUN git clone --depth 1 --branch ${VMAF_VERSION} \
     ninja -C /vmaf/libvmaf/build && \
     install -m755 /vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf && \
     rm -rf /vmaf
+
+FROM ffms2 AS builder
+
+ARG RUST_VERSION
+ARG TARGETARCH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -128,16 +151,16 @@ RUN apk add --no-cache \
         mesa-vulkan-swrast && \
     [ "$TARGETARCH" != "amd64" ] || apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati
 
-COPY --from=builder /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
-COPY --from=builder /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
-COPY --from=builder /usr/local/bin/ffmsindex         /usr/local/bin/ffmsindex
-COPY --from=builder /avet                             /usr/local/bin/avet
+COPY --from=svt-av1     /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
+COPY --from=svt-av1-hdr /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
+COPY --from=ffms2       /usr/local/bin/ffmsindex        /usr/local/bin/ffmsindex
+COPY --from=builder     /avet                           /usr/local/bin/avet
 # Not in Alpine's package manager.
-COPY --from=builder /usr/local/lib/libffms2.so*      /usr/local/lib/
+COPY --from=ffms2       /usr/local/lib/libffms2.so*     /usr/local/lib/
 # FFVship + libvship, for target_quality.
-COPY --from=builder /usr/local/bin/FFVship           /usr/local/bin/FFVship
-COPY --from=builder /usr/local/lib/libvship.so       /usr/local/lib/
-COPY --from=builder /usr/local/bin/vmaf              /usr/local/bin/vmaf
+COPY --from=vship       /usr/local/bin/FFVship          /usr/local/bin/FFVship
+COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
+COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
 ENV INPUT_DIR=/input

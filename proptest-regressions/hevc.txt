@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc fdf05e31f7d129d17b58640c7825b2441746bf96718af589802c01deb3feca3b # shrinks to nals = [(Prefix(Some([0, 0, 0, 0])), false, 0), (FirstSlice([0]), false, 0)], sizes = [1]
+cc 773c2145857f810447a0cdfbbbe7f0a11ee41b752a9b5b0b3e43dff3c0fc3480 # shrinks to nals = [(FirstSlice([0]), false, 0)], sizes = [1]

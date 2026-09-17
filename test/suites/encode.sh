@@ -42,8 +42,6 @@ encoder = "svt-av1"
 preset           = 12
 crf              = 50
 color-primaries  = 1
-[avet]
-hdr = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR override: no output"
 assert_log_contains     "color-primaries=1"
@@ -64,7 +62,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "auto-keyint: no output"
 assert_log_contains "auto-keyint"
 assert_log_contains "keyint="
 
-# -- bit_depth=10 on 8-bit source: output is 10-bit, conversion logged --------
+# -- bit_depth: 8 to 10 bits and back, conversion logged; a matching depth logs none ---
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -79,7 +77,6 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8 to 10: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p10le"
 assert_log_contains  "bit-depth conversion: 8-bit to 10-bit"
 
-# -- bit_depth=8 on 10-bit source: output is 8-bit, conversion logged ---------
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/hdr10.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -94,7 +91,6 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 10 to 8: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p"
 assert_log_contains  "bit-depth conversion: 10-bit to 8-bit"
 
-# -- bit_depth matching source: no conversion log -----------------------------
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
