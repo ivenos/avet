@@ -113,7 +113,7 @@ jobs:
   build-arm64:
     name: Build arm64 (no push)
     needs: test
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -169,7 +169,7 @@ jobs:
             runner: ubuntu-latest
           - platform: linux/arm64
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
 
     steps:
       - uses: actions/checkout@v7
