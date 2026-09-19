@@ -169,7 +169,7 @@ jobs:
             runner: ubuntu-latest
           - platform: linux/arm64
             arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
 
     steps:
       - uses: actions/checkout@v7

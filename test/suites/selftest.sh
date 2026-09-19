@@ -90,7 +90,12 @@ expect_fail "a changed attachment"   assert_attachments_match "$W/attachment.mkv
 
 # -- a corrupted stream, a swapped channel, changed bytes -------------------------------------
 cp "$SRC" "$W/corrupt.mkv"
-dd if=/dev/urandom of="$W/corrupt.mkv" bs=1 seek=4000000 count=4096 conv=notrunc 2>/dev/null
+# A single block of random bytes still decodes cleanly about once in 200 runs.
+corrupt_size=$(stat -c %s "$W/corrupt.mkv")
+for part in 1 2 3; do
+    dd if=/dev/urandom of="$W/corrupt.mkv" bs=1 seek=$((corrupt_size * part / 4)) \
+        count=4096 conv=notrunc 2>/dev/null
+done
 $FF -i "$FIXTURES_DIR/tones_71.mkv" -map 0 -c:v copy -c:a flac -af "pan=7.1|FL=FR|FR=FL|FC=FC|LFE=LFE|BL=BL|BR=BR|SL=SL|SR=SR" "$W/swapped_lr.mkv"
 need "$W/corrupt.mkv" "$W/swapped_lr.mkv"
 expect_pass "a clean decode"         assert_decodes_cleanly "$SRC"

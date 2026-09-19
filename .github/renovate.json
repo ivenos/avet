@@ -137,6 +137,14 @@
     },
     {
       "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/build-publish\\.yml$/"],
+      "matchStrings": ["runner: ubuntu-(?<currentValue>[0-9]+\\.[0-9]+)-arm"],
+      "autoReplaceStringTemplate": "runner: ubuntu-{{{newValue}}}-arm",
+      "datasourceTemplate": "github-runners",
+      "depNameTemplate": "ubuntu"
+    },
+    {
+      "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
       "matchStrings": ["LINUXDEPLOY_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "github-releases",

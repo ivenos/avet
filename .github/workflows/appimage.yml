@@ -64,6 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Pinned: the AppImage inherits the runner's glibc as its minimum.
         include:
           - arch: x86_64
             runner: ubuntu-24.04
