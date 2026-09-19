@@ -88,8 +88,7 @@ fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<Str
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
 
     if out.status.code().unwrap_or(2) >= 2 {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("mkvmerge identify failed:\n{stderr}");
+        bail!("mkvmerge identify failed:\n{}", String::from_utf8_lossy(&out.stdout));
     }
 
     #[derive(Deserialize)]

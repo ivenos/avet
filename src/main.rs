@@ -60,7 +60,7 @@ fn main() -> Result<()> {
                     let stem = j.stem();
 
                     if let Err(e) = job::run(j, &ctx) {
-                        job::handle_failure(j, &ctx, stem, &e);
+                        job::handle_failure(j, &ctx, stem, &e, shutdown.load(Ordering::Relaxed));
                     }
                     if shutdown.load(Ordering::Relaxed) {
                         tracing::info!("stopping after {stem}");

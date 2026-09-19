@@ -82,6 +82,12 @@ pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<O
     }
 }
 
+/// `Child::drop` does not wait, so a tool left behind by an early return stays a zombie.
+pub fn reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();

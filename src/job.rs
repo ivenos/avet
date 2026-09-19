@@ -651,7 +651,7 @@ fn free_path(path: &Path) -> Result<PathBuf> {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy().into_owned();
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
-    for n in 2..1000u32 {
+    for n in 2..=1000u32 {
         let candidate = dir.join(format!("{stem}.{n}{ext}"));
         if !candidate.exists() {
             return Ok(candidate);
@@ -722,9 +722,9 @@ fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Opt
     Ok(Some(res.crf))
 }
 
-pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error) {
+pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error, shutting_down: bool) {
     // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
-    if is_transient(err) {
+    if shutting_down || is_transient(err) {
         tracing::error!("[{stem}] job failed - retrying on the next scan\n{err:#}");
         return;
     }
@@ -736,7 +736,7 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
     }
     // So the marker locks out this file, not the next one with the same name.
-    if let Err(e) = std::fs::write(&temp.source_id_path, job.source_file.display().to_string()) {
+    if let Err(e) = std::fs::write(&temp.source_id_path, crate::resume::source_id(&job.source_file)) {
         tracing::warn!("[{stem}] could not record source path: {e:#}");
     }
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
@@ -861,6 +861,8 @@ fn profile_fingerprint(
     ];
     if opts.dynamic_hdr.any() {
         parts.push(format!("{:?}", opts.dynamic_hdr));
+        // The bitstream values and the decoder's fallback are not the same metadata.
+        parts.push(format!("hdr10plus_bitstream={}", opts.hdr10plus_frames.is_some()));
     }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     parts.join("|").hash(&mut h);
@@ -1131,6 +1133,12 @@ mod tests {
         let hdr10plus = profile_fingerprint(enc, &args, &o, &sc, None);
         assert_ne!(base, hdr10plus);
         o.dynamic_hdr.dolby_vision = true;
+        assert_ne!(hdr10plus, profile_fingerprint(enc, &args, &o, &sc, None));
+
+        // Falling back to the decoder's values must not resume onto bitstream chunks.
+        let mut o = opts();
+        o.dynamic_hdr = DynamicHdr { hdr10plus: true, dolby_vision: false };
+        o.hdr10plus_frames = Some(crate::hevc::Hdr10PlusFrames::default());
         assert_ne!(hdr10plus, profile_fingerprint(enc, &args, &o, &sc, None));
     }
 }

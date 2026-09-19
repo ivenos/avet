@@ -116,6 +116,17 @@ impl Bitrate {
                 .map(String::as_str),
         }
     }
+
+    /// Keyed by the layout that is written, which an Opus upmix widens past the source.
+    pub fn resolve_layout(&self, layout: &str) -> Option<&str> {
+        match self {
+            Bitrate::Single(s) => Some(s.as_str()),
+            Bitrate::PerLayout(map) => map
+                .get(layout)
+                .or_else(|| map.get("default"))
+                .map(String::as_str),
+        }
+    }
 }
 
 pub struct ResolvedAudio<'a> {
@@ -557,6 +568,17 @@ mod tests {
         assert_eq!(layout_name(6), "5.1");
         assert_eq!(layout_name(8), "7.1");
         assert_eq!(layout_name(16), "7.1");
+    }
+
+    #[test]
+    fn bitrate_follows_the_layout_that_is_written_not_the_source() {
+        let b = Bitrate::PerLayout(HashMap::from([
+            ("3.0".into(), "128k".into()),
+            ("5.1".into(), "320k".into()),
+        ]));
+        assert_eq!(b.resolve(Some(3)), Some("128k"));
+        assert_eq!(b.resolve_layout("5.1"), Some("320k"));
+        assert_eq!(b.resolve_layout("6.1"), None);
     }
 
     #[test]

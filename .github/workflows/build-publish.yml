@@ -68,11 +68,22 @@ jobs:
           cache-from: type=gha,scope=amd64
           cache-to: type=gha,mode=max,scope=amd64
 
-      - name: Upload test image
+      # Built here too: otherwise every suite apk-installs the same three packages.
+      - name: Build fixture tools image
+        uses: docker/build-push-action@v7
+        with:
+          context: test
+          file: test/tools.Dockerfile
+          tags: avet:fixture-tools
+          outputs: type=docker,dest=${{ runner.temp }}/avet-fixture-tools.tar
+
+      - name: Upload test images
         uses: actions/upload-artifact@v7
         with:
           name: avet-test-image
-          path: ${{ runner.temp }}/avet-test.tar
+          path: |
+            ${{ runner.temp }}/avet-test.tar
+            ${{ runner.temp }}/avet-fixture-tools.tar
           if-no-files-found: error
           retention-days: 1
 
@@ -94,14 +105,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download test image
+      - name: Download test images
         uses: actions/download-artifact@v8
         with:
           name: avet-test-image
           path: ${{ runner.temp }}
 
-      - name: Load test image
-        run: docker load -i "$RUNNER_TEMP/avet-test.tar"
+      - name: Load test images
+        run: |
+          docker load -i "$RUNNER_TEMP/avet-test.tar"
+          docker load -i "$RUNNER_TEMP/avet-fixture-tools.tar"
 
       - name: Run integration tests
         env:

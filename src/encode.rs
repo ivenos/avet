@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::ffi::OsStr;
 use std::io::{BufWriter, Read};
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
 use crate::config::{Config, Encoder};
 use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, VideoSource};
@@ -121,6 +121,15 @@ fn insert_hdr_metadata(
         .with_context(|| format!("add HDR metadata to chunk {:05}", scene.index + 1))
 }
 
+/// Ctrl-C reaches the whole process group, so a signalled tool is no verdict on the source.
+fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> anyhow::Error {
+    let err = anyhow!("{what} failed (chunk {:05}):\n{stderr}", index + 1);
+    match status.code() {
+        Some(_) => err,
+        None => err.context(crate::job::Transient),
+    }
+}
+
 /// FFMS2 Y4M piped straight into the encoder.
 fn encode_direct(
     encoder_bin: &OsStr,
@@ -157,7 +166,7 @@ fn encode_direct(
 
     // Status first: an encoder that died early turns the write into a broken pipe.
     if !status.success() {
-        bail!("encoder failed (chunk {:05}):\n{stderr}", scene.index + 1);
+        return Err(tool_failure("encoder", status, &stderr, scene.index));
     }
     write_res.context("write Y4M frames to encoder")?;
     Ok(())
@@ -179,14 +188,20 @@ fn encode_scaled(
     let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let mut ff_err = ff.stderr.take().expect("ffmpeg stderr unavailable");
 
-    let mut child = std::process::Command::new(encoder_bin)
+    let mut child = match std::process::Command::new(encoder_bin)
         .args(encoder_args)
         .args(["--input", "-"])
         .stdin(Stdio::from(ff_out))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("start encoder '{encoder_name}'"))?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            crate::ext::reap(&mut ff);
+            return Err(e).with_context(|| format!("start encoder '{encoder_name}'"));
+        }
+    };
     let mut enc_err = child.stderr.take().expect("encoder stderr unavailable");
 
     // Drain both stderr pipes on threads so neither can block the pipeline.
@@ -202,12 +217,12 @@ fn encode_scaled(
     let ff_stderr  = ff_err_t.join().unwrap_or_default();
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
-    // Status first: a scaler or encoder that died early turns the write into a broken pipe.
-    if !ff_status.success() {
-        bail!("ffmpeg scaler failed (chunk {:05}):\n{ff_stderr}", scene.index + 1);
-    }
+    // Encoder first: it is its death that breaks the scaler's pipe, never the other way round.
     if !enc_status.success() {
-        bail!("encoder failed (chunk {:05}):\n{enc_stderr}", scene.index + 1);
+        return Err(tool_failure("encoder", enc_status, &enc_stderr, scene.index));
+    }
+    if !ff_status.success() {
+        return Err(tool_failure("ffmpeg scaler", ff_status, &ff_stderr, scene.index));
     }
     write_res.context("write Y4M frames to ffmpeg scaler")?;
     Ok(())

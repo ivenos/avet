@@ -2,7 +2,7 @@
 # Generates every fixture into $FIXTURES_DIR. Called by run.sh.
 
 set -u
-: "${FIXTURES_DIR:?}" "${TEST_IMAGE:?}"
+: "${FIXTURES_DIR:?}" "${TEST_IMAGE:?}" "${TOOLS_IMAGE:?}"
 
 docker run --rm -i \
     --user "$(id -u):$(id -g)" \
@@ -155,13 +155,14 @@ if [ "$GEN_RC" -ne 0 ]; then
     exit 1
 fi
 
-# dovi_tool and hdr10plus_tool are not in the image; apk needs root, the fixtures must not.
+# fel_orig.bin is a test asset from quietvoid/dovi_tool 2.3.4, MIT.
+cp "$(dirname "$0")/assets/fel_orig.bin" "$FIXTURES_DIR/fel.bin" || exit 1
+
 docker run --rm -i \
     -e OWNER="$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
-    alpine:3.24 sh << 'GEN'
+    "$TOOLS_IMAGE" sh << 'GEN'
 set -e
-apk add --no-cache -q dovi-tool hdr10plus-tool mkvtoolnix >/dev/null
 cd /out
 
 cat > dovi.json << 'JSON'
@@ -178,8 +179,6 @@ dovi_tool generate -j dovi.json -p 8.4 -o rpu84.bin >/dev/null
 dovi_tool generate -j dovi.json -p 5 -o rpu5.bin >/dev/null
 
 # dovi_tool cannot generate profile 7, so a disc RPU from its own test assets stands in.
-wget -q -O fel.bin https://raw.githubusercontent.com/quietvoid/dovi_tool/2.3.4/assets/tests/fel_orig.bin
-echo "b2b27714b7279c4e24d1a795cb6f95d3ad06745db96d360698ee0932184117a0  fel.bin" | sha256sum -c -s
 echo '{ "duplicate": [{ "source": 0, "offset": 0, "length": 47 }] }' > duplicate.json
 dovi_tool editor -i fel.bin -j duplicate.json -o rpu7.bin >/dev/null
 
@@ -340,9 +339,10 @@ $FF -f lavfi -i "$(pattern 360x288 25 yuv420p),setsar=64/45" -frames:v 100 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_anamorphic.mkv
 
 # Uneven bars, so a crop that is off by a line or mirrored shows.
-echo "  pattern_bars.mkv"
+echo "  pattern_bars.mkv, pattern_bars_rot90.mp4"
 $FF -f lavfi -i "nullsrc=size=640x276:rate=24,$PATTERN,format=yuv420p,pad=640:360:0:44:black" -frames:v 96 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_bars.mkv
+$FF -display_rotation 90 -i pattern_bars.mkv -map 0:v -c:v copy pattern_bars_rot90.mp4
 
 echo "  pattern_odd.mkv, pattern_422.mkv, pattern_444.mkv"
 $FF -f lavfi -i "$(pattern 321x181 24 yuv420p)" -frames:v 48 -c:v ffv1 pattern_odd.mkv

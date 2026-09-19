@@ -2,19 +2,28 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "dependencyDashboard": false,
-  "platformAutomerge": false,
   "labels": ["dependencies"],
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-optional",
+  "platformAutomerge": false,
+  "automergeStrategy": "squash",
+  "ignorePaths": [],
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
       "groupName": "GitHub Actions",
-      "commitMessagePrefix": "ci:"
+      "commitMessagePrefix": "ci:",
+      "automerge": true
     },
     {
-      "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch"],
-      "minimumReleaseAge": "3 days",
-      "automerge": true
+      "matchPackageNames": [
+        "docker/login-action",
+        "docker/metadata-action",
+        "peter-evans/dockerhub-description",
+        "softprops/action-gh-release"
+      ],
+      "matchUpdateTypes": ["major"],
+      "automerge": false
     },
     {
       "matchManagers": ["dockerfile", "docker-compose"],
@@ -23,7 +32,6 @@
     {
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
-      "minimumReleaseAge": "3 days",
       "automerge": true
     },
     {
@@ -33,6 +41,10 @@
     {
       "matchPackageNames": ["rust"],
       "groupName": "Rust toolchain"
+    },
+    {
+      "matchDepNames": ["ubuntu"],
+      "groupName": "Ubuntu runners"
     }
   ],
   "customManagers": [
@@ -150,24 +162,6 @@
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "linuxdeploy/linuxdeploy",
       "versioningTemplate": "loose"
-    },
-    {
-      "customType": "regex",
-      "managerFilePatterns": ["/(^|/)README\\.md$/"],
-      "matchStrings": ["badge/svt--av1-(?<currentValue>v[0-9][^-?]*)\\.svg\\?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1\" src=\"https://shieldcn\\.dev/badge/svt--av1-v[0-9][^-?]*\\.svg"],
-      "datasourceTemplate": "gitlab-releases",
-      "depNameTemplate": "AOMediaCodec/SVT-AV1",
-      "versioningTemplate": "semver",
-      "autoReplaceStringTemplate": "badge/svt--av1-{{{newValue}}}.svg?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1\" src=\"https://shieldcn.dev/badge/svt--av1-{{{newValue}}}.svg"
-    },
-    {
-      "customType": "regex",
-      "managerFilePatterns": ["/(^|/)README\\.md$/"],
-      "matchStrings": ["badge/svt--av1--hdr-[0-9a-f]+\\.svg\\?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1-hdr\" src=\"https://shieldcn\\.dev/badge/svt--av1--hdr-[0-9a-f]+\\.svg\\?variant=secondary&amp;mode=light\"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@(?<currentDigest>[0-9a-f]+) -->"],
-      "currentValueTemplate": "main",
-      "datasourceTemplate": "git-refs",
-      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr",
-      "autoReplaceStringTemplate": "badge/svt--av1--hdr-{{{replace '^(.{7}).*' '$1' newDigest}}}.svg?variant=secondary&amp;mode=dark\"><img alt=\"svt-av1-hdr\" src=\"https://shieldcn.dev/badge/svt--av1--hdr-{{{replace '^(.{7}).*' '$1' newDigest}}}.svg?variant=secondary&amp;mode=light\"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@{{{newDigest}}} -->"
     }
   ]
 }

@@ -23,7 +23,7 @@ pub struct HdrInfo {
     pub mastering_display: Option<String>,
     /// Dolby Vision profile from the DOVI configuration record, when there is one.
     pub dv_profile: Option<u32>,
-    /// HDR10+ on the first frame; also set under Dolby Vision, which wins `hdr_type`.
+    /// HDR10+ in the probed frames; also set under Dolby Vision, which wins `hdr_type`.
     pub hdr10plus: bool,
 }
 
@@ -133,7 +133,8 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         &[
             "-v", "error",
             "-select_streams", "v:0",
-            "-read_intervals", "%+#1",
+            // A source whose first HDR10+ message sits on a later frame would read as HDR10.
+            "-read_intervals", "%+#48",
             "-show_entries", "stream=codec_name,color_primaries,color_transfer,color_space,chroma_location,color_range",
             // Sections accumulate, so this does not replace the two around it.
             "-show_entries", "stream_side_data=dv_profile",
@@ -159,9 +160,7 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         ..Default::default()
     };
 
-    let side_data = probe.frames.into_iter().next()
-        .map(|f| f.side_data_list)
-        .unwrap_or_default();
+    let side_data: Vec<_> = probe.frames.into_iter().flat_map(|f| f.side_data_list).collect();
 
     let has_side_type = |needle: &str| {
         side_data.iter().any(|s| s.side_data_type.to_lowercase().contains(needle))

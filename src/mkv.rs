@@ -133,14 +133,20 @@ pub fn trim_av1_codec_private(path: &Path) -> Result<bool> {
             break;
         }
         let size = el.size.context("top-level element of unknown size before the first cluster")?;
+        let data_pos = pos + el.data as u64;
+        // A truncated file would otherwise allocate whatever its size field claims.
+        ensure!(
+            data_pos.checked_add(size).is_some_and(|end| end <= file_len),
+            "element at byte {pos} runs past the end of {}", path.display()
+        );
         if el.id == TRACKS {
             let mut tracks = vec![0u8; usize::try_from(size)?];
-            f.seek(SeekFrom::Start(pos + el.data as u64))?;
+            f.seek(SeekFrom::Start(data_pos))?;
             f.read_exact(&mut tracks)?;
             if !trim_tracks(&mut tracks) {
                 return Ok(false);
             }
-            f.seek(SeekFrom::Start(pos + el.data as u64))?;
+            f.seek(SeekFrom::Start(data_pos))?;
             f.write_all(&tracks)?;
             f.sync_all()?;
             return Ok(true);
@@ -167,6 +173,20 @@ mod tests {
             n => vec![(n & 0x7f) as u8 | 0x80, (n >> 7) as u8],
         };
         [vec![(kind << 3) | 0x02], size, payload.to_vec()].concat()
+    }
+
+    #[test]
+    fn a_tracks_size_past_the_end_of_the_file_is_an_error_not_an_allocation() {
+        let file = [
+            vec![0x1A, 0x45, 0xDF, 0xA3, 0x83, 0x42, 0x82, 0x88],
+            vec![0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            vec![0x16, 0x54, 0xAE, 0x6B, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00],
+        ].concat();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("truncated.mkv");
+        std::fs::write(&path, &file).unwrap();
+        assert!(trim_av1_codec_private(&path).is_err());
     }
 
     #[test]

@@ -199,7 +199,7 @@ impl TempDir {
     }
 
     /// The source this temp dir was built for, as recorded by `claim_source`.
-    pub fn recorded_source(&self) -> Option<String> {
+    pub fn recorded_id(&self) -> Option<String> {
         std::fs::read_to_string(&self.source_id_path)
             .ok()
             .map(|s| s.trim().to_owned())
@@ -207,8 +207,8 @@ impl TempDir {
 
     /// A different source with the same stem wipes the dir; it describes the old video.
     pub fn claim_source(&self, source: &Path, stem: &str) -> Result<()> {
-        let id = source.display().to_string();
-        if self.recorded_source().is_some_and(|prev| prev != id) {
+        let id = source_id(source);
+        if self.recorded_id().is_some_and(|prev| prev != id) {
             tracing::warn!("[{stem}] temp dir belongs to a different source - discarding it");
             std::fs::remove_dir_all(&self.path)
                 .with_context(|| format!("remove stale temp dir: {}", self.path.display()))?;
@@ -217,6 +217,13 @@ impl TempDir {
         std::fs::write(&self.source_id_path, &id)
             .with_context(|| format!("write {}", self.source_id_path.display()))
     }
+}
+
+/// The size below the path, so a file replaced under the same name is a new job. Not the
+/// mtime: a copy that only touched it would throw away hours of encoding.
+pub fn source_id(source: &Path) -> String {
+    let size = std::fs::metadata(source).map_or(0, |m| m.len());
+    format!("{}\n{size}", source.display())
 }
 
 #[cfg(test)]
@@ -248,6 +255,26 @@ mod tests {
         assert_eq!(back[0].end_frame, 9);
 
         assert!(!path.with_extension("json.tmp").exists(), "scratch file left behind");
+    }
+
+    #[test]
+    fn a_source_replaced_under_the_same_name_discards_the_temp_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("Film.mkv");
+        std::fs::write(&source, b"first video").unwrap();
+
+        let temp = TempDir::for_video(dir.path(), "Film");
+        temp.claim_source(&source, "Film").unwrap();
+        let chunk = temp.chunk_path("00001");
+        std::fs::write(&chunk, b"chunk of the first video").unwrap();
+
+        temp.claim_source(&source, "Film").unwrap();
+        assert!(chunk.exists(), "the same file must keep its chunks");
+
+        std::fs::write(&source, b"a different video of another length").unwrap();
+        temp.claim_source(&source, "Film").unwrap();
+        assert!(!chunk.exists(), "chunks of the old video survived the replacement");
+        assert_eq!(temp.recorded_id(), Some(source_id(&source)));
     }
 
     #[test]

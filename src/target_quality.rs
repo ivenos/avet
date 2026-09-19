@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use crate::config::{Config, TargetQualityConfig};
 use crate::encode::{self, EncodeOptions};
-use crate::ext::external_bin;
+use crate::ext::{external_bin, reap};
 use crate::ffms2::{Crop, OpenOpts, VideoSource};
 use crate::resume::SceneEntry;
 
@@ -717,11 +717,6 @@ fn make_fifo(path: &Path) -> Result<()> {
             .with_context(|| format!("create fifo {}", path.display()));
     }
     Ok(())
-}
-
-fn reap(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {

@@ -8,11 +8,10 @@
 
 <a href="https://hub.docker.com/r/ivenos/avet"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/docker/size/ivenos/avet.svg?variant=secondary&amp;mode=dark"><img alt="Docker Image Size" src="https://shieldcn.dev/docker/size/ivenos/avet.svg?variant=secondary&amp;mode=light"></picture></a>
 <a href="https://hub.docker.com/r/ivenos/avet"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/docker/pulls/ivenos/avet.svg?variant=secondary&amp;mode=dark"><img alt="Docker Pulls" src="https://shieldcn.dev/docker/pulls/ivenos/avet.svg?variant=secondary&amp;mode=light"></picture></a>
+<a href="https://github.com/ivenos/avet/releases"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/github/downloads/ivenos/avet.svg?variant=secondary&amp;mode=dark&amp;label=AppImage%20downloads"><img alt="AppImage Downloads" src="https://shieldcn.dev/github/downloads/ivenos/avet.svg?variant=secondary&amp;mode=light&amp;label=AppImage%20downloads"></picture></a>
 <a href="https://github.com/ivenos/avet/blob/main/LICENSE"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/license-GPL_3.0.svg?variant=secondary&amp;mode=dark"><img alt="License" src="https://shieldcn.dev/badge/license-GPL_3.0.svg?variant=secondary&amp;mode=light"></picture></a>
-<a href="https://gitlab.com/AOMediaCodec/SVT-AV1"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/svt--av1-v4.2.0.svg?variant=secondary&amp;mode=dark"><img alt="svt-av1" src="https://shieldcn.dev/badge/svt--av1-v4.2.0.svg?variant=secondary&amp;mode=light"></picture></a>
-<a href="https://github.com/juliobbv-p/svt-av1-hdr"><picture><source media="(prefers-color-scheme: dark)" srcset="https://shieldcn.dev/badge/svt--av1--hdr-9dabe3c.svg?variant=secondary&amp;mode=dark"><img alt="svt-av1-hdr" src="https://shieldcn.dev/badge/svt--av1--hdr-9dabe3c.svg?variant=secondary&amp;mode=light"></picture></a> <!-- renovate: juliobbv-p/svt-av1-hdr@9dabe3ca04390e2e19267bf87a48c6cab44d6111 -->
 
-avet is an AV1 encoding service. It watches a folder, splits each video into scenes, encodes them in parallel with SVT-AV1 and writes a finished MKV with audio, subtitles and chapters carried over. It ships as a Docker image and as a Linux AppImage with every tool bundled.
+avet is an AV1 encoding service that watches a folder, splits each video at its scene cuts and encodes the chunks in parallel with SVT-AV1. It writes a finished MKV with audio, subtitles and chapters carried over, and ships as a Docker image and as a Linux AppImage with every tool bundled.
 
 </div>
 
@@ -82,7 +81,7 @@ output/
 ```
 
 - Supported extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. Only the first video track is encoded.
-- Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Aspect ratio, rotation, the colour description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
+- Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Aspect ratio, rotation, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
 - A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
 - Output files are named after the source, so two queued files with the same name in the same folder wait until one is renamed.
@@ -217,3 +216,18 @@ Chapters are always kept. Subtitle tracks Matroska cannot hold, such as TTML, ar
 | `extra_split` | `0` | Maximum chunk length in frames (at least `24`), overrides `extra_split_sec` |
 | `speed` | `"standard"` | `"fast"` trades accuracy for speed |
 | `downscale_height` | - | Detect scenes on a copy scaled to this height (at least `64`) |
+
+## License
+
+Copyright © Iven Schlösser. avet is free software, licensed under the [GNU General Public License v3.0 only](https://github.com/ivenos/avet/blob/main/LICENSE). You may use, modify and redistribute it. Anyone distributing a modified version must release it under the same license and make its source code available.
+
+The Docker image and the AppImage bundle third-party software, each under its own license:
+
+- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) and [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr): BSD 3-Clause Clear License with the Alliance for Open Media Patent License 1.0
+- [FFmpeg](https://ffmpeg.org): GPL-2.0-or-later and LGPL-2.1-or-later
+- [FFMS2](https://github.com/FFMS/ffms2): MIT as source, GPL as a binary built against FFmpeg
+- [Vship](https://codeberg.org/Line-fr/Vship): MIT NON-AI License
+- [libvmaf](https://github.com/Netflix/vmaf): BSD-2-Clause-Patent
+- [MKVToolNix](https://mkvtoolnix.download): GPL-2.0-only
+
+avet is not affiliated with or endorsed by any of them. "Dolby Vision" is a trademark of Dolby Laboratories Licensing Corporation, "HDR10+" is a trademark of HDR10+ Technologies, LLC.

@@ -45,7 +45,7 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
             continue;
         }
 
-        for (source_file, rel_dir) in find_video_files(&profile_dir)? {
+        for (source_file, rel_dir) in find_video_files(&profile_dir) {
             let job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir };
             let job_output = job.output_dir(output_dir);
             if output_exists(&job_output, &job.source_file) {
@@ -97,29 +97,44 @@ fn drop_name_collisions(jobs: Vec<Job>) -> Vec<Job> {
         .collect()
 }
 
-fn find_video_files(dir: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+fn find_video_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut files = Vec::new();
-    collect_video_files(dir, Path::new(""), &mut files)?;
+    collect_video_files(dir, Path::new(""), &mut files);
     files.sort_by(|a, b| (&a.1, a.0.file_name()).cmp(&(&b.1, b.0.file_name())));
-    Ok(files)
+    files
 }
 
-fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<()> {
+fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) {
     const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
 
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry.context("directory entry")?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("skipping {}: {e}", dir.display());
+            return;
+        }
+    };
+
+    for entry in entries {
+        let Ok(entry) = entry else {
+            tracing::warn!("skipping an unreadable entry in {}", dir.display());
+            continue;
+        };
         let path = entry.path();
         // DirEntry's type does not follow symlinks, so a link back up cannot loop.
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             match path.file_name().and_then(|n| n.to_str()) {
                 None => tracing::warn!("skipping folder with non-UTF8 name: {}", path.display()),
                 Some(name) if name.starts_with('.') => {}
-                Some(name) => collect_video_files(&path, &rel.join(name), files)?,
+                Some(name) => collect_video_files(&path, &rel.join(name), files),
             }
             continue;
         }
         if !path.is_file() {
+            continue;
+        }
+        // macOS writes ._Name.mkv beside Name.mkv; it is metadata, not a video.
+        if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
@@ -134,7 +149,6 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
             files.push((path, rel.to_path_buf()));
         }
     }
-    Ok(())
 }
 
 /// avet never produces an empty output, so one is a leftover, not "already done".
@@ -158,8 +172,8 @@ fn failed_marker(output_dir: &Path, source_file: &Path) -> Option<PathBuf> {
     if !temp.failed_path.exists() {
         return None;
     }
-    match temp.recorded_source() {
-        Some(prev) if prev != source_file.display().to_string() => None,
+    match temp.recorded_id() {
+        Some(prev) if prev != crate::resume::source_id(source_file) => None,
         _ => Some(temp.failed_path),
     }
 }
@@ -327,6 +341,44 @@ mod tests {
     }
 
     #[test]
+    fn a_macos_resource_fork_is_not_a_job() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        fs::write(profile.join("._film.mkv"), b"apple double").unwrap();
+
+        let jobs = scan(&input, &output).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].stem(), "film");
+    }
+
+    #[test]
+    fn an_unreadable_folder_does_not_stop_the_scan() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, input, output) = make_dirs();
+        for name in ["a", "b"] {
+            let profile = input.join(name);
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+            fs::write(profile.join(format!("{name}.mkv")), b"fake").unwrap();
+        }
+
+        let locked = input.join("a").join("season");
+        fs::create_dir_all(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&locked).is_ok() {
+            return; // running as root, where nothing is unreadable
+        }
+
+        let jobs = scan(&input, &output).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
     fn failed_marker_only_blocks_the_file_it_was_written_for() {
         let (_tmp, input, output) = make_dirs();
         let profile = input.join("p");
@@ -339,7 +391,7 @@ mod tests {
         fs::write(&temp.failed_path, b"boom").unwrap();
 
         // Marker written for this exact file: blocked.
-        fs::write(&temp.source_id_path, profile.join("film.mkv").display().to_string()).unwrap();
+        fs::write(&temp.source_id_path, crate::resume::source_id(&profile.join("film.mkv"))).unwrap();
         assert_eq!(scan(&input, &output).unwrap().len(), 0);
 
         // Marker left over from a different file that had the same name: not blocked.

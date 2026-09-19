@@ -89,4 +89,21 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "empty cache: no output"
 assert_log_contains "no black bars (cached)"
 
+# -- rotated source: the bars sit in storage orientation, not in the displayed one ----
+I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/pattern_bars_rot90.mp4" "$I/p/test.mp4"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avet]
+crop      = true
+keep_temp = true
+EOF
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "rotated crop: no output"
+assert_video_height "$O/test.mkv" 276
+grep -qx "crop=640:276:0:44" "$O/.avet_test/crop.cache" ||
+    fail "rotated crop: cropdetect box is '$(cat "$O/.avet_test/crop.cache")'"
+
 test_done

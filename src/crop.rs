@@ -117,7 +117,8 @@ fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
     const TIMEOUT_SECS: u64 = 300;
 
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    cmd.args(["-ss", &seek_secs.to_string()])
+    // FFMS2 decodes in storage orientation; autorotate would box the displayed image.
+    cmd.args(["-noautorotate", "-ss", &seek_secs.to_string()])
         .arg("-i").arg(source_file)
         // Same track as probe_dimensions; ffmpeg's own pick is by resolution.
         .args(["-map", "0:v:0"])

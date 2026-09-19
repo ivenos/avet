@@ -120,6 +120,47 @@ fn parse_lossless_codecs(stdout: &str) -> HashSet<String> {
     set
 }
 
+/// Audio encoder names ffmpeg offers, queried once from `ffmpeg -encoders`.
+static AUDIO_ENCODERS: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+
+fn audio_encoders() -> Option<&'static HashSet<String>> {
+    AUDIO_ENCODERS
+        .get_or_init(|| match probe_audio_encoders() {
+            Ok(set) => Some(set),
+            Err(e) => {
+                tracing::warn!("ffmpeg -encoders query failed ({e:#}); codec names go unchecked");
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn probe_audio_encoders() -> Result<HashSet<String>> {
+    let mut cmd = Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-encoders"]);
+    let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -encoders")?;
+    if !out.status.success() {
+        bail!("ffmpeg -encoders exited with failure");
+    }
+    Ok(parse_audio_encoders(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_audio_encoders(stdout: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(flags), Some(name)) = (fields.next(), fields.next()) else { continue };
+        // The legend rows ("A..... = Audio") carry the same flags but no encoder name.
+        if flags.len() == 6
+            && flags.starts_with('A')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            set.insert(name.to_string());
+        }
+    }
+    set
+}
+
 fn fallback_lossless_codecs() -> HashSet<String> {
     [
         "truehd", "mlp", "flac", "alac", "ape", "tta", "wavpack", "tak",
@@ -434,10 +475,21 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                 let codec = r.codec.ok_or_else(|| anyhow::anyhow!(
                     "audio track {}: codec is required when mode = encode", track.audio_index
                 ))?;
+                if audio_encoders().is_some_and(|known| !known.contains(codec)) {
+                    return Err(anyhow::Error::new(crate::job::Transient).context(format!(
+                        "audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index
+                    )));
+                }
+                let layout = codec
+                    .contains("opus")
+                    .then(|| opus_layout(track.channel_layout.as_deref(), track.channels));
                 let bitrate = if output_is_lossless(codec) {
                     None
                 } else {
-                    let b = r.bitrate.and_then(|b| b.resolve(track.channels)).map(str::to_owned);
+                    let b = r.bitrate.and_then(|b| match &layout {
+                        Some((name, _)) => b.resolve_layout(name),
+                        None => b.resolve(track.channels),
+                    }).map(str::to_owned);
                     if b.is_none() {
                         tracing::warn!(
                             "audio track {}: no bitrate for {} channels, using encoder default",
@@ -452,9 +504,6 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                     .map(|(k, v)| (k.clone(), toml_value_to_arg(v)))
                     .collect();
                 options.sort();
-                let layout = codec
-                    .contains("opus")
-                    .then(|| opus_layout(track.channel_layout.as_deref(), track.channels));
                 Action::Encode { codec: codec.to_owned(), bitrate, options, layout }
             }
         };
@@ -659,8 +708,7 @@ pub fn mux_final(
     let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
     // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("mkvmerge failed:\n{stderr}");
+        bail!("mkvmerge failed:\n{}", String::from_utf8_lossy(&out.stdout));
     }
     // Exit 1 also covers "track skipped: unsupported codec", which silently drops a track.
     if out.status.code() == Some(1) {
@@ -720,6 +768,23 @@ mod tests {
         assert!(set.contains("dts"));
         assert!(!set.contains("aac"));
         assert!(!set.contains("ffv1"));
+    }
+
+    #[test]
+    fn the_encoder_list_holds_audio_encoders_and_no_legend_rows() {
+        let stdout = concat!(
+            "Encoders:\n",
+            " V..... = Video\n",
+            " A..... = Audio\n",
+            " ------\n",
+            " V....D libx264              libx264 H.264\n",
+            " A....D libopus              libopus Opus (codec opus)\n",
+            " A....D flac                 FLAC (Free Lossless Audio Codec)\n",
+        );
+        let set = parse_audio_encoders(stdout);
+        assert!(set.contains("libopus") && set.contains("flac"));
+        assert!(!set.contains("libx264"));
+        assert!(!set.contains("=") && !set.contains("libopu"));
     }
 
     #[test]

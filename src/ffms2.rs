@@ -84,7 +84,6 @@ pub struct FFMS_Frame {
     pub has_content_light_level: c_int,
     pub content_light_level_max: c_uint,
     pub content_light_level_average: c_uint,
-    pub flip: c_int,
     pub dolby_vision_rpu: *const u8,
     pub dolby_vision_rpu_size: c_int,
     pub hdr10_plus: *const u8,
@@ -514,8 +513,6 @@ impl VideoSource {
             bail!("FFMS_CreateVideoSource failed: {}", ei.message());
         }
 
-        let props = unsafe { &*FFMS_GetVideoProperties(ptr) };
-
         let mut ei2 = ErrorInfo::new();
         let first_frame = unsafe { FFMS_GetFrame(ptr, 0, &mut ei2.raw) };
         if first_frame.is_null() {
@@ -573,6 +570,7 @@ impl VideoSource {
             bail!("FFMS_SetOutputFormatV2 failed: {}", ei3.message());
         }
 
+        let props = unsafe { &*FFMS_GetVideoProperties(ptr) };
         let info = VideoInfo {
             width:      out_w as u32,
             height:     out_h as u32,
@@ -730,4 +728,21 @@ pub fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
 
     std::fs::rename(&tmp, index_file)
         .with_context(|| format!("rename {} to {}", tmp.display(), index_file.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_frame_struct_is_laid_out_like_ffms_h() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<FFMS_Frame>(), 256);
+        assert_eq!(offset_of!(FFMS_Frame, content_light_level_average), 216);
+        assert_eq!(offset_of!(FFMS_Frame, dolby_vision_rpu), 224);
+        assert_eq!(offset_of!(FFMS_Frame, dolby_vision_rpu_size), 232);
+        assert_eq!(offset_of!(FFMS_Frame, hdr10_plus), 240);
+        assert_eq!(offset_of!(FFMS_Frame, hdr10_plus_size), 248);
+    }
 }

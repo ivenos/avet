@@ -8,11 +8,13 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CASES_DIR="$SCRIPT_DIR/suites"
 
 export TEST_IMAGE="${TEST_IMAGE:-avet:test}"
+export TOOLS_IMAGE="${TOOLS_IMAGE:-avet:fixture-tools}"
 export VERBOSE=0
 
 NO_BUILD=0
 FILTER=""
 JOBS=$(( $(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2) / 2 ))
+[ "$JOBS" -ge 1 ] || JOBS=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -21,18 +23,19 @@ while [ $# -gt 0 ]; do
         -j)         JOBS="${2:-}"; [ $# -lt 2 ] || shift ;;
         -h|--help)
             cat << 'EOF'
-Builds the Docker image, generates fixtures in a temp dir, runs all test
+Builds the Docker images, generates fixtures in a temp dir, runs all test
 cases. The fixtures directory is automatically removed on exit.
 
 Usage:
   ./test/run.sh                    full run: build + fixtures + tests
-  ./test/run.sh --no-build         reuse existing image
+  ./test/run.sh --no-build         reuse existing images
   ./test/run.sh --verbose          print container logs on failure
   ./test/run.sh -j 4               run at most 4 suites at once (default: half the CPU cores)
   ./test/run.sh audio              filter: only tests matching "audio"
 
 Environment:
   TEST_IMAGE       Docker image tag (default: avet:test)
+  TOOLS_IMAGE      Fixture tools image tag (default: avet:fixture-tools)
 EOF
             exit 0 ;;
         # Anything else is a filter, but a mistyped flag must not become one: it would
@@ -53,11 +56,16 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 if [ "$NO_BUILD" -eq 0 ]; then
-    printf "=== Building %s ===\n" "$TEST_IMAGE"
+    printf "=== Building %s and %s ===\n" "$TEST_IMAGE" "$TOOLS_IMAGE"
     docker build -t "$TEST_IMAGE" "$ROOT_DIR" || exit 1
-elif ! docker image inspect "$TEST_IMAGE" >/dev/null 2>&1; then
-    printf "${RED}ERROR:${NC} image %s not found (drop --no-build or build manually)\n" "$TEST_IMAGE"
-    exit 1
+    docker build -t "$TOOLS_IMAGE" -f "$SCRIPT_DIR/tools.Dockerfile" "$SCRIPT_DIR" || exit 1
+else
+    for image in "$TEST_IMAGE" "$TOOLS_IMAGE"; do
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            printf "${RED}ERROR:${NC} image %s not found (drop --no-build or build manually)\n" "$image"
+            exit 1
+        fi
+    done
 fi
 
 FIXTURES_DIR=$(mktemp -d)

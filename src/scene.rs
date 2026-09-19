@@ -17,7 +17,8 @@ pub fn detect(
     let actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
 
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error"])
+    // FFMS2 decodes in storage orientation, which is what the crop filter is built for.
+    cmd.args(["-hide_banner", "-loglevel", "error", "-noautorotate"])
         .arg("-i")
         .arg(source_file)
         // The track FFMS2 opens; ffmpeg's own pick is by resolution.
@@ -141,15 +142,14 @@ fn apply_extra_split(scenes: Vec<SceneEntry>, max_frames: usize) -> Vec<SceneEnt
         } else {
             let n_parts = len.div_ceil(max_frames);
             let part_size = len / n_parts;
+            // The remainder goes one frame per part, or the last part would exceed max_frames.
+            let long_parts = len % n_parts;
+            let mut start = scene.start_frame;
             for i in 0..n_parts {
-                let start = scene.start_frame + (i * part_size) as u64;
-                let end   = if i + 1 == n_parts {
-                    scene.end_frame
-                } else {
-                    start + part_size as u64 - 1
-                };
+                let end = start + (part_size + usize::from(i < long_parts)) as u64 - 1;
                 result.push(SceneEntry { index, start_frame: start, end_frame: end });
                 index += 1;
+                start = end + 1;
             }
         }
     }
@@ -266,7 +266,8 @@ mod tests {
         let scenes = build_scene_entries(&[0], 241);
         let result = apply_extra_split(scenes, 240);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].end_frame - result[0].start_frame + 1, 120);
+        assert_eq!(result[0].frame_count(), 121);
+        assert_eq!(result[1].frame_count(), 120);
         assert_eq!(result[1].end_frame, 240);
     }
 
@@ -277,6 +278,21 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[2].end_frame, 719);
         for e in &result { assert!(e.frame_count() <= 240); }
+    }
+
+    #[test]
+    fn no_part_exceeds_the_maximum_when_the_scene_does_not_divide_evenly() {
+        for (len, max) in [(239usize, 24usize), (1439, 240), (14399, 240), (172799, 240)] {
+            let result = apply_extra_split(build_scene_entries(&[0], len), max);
+            for e in &result {
+                assert!(e.frame_count() <= max as u64, "len {len} max {max}: {}", e.frame_count());
+            }
+            assert_eq!(result[0].start_frame, 0);
+            assert_eq!(result.last().unwrap().end_frame, len as u64 - 1);
+            for pair in result.windows(2) {
+                assert_eq!(pair[1].start_frame, pair[0].end_frame + 1);
+            }
+        }
     }
 
     #[test]

@@ -38,7 +38,8 @@ fn hdr10plus_in_sei(nal_payload: &[u8]) -> Option<Vec<u8>> {
         loop {
             let b = *rbsp.get(*pos)?;
             *pos += 1;
-            value += u32::from(b);
+            // H.265 does not cap the ff_byte run, so the sum can leave u32.
+            value = value.checked_add(u32::from(b))?;
             if b != 0xFF {
                 return Some(value);
             }
@@ -284,6 +285,12 @@ mod tests {
 
     fn hdr10plus(value: u8) -> (u8, Vec<u8>) {
         (4, [&HDR10PLUS_T35_HEADER[..], &[0x01, 0x40, value]].concat())
+    }
+
+    #[test]
+    fn an_endless_run_of_ff_bytes_is_no_message() {
+        let ff_bytes = (u32::MAX / 255) as usize + 16;
+        assert_eq!(hdr10plus_in_sei(&vec![0xFF; ff_bytes]), None);
     }
 
     /// Reads a few bytes at a time, so NALs and start codes straddle every read.

@@ -97,8 +97,10 @@ fn read_ivf_frame(r: &mut impl Read) -> Result<Option<(u64, Vec<u8>)>> {
     r.read_exact(&mut head[1..]).context("truncated IVF frame header")?;
     let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
     let pts = u64::from_le_bytes([head[4], head[5], head[6], head[7], head[8], head[9], head[10], head[11]]);
-    let mut data = vec![0u8; size];
-    r.read_exact(&mut data).context("truncated IVF frame")?;
+    // Growing into the read: a corrupt size field would otherwise allocate 4 GiB up front.
+    let mut data = Vec::new();
+    r.by_ref().take(size as u64).read_to_end(&mut data).context("read IVF frame")?;
+    ensure!(data.len() == size, "truncated IVF frame: {} of {size} bytes", data.len());
     Ok(Some((pts, data)))
 }
 
@@ -242,6 +244,18 @@ mod tests {
     }
 
     const TD: u8 = 2;
+
+    #[test]
+    fn a_frame_size_past_the_end_of_the_file_is_an_error_not_an_allocation() {
+        let mut data = ivf(&[]);
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(b"four");
+
+        let mut r = std::io::Cursor::new(data);
+        read_ivf_header(&mut r, Path::new("t.ivf")).unwrap();
+        assert!(read_ivf_frame(&mut r).is_err());
+    }
 
     #[test]
     fn leb128_round_trips_multi_byte_sizes() {
