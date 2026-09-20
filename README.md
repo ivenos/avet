@@ -55,7 +55,7 @@ The arm64 image has no hardware Vulkan driver.
 
 ### AppImage
 
-Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory.
+Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory. It needs glibc 2.39 or newer and FUSE 2; without FUSE, run it with `--appimage-extract-and-run`.
 
 ## Usage
 
@@ -151,14 +151,15 @@ jod = 9.5
 | `jod` | - | Minimum CVVDP score per chunk, in `(0, 10)` (required) |
 | `min_crf` | `1` | Lowest CRF to try |
 | `max_crf` | `70` | Highest CRF to try (max `70`) |
-| `min_probes` | `2` | Probes before `tolerance` may stop the search |
+| `min_probes` | `2` | Probes before `tolerance` may stop the search, at least `2` |
 | `max_probes` | `7` | Maximum probes per chunk |
 | `tolerance` | `0.05` | Stop once a probe is at most this far above `jod` |
-| `probe_preset` | `13` | Encoder preset for probes |
+| `probe_preset` | `13` | Encoder preset for probes, `0` to `13` |
 | `max_encoded_percent` | `90` | Maximum chunk size as a percent of the source's bytes for that chunk |
 | `max_cambi` | - | Maximum CAMBI of the encode, `>= 0` |
 | `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, `>= 0` |
 
+- Needs `avet.video = "encode"` and cannot be combined with `avet.scale`: the score compares against the source at its own resolution, so a downscale would count as lost quality.
 - `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged.
 - CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both apply to the worst 5% of a chunk's frames and are measured without film grain.
 - If no probe holds every limit, the chunk uses the lowest CRF under `max_encoded_percent`.
@@ -213,7 +214,7 @@ Chapters are always kept. Subtitle tracks Matroska cannot hold, such as TTML, ar
 |---|---|---|
 | `min_scene_len` | `24` | Minimum chunk length in frames |
 | `extra_split_sec` | `10` | Maximum chunk length in seconds, `0` disables |
-| `extra_split` | `0` | Maximum chunk length in frames (at least `24`), overrides `extra_split_sec` |
+| `extra_split` | `0` | Maximum chunk length in frames (at least `24`), `0` disables, overrides `extra_split_sec` |
 | `speed` | `"standard"` | `"fast"` trades accuracy for speed |
 | `downscale_height` | - | Detect scenes on a copy scaled to this height (at least `64`) |
 

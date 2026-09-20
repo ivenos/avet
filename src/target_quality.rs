@@ -19,14 +19,50 @@ const NOMINAL_JOD_PER_CRF: f64 = 0.025;
 
 const CAMBI_PERCENTILE: f64 = 95.0;
 
-/// By the signalled transfer: an SDR source measures ~2.5 JOD low against an HDR display.
-pub fn display_model_for(output_height: u32, hdr_args: &[String]) -> &'static str {
-    match signalled_transfer(hdr_args) {
-        Some("18") => "standard_hdr_hlg",
-        Some("16") => "standard_hdr_pq",
-        _ if output_height >= 1440 => "standard_4k",
-        _ => "standard_fhd",
+/// The display CVVDP scores against. Vship takes pixels-per-degree from the model's own
+/// resolution, never from the content, so the model has to carry the comparison's size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayModel {
+    width: u32,
+    height: u32,
+    hdr: bool,
+}
+
+/// 30 inches at twice the display height, the geometry of Vship's own standard models.
+const DISPLAY_INCHES: &str = "30";
+const DISPLAY_DISTANCE_M: &str = "0.7472";
+
+impl DisplayModel {
+    /// Luminance as in Vship's own models. An SDR source measures ~2.5 JOD low against
+    /// an HDR display, so the two are kept apart.
+    pub fn config_json(&self) -> String {
+        let (colorspace, max_luminance, contrast, ambient) = if self.hdr {
+            ("HDR", "1500", "1000000", "10")
+        } else {
+            ("sRGB", "200", "1000", "250")
+        };
+        format!(
+            "{{\"{}\":{{\"name\":\"avet\",\"resolution\":[{},{}],\"colorspace\":\"{colorspace}\",\
+             \"viewing_distance_meters\":{DISPLAY_DISTANCE_M},\"diagonal_size_inches\":{DISPLAY_INCHES},\
+             \"max_luminance\":{max_luminance},\"contrast\":{contrast},\"E_ambient\":{ambient},\
+             \"k_refl\":0.005}}}}",
+            Self::KEY, self.width, self.height
+        )
     }
+
+    /// The name the config is looked up under; without it FFVship keeps its own default.
+    pub const KEY: &'static str = "avet";
+
+    pub fn describe(&self) -> String {
+        let kind = if self.hdr { "HDR" } else { "SDR" };
+        format!("{}x{} {kind}", self.width, self.height)
+    }
+}
+
+/// HDR by the signalled transfer, at the resolution the two files are compared at.
+pub fn display_model_for(width: u32, height: u32, hdr_args: &[String]) -> DisplayModel {
+    let hdr = matches!(signalled_transfer(hdr_args), Some("16" | "18"));
+    DisplayModel { width, height, hdr }
 }
 
 fn signalled_transfer(hdr_args: &[String]) -> Option<&str> {
@@ -108,7 +144,7 @@ pub struct ProbeContext<'a> {
     pub config: &'a Config,
     pub opts: &'a EncodeOptions,
     pub tq: &'a TargetQualityConfig,
-    pub display_model: &'a str,
+    pub display_model: DisplayModel,
     pub gpu_id: u32,
     /// Held around FFVship: a second run on the same GPU adds VRAM, not throughput.
     pub gpu_lock: &'a Mutex<()>,
@@ -198,29 +234,64 @@ impl SolveResult {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Phase {
+    Search,
+    ChasingCap,
+    NarrowingCap,
+}
+
+impl Phase {
+    fn suffix(self) -> &'static str {
+        match self {
+            Phase::Search       => "",
+            Phase::ChasingCap   => " (chasing the size cap)",
+            Phase::NarrowingCap => " (narrowing the size cap)",
+        }
+    }
+}
+
 /// Highest CRF holding `tq.jod` and the CAMBI limits under `tq.max_encoded_percent`. JOD
 /// falls monotonically with CRF, so this is an interpolated binary search on the 0.25 grid.
 pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
     let lo = ctx.tq.min_crf as f64;
     let hi = ctx.tq.max_crf as f64;
-    let floor = Floor::new(ctx.tq);
-    let tol = ctx.tq.tolerance;
-    let cap = ctx.tq.max_encoded_percent;
     let key = scene.padded_index();
+    let mut n = 0u32;
+
+    solve(ctx.tq, seed_crf(ctx.config, lo, hi), &mut |crf, phase| {
+        let probe = probe_once(ctx, scene, crf)?;
+        n += 1;
+        tracing::info!(
+            "[{}] chunk {key} probe {n}/{} crf {crf} gives {}, {:.0}% size{}",
+            ctx.stem, ctx.tq.max_probes, probe.scores(), probe.size_pct, phase.suffix()
+        );
+        Ok(probe)
+    })
+}
+
+/// The search with the probe as a seam: driving it takes an encoder and a GPU, the
+/// decisions it makes between probes take neither.
+fn solve(
+    tq: &TargetQualityConfig,
+    seed: f64,
+    probe_at: &mut dyn FnMut(f64, Phase) -> Result<Probe>,
+) -> Result<SolveResult> {
+    let lo = tq.min_crf as f64;
+    let hi = tq.max_crf as f64;
+    let floor = Floor::new(tq);
+    let tol = tq.tolerance;
+    let cap = tq.max_encoded_percent;
 
     let mut pts: Vec<Probe> = Vec::new();
-    let mut crf = round_to_step(seed_crf(ctx.config, lo, hi), lo, hi);
+    let mut crf = round_to_step(seed, lo, hi);
 
-    for i in 0..ctx.tq.max_probes {
-        let probe = probe_once(ctx, scene, crf)?;
-        tracing::info!(
-            "[{}] chunk {key} probe {}/{} crf {crf} gives {}, {:.0}% size",
-            ctx.stem, i + 1, ctx.tq.max_probes, probe.scores(), probe.size_pct
-        );
+    for i in 0..tq.max_probes {
+        let probe = probe_at(crf, Phase::Search)?;
         pts.push(probe);
 
         // early stop: just above the floor, within the size cap, after min_probes
-        if i + 1 >= ctx.tq.min_probes
+        if i + 1 >= tq.min_probes
             && floor.holds(&probe) && probe.jod <= floor.jod + tol && probe.size_pct <= cap
         {
             break;
@@ -232,7 +303,7 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveRe
     }
 
     // The search above follows the floor only, so every probe can be over the cap.
-    while (pts.len() as u32) < ctx.tq.max_probes && !pts.iter().any(|p| p.size_pct <= cap) {
+    while (pts.len() as u32) < tq.max_probes && !pts.iter().any(|p| p.size_pct <= cap) {
         let highest = pts.iter().map(|p| p.crf).fold(f64::MIN, f64::max);
         if highest >= hi - 1e-9 {
             break;
@@ -241,16 +312,12 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveRe
         if already(&pts, next) {
             break;
         }
-        let probe = probe_once(ctx, scene, next)?;
-        tracing::info!(
-            "[{}] chunk {key} probe {}/{} crf {next} gives {}, {:.0}% size (chasing the size cap)",
-            ctx.stem, pts.len() + 1, ctx.tq.max_probes, probe.scores(), probe.size_pct
-        );
+        let probe = probe_at(next, Phase::ChasingCap)?;
         pts.push(probe);
     }
 
     // That bisection can overshoot, and a lower CRF under the cap is free quality.
-    while (pts.len() as u32) < ctx.tq.max_probes
+    while (pts.len() as u32) < tq.max_probes
         && !pts.iter().any(|p| floor.holds(p) && p.size_pct <= cap)
     {
         let Some(fit) = pts.iter().filter(|p| p.size_pct <= cap).map(|p| p.crf).reduce(f64::min)
@@ -273,11 +340,7 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveRe
         if already(&pts, next) {
             break;
         }
-        let probe = probe_once(ctx, scene, next)?;
-        tracing::info!(
-            "[{}] chunk {key} probe {}/{} crf {next} gives {}, {:.0}% size (narrowing the size cap)",
-            ctx.stem, pts.len() + 1, ctx.tq.max_probes, probe.scores(), probe.size_pct
-        );
+        let probe = probe_at(next, Phase::NarrowingCap)?;
         pts.push(probe);
     }
 
@@ -475,7 +538,7 @@ struct MeasureOpts<'a> {
     crop: Option<Crop>,
     source_width: u32,
     source_height: u32,
-    display_model: &'a str,
+    display_model: DisplayModel,
     gpu_id: u32,
     n_threads: usize,
     /// Unique suffix for the per-measurement json file.
@@ -492,6 +555,26 @@ impl Drop for Cleanup {
     }
 }
 
+/// A driver reset, a GPU in use by something else or a lost device all come back on their
+/// own; anything else FFVship reports is a verdict on the file.
+fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
+    const RECOVERABLE: &[&str] = &[
+        "VK_ERROR_DEVICE_LOST",
+        "VK_ERROR_OUT_OF_DEVICE_MEMORY",
+        "VK_ERROR_INITIALIZATION_FAILED",
+        "out of device memory",
+        "no Vulkan device",
+        "OutOfVRAM",
+    ];
+    let err = crate::ext::tool_error(what, status, stderr);
+    if err.downcast_ref::<crate::job::Transient>().is_none()
+        && RECOVERABLE.iter().any(|m| stderr.contains(m))
+    {
+        return err.context(crate::job::Transient);
+    }
+    err
+}
+
 /// FFVship crops the source to match and resizes on a mismatch; its last cumulative
 /// JOD is the chunk score.
 fn measure(m: &MeasureOpts) -> Result<f64> {
@@ -501,37 +584,47 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
     cmd.arg("-s").arg(m.source)
         .arg("-e").arg(m.distorted)
-        .args(["-m", "CVVDP"])
         .arg("--source-index").arg(m.index)
-        .args(["--start", &m.start.to_string()])
-        .args(["--encoded-offset", &format!("-{}", m.start)])
-        .args(["--displayModel", m.display_model])
-        .args(["--gpu-id", &m.gpu_id.to_string()])
-        .args(["-t", &m.n_threads.to_string()])
-        .args(["-g", "3"])
+        .args(measure_args(m))
         .arg("--json").arg(&json);
-
-    // avet crop is offset+size in source space; FFVship wants per-edge amounts.
-    if let Some(c) = m.crop {
-        let right = m.source_width.saturating_sub(c.x + c.w);
-        let bottom = m.source_height.saturating_sub(c.y + c.h);
-        cmd.args(["--cropLeftSource", &c.x.to_string()])
-            .args(["--cropTopSource", &c.y.to_string()])
-            .args(["--cropRightSource", &right.to_string()])
-            .args(["--cropBottomSource", &bottom.to_string()]);
-    }
 
     // A wedged GPU takes the worker with it, and nothing above would notice.
     const TIMEOUT_SECS: u64 = 1800;
 
     let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "FFVship")?;
     if !out.status.success() {
-        bail!("FFVship failed:\n{}", String::from_utf8_lossy(&out.stderr));
+        return Err(gpu_error("FFVship", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
 
     let raw = std::fs::read_to_string(&json)
         .with_context(|| format!("read FFVship json: {}", json.display()))?;
     parse_cvvdp(&raw)
+}
+
+/// Everything but the file paths. The probe holds the chunk's frames from 0, and avet's
+/// crop is offset and size where FFVship wants per-edge amounts.
+fn measure_args(m: &MeasureOpts) -> Vec<String> {
+    let mut args: Vec<String> = ["-m", "CVVDP"].iter().map(|s| (*s).to_string()).collect();
+    args.extend([
+        "--start".into(), m.start.to_string(),
+        "--encoded-offset".into(), format!("-{}", m.start),
+        "--displayModel".into(), DisplayModel::KEY.to_string(),
+        "--displayConfig".into(), m.display_model.config_json(),
+        "--gpu-id".into(), m.gpu_id.to_string(),
+        // FFVship's own help calls this the number of decoder processes and recommends 2;
+        // it is not the encoder's thread count, and each one holds decoded frames.
+        "-t".into(), m.n_threads.clamp(1, 4).to_string(),
+        "-g".into(), "3".into(),
+    ]);
+    if let Some(c) = m.crop {
+        args.extend([
+            "--cropLeftSource".into(), c.x.to_string(),
+            "--cropTopSource".into(), c.y.to_string(),
+            "--cropRightSource".into(), m.source_width.saturating_sub(c.x + c.w).to_string(),
+            "--cropBottomSource".into(), m.source_height.saturating_sub(c.y + c.h).to_string(),
+        ]);
+    }
+    args
 }
 
 /// CVVDP JSON is `[[cum], [cum], ...]`; the last row is the whole clip's score.
@@ -685,11 +778,17 @@ fn parse_cambi(raw: &str) -> Result<Cambi> {
     for frame in &root.frames {
         let m = &frame.metrics;
         diffs.push(*m.get("cambi_full_reference").context("vmaf json has no cambi_full_reference")?);
-        // libvmaf appends non-default options to this name: `cambi_eotf_pq`.
-        let score = m
-            .iter()
-            .find(|(k, _)| k.starts_with("cambi") && *k != "cambi_source" && *k != "cambi_full_reference")
-            .context("vmaf json has no CAMBI score")?;
+        // libvmaf appends non-default options to every one of these names: the encode's
+        // own score becomes `cambi_eotf_pq`, and the other two can follow.
+        let mut found = m.iter().filter(|(k, _)| {
+            k.starts_with("cambi")
+                && !k.starts_with("cambi_source")
+                && !k.starts_with("cambi_full_reference")
+        });
+        let score = found.next().context("vmaf json has no CAMBI score")?;
+        if found.next().is_some() {
+            bail!("vmaf json has more than one CAMBI score, so none of them can be read");
+        }
         scores.push(*score.1);
     }
     if scores.is_empty() {
@@ -699,6 +798,9 @@ fn parse_cambi(raw: &str) -> Result<Cambi> {
 }
 
 fn worst_frames(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
     values.sort_by(f64::total_cmp);
     let rank = (values.len() as f64 * CAMBI_PERCENTILE / 100.0).ceil() as usize;
     values[rank.clamp(1, values.len()) - 1]
@@ -753,16 +855,36 @@ mod tests {
     fn display_model_follows_the_signalled_transfer() {
         let args = |t: &str| vec!["--transfer-characteristics".to_string(), t.to_string()];
 
-        assert_eq!(display_model_for(2160, &args("16")), "standard_hdr_pq");
-        assert_eq!(display_model_for(2160, &args("18")), "standard_hdr_hlg");
-        assert_eq!(display_model_for(720, &args("18")), "standard_hdr_hlg");
+        assert_eq!(display_model_for(3840, 2160, &args("16")).describe(), "3840x2160 HDR");
+        assert_eq!(display_model_for(3840, 2160, &args("18")).describe(), "3840x2160 HDR");
+        assert_eq!(display_model_for(1280, 720, &args("18")).describe(), "1280x720 HDR");
 
         // An SDR source signals bt709; an HDR display costs it ~2.5 JOD.
-        assert_eq!(display_model_for(1080, &args("1")), "standard_fhd");
-        assert_eq!(display_model_for(2160, &args("1")), "standard_4k");
+        assert_eq!(display_model_for(1920, 1080, &args("1")).describe(), "1920x1080 SDR");
+        assert_eq!(display_model_for(3840, 2160, &[]).describe(), "3840x2160 SDR");
+    }
 
-        assert_eq!(display_model_for(1439, &[]), "standard_fhd");
-        assert_eq!(display_model_for(1440, &[]), "standard_4k");
+    #[test]
+    fn the_display_config_carries_the_comparison_resolution() {
+        let pq = vec!["--transfer-characteristics".to_string(), "16".to_string()];
+
+        // Vship reads pixels-per-degree off the model, so this is what fixes the reading.
+        let hdr = display_model_for(1920, 1080, &pq).config_json();
+        assert!(hdr.contains("\"resolution\":[1920,1080]"), "{hdr}");
+        assert!(hdr.contains("\"colorspace\":\"HDR\""), "{hdr}");
+        assert!(hdr.contains("\"max_luminance\":1500"), "{hdr}");
+        assert!(hdr.starts_with(&format!("{{\"{}\":", DisplayModel::KEY)), "{hdr}");
+
+        let sdr = display_model_for(3840, 2160, &[]).config_json();
+        assert!(sdr.contains("\"resolution\":[3840,2160]"), "{sdr}");
+        assert!(sdr.contains("\"colorspace\":\"sRGB\""), "{sdr}");
+        assert!(sdr.contains("\"max_luminance\":200"), "{sdr}");
+
+        // Vship errors out on a model that is missing any of these.
+        for key in ["viewing_distance_meters", "diagonal_size_inches", "contrast", "E_ambient"] {
+            assert!(sdr.contains(key), "{key} missing from {sdr}");
+        }
+        assert!(!sdr.contains('\n'), "the config goes through argv as one token");
     }
 
     #[test]
@@ -976,6 +1098,145 @@ mod tests {
         assert_eq!(worst_frames(&mut [3.0]), 3.0);
         assert_eq!(worst_frames(&mut (1..=100).map(f64::from).collect::<Vec<_>>()), 95.0);
         assert_eq!(worst_frames(&mut (1..=24).rev().map(f64::from).collect::<Vec<_>>()), 23.0);
+    }
+
+    fn tq(jod: f64) -> TargetQualityConfig {
+        TargetQualityConfig { jod, ..Default::default() }
+    }
+
+    fn run_solve(
+        cfg: &TargetQualityConfig,
+        seed: f64,
+        mut curve: impl FnMut(f64) -> Probe,
+    ) -> (SolveResult, Vec<f64>) {
+        let mut calls = Vec::new();
+        let res = solve(cfg, seed, &mut |crf, _| {
+            calls.push(crf);
+            Ok(curve(crf))
+        })
+        .expect("a search over a working probe must not fail");
+        (res, calls)
+    }
+
+    fn check_probes(cfg: &TargetQualityConfig, calls: &[f64]) {
+        assert!(
+            calls.len() <= cfg.max_probes as usize,
+            "{} probes for a budget of {}: {calls:?}", calls.len(), cfg.max_probes
+        );
+        for crf in calls {
+            assert!(
+                *crf >= cfg.min_crf as f64 && *crf <= cfg.max_crf as f64,
+                "probed crf {crf} outside {}..={}", cfg.min_crf, cfg.max_crf
+            );
+            assert!((crf / CRF_STEP).fract().abs() < 1e-9, "probed crf {crf} is off the grid");
+        }
+        for (i, a) in calls.iter().enumerate() {
+            assert!(
+                !calls[i + 1..].iter().any(|b| (a - b).abs() < 1e-9),
+                "crf {a} probed twice, which costs a whole encode and measurement: {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_search_settles_on_the_highest_crf_that_still_holds_the_floor() {
+        // 9.5 JOD is held up to crf 26.0 exactly, and lost from 26.25 on.
+        let cfg = tq(9.5);
+        let (res, calls) = run_solve(&cfg, 35.5, |crf| p(crf, 10.0 - 0.02 * (crf - 1.0), 50.0));
+        check_probes(&cfg, &calls);
+        assert_eq!(res.crf, 26.0);
+        assert!(matches!(res.outcome, SolveOutcome::Met));
+    }
+
+    #[test]
+    fn min_probes_keeps_the_search_from_stopping_at_the_first_good_reading() {
+        let flat = |crf: f64| p(crf, 9.52, 50.0);
+
+        let (_, two) = run_solve(&tq(9.5), 30.0, flat);
+        assert_eq!(two.len(), 2);
+
+        let cfg = TargetQualityConfig { min_probes: 5, ..tq(9.5) };
+        let (res, five) = run_solve(&cfg, 30.0, flat);
+        check_probes(&cfg, &five);
+        assert_eq!(five.len(), 5);
+        assert!(matches!(res.outcome, SolveOutcome::Met));
+    }
+
+    #[test]
+    fn a_source_too_small_to_beat_sends_the_search_after_the_size_cap() {
+        let cfg = tq(9.5);
+        let (res, calls) = run_solve(&cfg, 20.0, |crf| p(crf, 9.9 - 0.01 * crf, 260.0 - 4.0 * crf));
+        check_probes(&cfg, &calls);
+        assert!(res.size_pct <= cfg.max_encoded_percent, "settled on {}% size", res.size_pct);
+        assert!(matches!(res.outcome, SolveOutcome::CapBinding | SolveOutcome::Met));
+    }
+
+    #[test]
+    fn a_floor_no_crf_reaches_spends_the_budget_and_stops() {
+        let cfg = TargetQualityConfig { max_probes: 5, ..tq(9.9) };
+        let (res, calls) = run_solve(&cfg, 35.0, |crf| p(crf, 9.0 - 0.01 * crf, 50.0));
+        check_probes(&cfg, &calls);
+        assert!(matches!(res.outcome, SolveOutcome::FloorUnreachable));
+        assert_eq!(res.crf, calls.iter().copied().fold(f64::MAX, f64::min));
+    }
+
+    #[test]
+    fn a_probe_that_fails_ends_the_search_instead_of_settling_on_a_guess() {
+        let res = solve(&tq(9.5), 30.0, &mut |crf, _| {
+            if crf == 30.0 { Ok(p(crf, 9.2, 50.0)) } else { bail!("FFVship failed") }
+        });
+        let Err(err) = res else { panic!("a failed measurement was swallowed") };
+        assert!(err.to_string().contains("FFVship"));
+    }
+
+    #[test]
+    fn the_budget_holds_on_a_curve_the_search_cannot_bracket() {
+        // Non-monotonic: the interpolation aims at nothing and must still stop.
+        let cfg = TargetQualityConfig { max_probes: 6, ..tq(9.5) };
+        let (_, calls) = run_solve(&cfg, 35.0, |crf| p(crf, 9.5 + (crf * 7.0).sin() * 0.3, 80.0));
+        check_probes(&cfg, &calls);
+    }
+
+    #[test]
+    fn measure_args_offsets_the_chunk_and_turns_the_crop_into_edge_amounts() {
+        let opts = |crop| MeasureOpts {
+            distorted: Path::new("probe.ivf"),
+            source: Path::new("film.mkv"),
+            index: Path::new("film.ffindex"),
+            work_dir: Path::new("."),
+            start: 720,
+            crop,
+            source_width: 1920,
+            source_height: 1080,
+            display_model: display_model_for(1920, 940, &[]),
+            gpu_id: 1,
+            n_threads: 6,
+            tag: "00003_28",
+        };
+        let pair = |args: &[String], flag: &str| {
+            args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+        };
+
+        // The probe holds the chunk's frames from 0; the source has them from 720.
+        let plain = measure_args(&opts(None));
+        assert_eq!(pair(&plain, "--start").as_deref(), Some("720"));
+        assert_eq!(pair(&plain, "--encoded-offset").as_deref(), Some("-720"));
+        assert_eq!(pair(&plain, "--displayModel").as_deref(), Some(DisplayModel::KEY));
+        assert!(pair(&plain, "--displayConfig").is_some_and(|c| c.contains("[1920,940]")));
+        assert_eq!(pair(&plain, "--gpu-id").as_deref(), Some("1"));
+        assert!(!plain.iter().any(|a| a.starts_with("--crop")));
+
+        let cropped = measure_args(&opts(Some(Crop { w: 1920, h: 800, x: 0, y: 140 })));
+        assert_eq!(pair(&cropped, "--cropLeftSource").as_deref(), Some("0"));
+        assert_eq!(pair(&cropped, "--cropTopSource").as_deref(), Some("140"));
+        assert_eq!(pair(&cropped, "--cropRightSource").as_deref(), Some("0"));
+        assert_eq!(pair(&cropped, "--cropBottomSource").as_deref(), Some("140"));
+
+        let pillar = measure_args(&opts(Some(Crop { w: 1440, h: 1080, x: 240, y: 0 })));
+        assert_eq!(pair(&pillar, "--cropLeftSource").as_deref(), Some("240"));
+        assert_eq!(pair(&pillar, "--cropRightSource").as_deref(), Some("240"));
+        assert_eq!(pair(&pillar, "--cropTopSource").as_deref(), Some("0"));
+        assert_eq!(pair(&pillar, "--cropBottomSource").as_deref(), Some("0"));
     }
 
     #[test]

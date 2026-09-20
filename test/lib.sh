@@ -22,6 +22,8 @@ fi
 
 _FAIL=0
 _ERRORS=""
+_DONE=0
+_CLEANUP=""
 RUN_LOGS=""
 _ESC=$(printf '\033')
 
@@ -34,7 +36,7 @@ _TOOLS=$(docker run -d --rm --label avet-test-tools \
     --security-opt label=disable \
     --user "$(id -u):$(id -g)" \
     -v "${_TMP_ROOT}:${_TMP_ROOT}" \
-    --entrypoint sleep "$TEST_IMAGE" 3600) || {
+    --entrypoint sleep "$TEST_IMAGE" infinity) || {
     printf "ERROR: could not start the tools container from %s\n" "$TEST_IMAGE" >&2
     exit 2
 }
@@ -53,6 +55,14 @@ fail() {
 "
 }
 
+# Owning the EXIT trap here keeps a suite from replacing the one that calls test_done.
+test_workdir() {
+    local d
+    d=$(mktemp -d)
+    _CLEANUP="$_CLEANUP $d"
+    printf '%s' "$d"
+}
+
 # -- Docker helpers ----------------------------------------------------------
 
 # Run avet and wait until EXPECTED_FILE appears (or TIMEOUT_S elapses).
@@ -63,7 +73,7 @@ run_avet() {
     RUN_LOGS=""
 
     local cid
-    cid=$(docker run -d \
+    cid=$(docker run -d --label avet-test-tools \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
@@ -73,7 +83,8 @@ run_avet() {
 
     local elapsed=0
     while [ "$elapsed" -lt "$timeout" ]; do
-        [ -e "$expected" ] && break
+        # -s, not -e: a zero-byte leftover from an earlier run is not this run's output.
+        [ -s "$expected" ] && break
         local running
         running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null) || running="false"
         [ "$running" = "false" ] && break
@@ -83,15 +94,17 @@ run_avet() {
 
     # Output file appears at mux time but source is only moved to processed/
     # several lines later. Wait for "[stem] done" to confirm full cleanup.
-    if [ -e "$expected" ]; then
+    if [ -s "$expected" ]; then
         local stem done_wait=0
         stem=$(basename "$expected" .mkv)
-        while [ "$done_wait" -lt 10 ]; do
+        while [ "$done_wait" -lt 30 ]; do
             docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | \
                 grep -qF "[$stem] done" && break
             sleep 1
             done_wait=$((done_wait + 1))
         done
+        # Otherwise the container is killed mid-archive and the suite blames the archiving.
+        [ "$done_wait" -lt 30 ] || fail "run_avet: $stem produced output but never logged done"
     fi
 
     RUN_LOGS=$(docker logs "$cid" 2>&1) || true
@@ -110,7 +123,7 @@ run_avet_timed() {
     RUN_LOGS=""
 
     local cid
-    cid=$(docker run -d \
+    cid=$(docker run -d --label avet-test-tools \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
@@ -133,6 +146,70 @@ run_avet_timed() {
     RUN_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
     return 0
+}
+
+# -- Daemon helpers ------------------------------------------------------------
+
+# Leaves avet running under AVET_CID, for a test that acts on a live daemon.
+start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
+    RUN_LOGS=""
+    AVET_CID=$(docker run -d --label avet-test-tools \
+        --user "$(id -u):$(id -g)" \
+        -v "${1}:/input:z" \
+        -v "${2}:/output:z" \
+        -e POLL_INTERVAL="${3:-2}" \
+        -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        "${TEST_IMAGE}")
+}
+
+avet_logs() {
+    RUN_LOGS=$(docker logs "$AVET_CID" 2>&1) || true
+}
+
+wait_for_log() { # PATTERN TIMEOUT_S
+    local elapsed=0
+    while [ "$elapsed" -lt "$2" ]; do
+        docker logs "$AVET_CID" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" && { avet_logs; return 0; }
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    avet_logs
+    return 1
+}
+
+wait_for_file() { # PATH TIMEOUT_S
+    local elapsed=0
+    while [ "$elapsed" -lt "$2" ]; do
+        [ -s "$1" ] && { avet_logs; return 0; }
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    avet_logs
+    return 1
+}
+
+# SIGTERM, then wait; sets AVET_RC, 124 for a container still running after TIMEOUT_S.
+stop_avet() { # [TIMEOUT_S]
+    local elapsed=0 timeout="${1:-60}" running
+    docker kill --signal=TERM "$AVET_CID" >/dev/null 2>&1
+    while [ "$elapsed" -lt "$timeout" ]; do
+        running=$(docker inspect -f '{{.State.Running}}' "$AVET_CID" 2>/dev/null) || running="false"
+        [ "$running" = "false" ] && break
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    if [ "$running" = "false" ]; then
+        AVET_RC=$(docker inspect -f '{{.State.ExitCode}}' "$AVET_CID" 2>/dev/null || echo 125)
+    else
+        AVET_RC=124
+    fi
+    avet_logs
+    docker rm -f "$AVET_CID" >/dev/null 2>&1 || true
+}
+
+kill_avet() {
+    avet_logs
+    docker rm -f "$AVET_CID" >/dev/null 2>&1 || true
 }
 
 # -- Assertions ---------------------------------------------------------------
@@ -354,6 +431,11 @@ assert_video_frames() {
         fail "frame count: expected $expected, got $actual ($file)"
 }
 
+# The first capture group of PATTERN in the run's log, with the color codes removed.
+log_capture() {
+    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | sed -n "$1" | head -n 1
+}
+
 assert_log_contains() {
     printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" || \
         fail "log does not contain: $1"
@@ -418,7 +500,8 @@ assert_frame_times_match() {
     local out="$1" ref="$2" diff
     diff=$(paste -d ' ' "$(_tmp_file frame_times "$out")" "$(_tmp_file frame_times "$ref")" | awk '
         NF != 2 { printf "frame %d exists on one side only", NR - 1; exit }
-        { d = $1 - $2; if (d < 0) d = -d; if (d > 1.001) { printf "frame %d at %s ms, expected %s ms", NR - 1, $1, $2; exit } }')
+        { d = $1 - $2; if (d < 0) d = -d; if (d > 1.001) { printf "frame %d at %s ms, expected %s ms", NR - 1, $1, $2; exit } }
+        END { if (NR == 0) printf "neither file has readable frame times" }')
     [ -z "$diff" ] || fail "frame times: $out: $diff"
 }
 
@@ -508,7 +591,8 @@ assert_stream_times_match() {
     local out="$1" out_spec="$2" src="$3" src_spec="$4" diff
     diff=$(paste -d ' ' "$(_tmp_file stream_times "$out" "$out_spec")" "$(_tmp_file stream_times "$src" "$src_spec")" | awk '
         NF != 2 { printf "packet %d exists on one side only", NR - 1; exit }
-        { d = $1 - $2; if (d < 0) d = -d; if (d > 2) { printf "packet %d at %s ms from the first frame, source %s ms", NR - 1, $1, $2; exit } }')
+        { d = $1 - $2; if (d < 0) d = -d; if (d > 2) { printf "packet %d at %s ms from the first frame, source %s ms", NR - 1, $1, $2; exit } }
+        END { if (NR == 0) printf "neither stream has readable packet times" }')
     [ -z "$diff" ] || fail "stream times: $out $out_spec: $diff"
 }
 
@@ -540,11 +624,33 @@ track_list() {
         -of compact=nk=1 "$1" | awk -F'|' 'NF > 2 && $1 != "program"'
 }
 
+# Language and every disposition flag, without the title an encode marks with its codec.
+track_flags() {
+    ffprobe -v error -select_streams "$2" \
+        -show_entries stream=codec_type:stream_tags=language:stream_disposition=default,forced,comment,hearing_impaired,visual_impaired,original \
+        -of compact=nk=1 "$1" | awk -F'|' 'NF > 2 && $1 != "program"'
+}
+
+assert_track_flags_match() {
+    local out="$1" src="$2" spec="$3" a b
+    a=$(track_flags "$out" "$spec")
+    b=$(track_flags "$src" "$spec")
+    [ -n "$b" ] && [ "$a" = "$b" ] || \
+        fail "track flags $spec: $out has [$(echo $a)], the source [$(echo $b)]"
+}
+
+# Payload bytes of one stream.
+track_bytes() {
+    ffprobe -v error -select_streams "$2" -show_entries packet=size -of csv=p=0 "$1" \
+        | awk '{ s += $1 } END { print s + 0 }'
+}
+
 assert_tracks_match() {
     local out="$1" src="$2" spec="$3" a b
     a=$(track_list "$out" "$spec")
     b=$(track_list "$src" "$spec")
-    [ "$a" = "$b" ] || fail "tracks $spec: $out has [$(echo $a)], the source [$(echo $b)]"
+    [ -n "$b" ] && [ "$a" = "$b" ] || \
+        fail "tracks $spec: $out has [$(echo $a)], the source [$(echo $b)]"
 }
 
 # Name and SHA-256 of every attachment.
@@ -625,6 +731,44 @@ assert_subtitle_events_match() {
     [ -z "$diff" ] || fail "subtitles: $out $out_spec: $diff"
 }
 
+# Frame numbers of the keyframes, one per line.
+keyframe_indices() {
+    ffprobe -v error -select_streams v:0 -show_entries packet=flags -of csv=p=0 "$1" \
+        | awk '/K/ { print NR - 1 }'
+}
+
+# Every chunk but the last holds at least MIN frames, as min_scene_len asks.
+assert_min_chunk_frames() {
+    local file="$1" min="$2" problem
+    problem=$(tr -d ' \n' < "$file" | grep -o '"start_frame":[0-9]*,"end_frame":[0-9]*' \
+        | awk -F'[:,]' -v min="$min" '
+            { s[NR] = $2; e[NR] = $4 }
+            END {
+                if (NR == 0) { print "no frame ranges found"; exit }
+                for (i = 1; i < NR; i++) {
+                    len = e[i] - s[i] + 1
+                    if (len < min) { printf "chunk %d holds %d frames", i - 1, len; exit }
+                }
+            }')
+    [ -z "$problem" ] || fail "chunk length: $problem, expected at least $min ($file)"
+}
+
+# No chunk of SCENES_JSON longer than MAX frames, the last one included.
+assert_max_chunk_frames() {
+    local file="$1" max="$2" problem
+    problem=$(tr -d ' \n' < "$file" | grep -o '"start_frame":[0-9]*,"end_frame":[0-9]*' \
+        | awk -F'[:,]' -v max="$max" '
+            { s[NR] = $2; e[NR] = $4 }
+            END {
+                if (NR == 0) { print "no frame ranges found"; exit }
+                for (i = 1; i <= NR; i++) {
+                    len = e[i] - s[i] + 1
+                    if (len > max) { printf "chunk %d holds %d frames", i - 1, len; exit }
+                }
+            }')
+    [ -z "$problem" ] || fail "chunk length: $problem, expected at most $max ($file)"
+}
+
 # Every chunk of SCENES_JSON starts on a keyframe of OUT.
 assert_keyframes_at_chunks() {
     local keyframes missing
@@ -672,19 +816,75 @@ assert_same_bytes() {
     cmp -s "$1" "$2" || fail "bytes: $1 differs from $2"
 }
 
+# EXPECTED is "-" for "no such value"; an empty one is a fixture that lost the property.
 assert_stream_value() {
     local file="$1" spec="$2" entry="$3" expected="$4" actual
+    if [ -z "$expected" ]; then
+        fail "$entry of $spec: no expected value given (pass - for none) ($file)"
+        return
+    fi
+    [ "$expected" = "-" ] && expected=""
     actual=$(ffprobe -v error -select_streams "$spec" -show_entries "$entry" \
         -of default=nw=1:nk=1 "$file" | tr '\n' ' ' | sed 's/ *$//')
     [ "$actual" = "$expected" ] || fail "$entry of $spec: expected '$expected', got '$actual' ($file)"
 }
 
+stream_value() {
+    local v
+    v=$(ffprobe -v error -select_streams "$2" -show_entries "$3" \
+        -of default=nw=1:nk=1 "$1" | tr '\n' ' ' | sed 's/ *$//')
+    printf '%s' "${v:--}"
+}
+
+frames_with_side_data() {
+    ffprobe -v error "$1" -select_streams v:0 -show_frames \
+        -show_entries frame_side_data=side_data_type -of csv=p=0 | grep -c "$2"
+}
+
+assert_frames_with_side_data() {
+    local file="$1" pattern="$2" expected="$3" actual
+    assert_probeable "$file" || return
+    actual=$(frames_with_side_data "$file" "$pattern")
+    [ "$actual" = "$expected" ] || \
+        fail "frames with '$pattern': expected $expected, got $actual ($file)"
+}
+
+assert_dovi_record() {
+    local file="$1" expected="$2" actual
+    assert_probeable "$file" || return
+    actual=$(ffprobe -v error "$file" -select_streams v:0 \
+        -show_entries stream_side_data=dv_profile,dv_bl_signal_compatibility_id -of default=nw=1:nk=1 | paste -sd, -)
+    [ "$actual" = "$expected" ] || \
+        fail "Dolby Vision record (profile,compatibility): expected '$expected', got '$actual' ($file)"
+}
+
+# Mastering display and content light level of the first frame, as plain numbers.
+hdr_static() {
+    ffprobe -v error -select_streams v:0 -read_intervals '%+#1' \
+        -show_entries frame_side_data=red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,min_luminance,max_luminance,max_content,max_average \
+        -of default=nw=1 "$1" | awk -F= 'NF == 2 { split($2, r, "/"); printf "%s %.8f\n", $1, (r[2] + 0 ? r[1] / r[2] : r[1]) }' | sort
+}
+
+# Chromaticity to 1/65536 and minimum luminance to 1/16384, what AV1 can store;
+# anything coarser is a loss avet caused.
+assert_hdr_static_match() {
+    local diff
+    diff=$(paste -d ' ' "$(_tmp_file hdr_static "$1")" "$(_tmp_file hdr_static "$2")" | awk '
+        NF != 4 || $1 != $3 { print "fields differ: " $0; exit }
+        { d = $2 - $4; if (d < 0) d = -d
+          tol = ($1 ~ /_x$|_y$/) ? 1 / 65536 : ($1 == "min_luminance") ? 1 / 16384 : 0.5
+          if (d > tol) { printf "%s is %s, the source %s", $1, $2, $4; exit } }')
+    [ -z "$diff" ] && [ -n "$(hdr_static "$2")" ] || fail "HDR static metadata of $1: ${diff:-source has none}"
+}
+
 # -- Test lifecycle ------------------------------------------------------------
 
-# Call at the end of every test case. Prints errors and exits with correct code.
+# Call at the end of every test case.
 test_done() {
+    [ "$_DONE" -eq 0 ] || return 0
+    _DONE=1
     docker rm -f "$_TOOLS" >/dev/null 2>&1
-    rm -rf "$_SCRATCH"
+    rm -rf "$_SCRATCH" $_CLEANUP
     if [ "$_FAIL" -eq 0 ]; then
         exit 0
     fi
@@ -697,3 +897,12 @@ test_done() {
     fi
     exit 1
 }
+
+# A suite that dies before its last line has run only part of its assertions, and
+# test_done's own exit code would report that as a pass.
+_on_exit() {
+    [ "$_DONE" -eq 1 ] || fail "suite ended before test_done"
+    test_done
+}
+
+trap _on_exit EXIT

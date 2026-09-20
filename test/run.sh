@@ -41,7 +41,8 @@ EOF
         # Anything else is a filter, but a mistyped flag must not become one: it would
         # match no suite and the run would report success without testing anything.
         -*)         printf "ERROR: unknown option %s\n" "$1" >&2; exit 2 ;;
-        *)          FILTER="$1" ;;
+        *)          [ -z "$FILTER" ] || { printf "ERROR: only one filter, got '%s' and '%s'\n" "$FILTER" "$1" >&2; exit 2; }
+                    FILTER="$1" ;;
     esac
     shift
 done
@@ -58,7 +59,8 @@ NC='\033[0m'
 if [ "$NO_BUILD" -eq 0 ]; then
     printf "=== Building %s and %s ===\n" "$TEST_IMAGE" "$TOOLS_IMAGE"
     docker build -t "$TEST_IMAGE" "$ROOT_DIR" || exit 1
-    docker build -t "$TOOLS_IMAGE" -f "$SCRIPT_DIR/tools.Dockerfile" "$SCRIPT_DIR" || exit 1
+    # From stdin: with test/ as the context, docker would tar test/local/ along with it.
+    docker build -t "$TOOLS_IMAGE" - < "$SCRIPT_DIR/tools.Dockerfile" || exit 1
 else
     for image in "$TEST_IMAGE" "$TOOLS_IMAGE"; do
         if ! docker image inspect "$image" >/dev/null 2>&1; then

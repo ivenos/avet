@@ -2,8 +2,7 @@
 # Tests for job.rs: full encode pipeline, lifecycle, scaling, resume, failure handling.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- baseline: output created, source in processed/, temp dir removed ----------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
@@ -138,7 +137,7 @@ preset = 12
 crf    = 50
 this-flag-doesnt-exist = "boom"
 EOF
-run_avet_timed "$I" "$O" 30
+run_avet_timed "$I" "$O" 60 "job failed"
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$O/.avet_test/.failed"
 assert_log_contains    "job failed"
@@ -221,5 +220,15 @@ printf 'encoder = "svt-av1"\n' > "$I/p/encode.toml"
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_file_not_exists "$O/test.mkv"
 grep -q "no video track" "$O/.avet_test/.failed" 2>/dev/null || fail "audio only: .failed does not name the missing video"
+
+# -- an empty output file is a leftover, not a finished encode ----------------
+I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+: > "$O/test.mkv"
+run_avet_timed "$I" "$O" 180 "[test] done"
+assert_log_contains  "ignoring empty output file"
+assert_video_frames  "$O/test.mkv" 240
+assert_file_exists   "$I/processed/test.mkv"
 
 test_done

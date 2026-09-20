@@ -2,8 +2,7 @@
 # Tests for subtitle.rs: track selection, strip mode, language whitelist.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- copy: all subtitle tracks preserved --------------------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"

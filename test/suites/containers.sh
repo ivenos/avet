@@ -2,8 +2,7 @@
 # Containers and GOP structures, checked against the lossless pattern each fixture was made from.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 MASTER="$FIXTURES_DIR/pattern.mkv"
 ENCODE='encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 40\n[scene_detection]\nextra_split = 24\n'

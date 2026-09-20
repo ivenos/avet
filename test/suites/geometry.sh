@@ -2,8 +2,7 @@
 # Frame geometry: crop, scale, odd sizes, sample aspect ratio and rotation, checked on content.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 encode() { # NAME FIXTURE [AVET_LINES]
     I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"
@@ -47,21 +46,26 @@ assert_stream_value "$O/test.mkv" v:0 stream=width,height,sample_aspect_ratio,di
 for degrees in 90 270; do
     encode "rot$degrees" "pattern_rot$degrees.mp4"
     assert_frames_match "$O/test.mkv" "$SRC"
-    assert_stream_value "$O/test.mkv" v:0 stream_side_data=rotation \
-        "$(ffprobe -v error -select_streams v:0 -show_entries stream_side_data=rotation -of default=nw=1:nk=1 "$SRC")"
+    ROT=$(stream_value "$SRC" v:0 stream_side_data=rotation)
+    [ "$ROT" = "-" ] && fail "rot$degrees: the fixture carries no rotation"
+    assert_stream_value "$O/test.mkv" v:0 stream_side_data=rotation "$ROT"
 done
 
 # -- video = copy keeps both too ----------------------------------------------------------
-for fixture in pattern_rot90.mp4 pattern_anamorphic.mkv; do
+# Each fixture with the property it is here for: expected and actual come from the same
+# probe, so an entry the probe stops reporting would compare "-" against "-".
+for pair in "pattern_rot90.mp4 stream_side_data=rotation" \
+            "pattern_anamorphic.mkv stream=sample_aspect_ratio,display_aspect_ratio"; do
+    set -- $pair
+    fixture="$1"; entry="$2"
     name="copy_${fixture%%.*}"
     I="$WORKDIR/$name/in"; O="$WORKDIR/$name/out"; mkdir -p "$I/p" "$O"
     cp "$FIXTURES_DIR/$fixture" "$I/p/test.${fixture##*.}"
     printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
     run_avet "$I" "$O" "$O/test.mkv" 120 || fail "$name: no output"
-    for entry in stream=sample_aspect_ratio,display_aspect_ratio stream_side_data=rotation; do
-        assert_stream_value "$O/test.mkv" v:0 "$entry" \
-            "$(ffprobe -v error -select_streams v:0 -show_entries "$entry" -of default=nw=1:nk=1 "$FIXTURES_DIR/$fixture" | tr '\n' ' ' | sed 's/ *$//')"
-    done
+    EXPECTED=$(stream_value "$FIXTURES_DIR/$fixture" v:0 "$entry")
+    [ "$EXPECTED" = "-" ] && fail "$name: the fixture carries no $entry"
+    assert_stream_value "$O/test.mkv" v:0 "$entry" "$EXPECTED"
 done
 
 test_done

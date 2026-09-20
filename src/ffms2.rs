@@ -409,10 +409,14 @@ fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
         }
     }
 
-    tracing::warn!("unrecognized FFMS pixel format {pix_fmt} - falling back to yuv420p 8-bit");
+    // A real format, not the source's own: FFMS2 skips the conversion for a target it
+    // already has, and the Y4M header would describe a layout the data does not have.
+    tracing::warn!(
+        "unrecognized FFMS pixel format {pix_fmt} - converting it to 10-bit 4:2:0"
+    );
     PixelFormat {
-        pix_fmt: get_pixel_format("yuv420p"),
-        bit_depth: 8,
+        pix_fmt: get_pixel_format("yuv420p10le"),
+        bit_depth: 10,
         subsampling: PixelSubsampling::Yuv420,
     }
 }
@@ -570,7 +574,12 @@ impl VideoSource {
             bail!("FFMS_SetOutputFormatV2 failed: {}", ei3.message());
         }
 
-        let props = unsafe { &*FFMS_GetVideoProperties(ptr) };
+        let props_ptr = unsafe { FFMS_GetVideoProperties(ptr) };
+        if props_ptr.is_null() {
+            unsafe { FFMS_DestroyVideoSource(ptr) }
+            bail!("FFMS_GetVideoProperties returned nothing");
+        }
+        let props = unsafe { &*props_ptr };
         let info = VideoInfo {
             width:      out_w as u32,
             height:     out_h as u32,
@@ -591,7 +600,11 @@ impl VideoSource {
         if track.is_null() {
             bail!("FFMS_GetTrackFromVideo returned no track");
         }
-        let tb = unsafe { &*FFMS_GetTimeBase(track) };
+        let tb_ptr = unsafe { FFMS_GetTimeBase(track) };
+        if tb_ptr.is_null() {
+            bail!("FFMS_GetTimeBase returned nothing");
+        }
+        let tb = unsafe { &*tb_ptr };
         (0..unsafe { FFMS_GetNumFrames(track) })
             .map(|n| {
                 let info = unsafe { FFMS_GetFrameInfo(track, n) };
@@ -723,7 +736,7 @@ pub fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let _ = std::fs::remove_file(&tmp);
-        bail!("ffmsindex failed:\n{stdout}{stderr}");
+        return Err(crate::ext::tool_error("ffmsindex", out.status, &format!("{stdout}{stderr}")));
     }
 
     std::fs::rename(&tmp, index_file)
@@ -744,5 +757,20 @@ mod tests {
         assert_eq!(offset_of!(FFMS_Frame, dolby_vision_rpu_size), 232);
         assert_eq!(offset_of!(FFMS_Frame, hdr10_plus), 240);
         assert_eq!(offset_of!(FFMS_Frame, hdr10_plus_size), 248);
+    }
+
+    #[test]
+    fn an_unknown_pixel_format_is_converted_and_not_passed_through() {
+        // Passed through, FFMS2 skips swscale and the Y4M header describes the wrong layout.
+        for name in ["yuvj422p", "yuv411p", "nv12", "gray", "bgr24"] {
+            let raw = get_pixel_format(name);
+            let detected = detect_pixel_format(raw);
+            assert_ne!(detected.pix_fmt, raw, "{name} reaches the encoder unconverted");
+            assert_eq!(detected.pix_fmt, get_pixel_format("yuv420p10le"), "{name}");
+            assert_eq!((detected.bit_depth, detected.subsampling), (10, PixelSubsampling::Yuv420));
+        }
+
+        let known = get_pixel_format("yuv422p10le");
+        assert_eq!(detect_pixel_format(known).pix_fmt, known);
     }
 }

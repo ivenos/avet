@@ -2,8 +2,7 @@
 # End-to-end integrity: every frame, timestamp, sample, subtitle, chapter and attachment.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 SRC="$FIXTURES_DIR/pattern.mkv"
 
@@ -38,7 +37,7 @@ keep_temp = true
 extra_split = 24
 EOF
     run_avet "$I" "$O" "$O/test.mkv" 180 || fail "$encoder: no output"
-    chunks=$(printf '%s\n' "$RUN_LOGS" | sed -n 's/.*\] \([0-9]*\) chunks$/\1/p' | head -n 1)
+    chunks=$(log_capture 's/.*\] \([0-9]*\) chunks$/\1/p')
     [ "${chunks:-0}" -ge 10 ] || fail "$encoder: expected at least 10 chunks, got '$chunks'"
     assert_video_codec  "$O/test.mkv" av1
     assert_frames_match "$O/test.mkv" "$SRC"
@@ -49,6 +48,10 @@ EOF
     # The source is archived, not rewritten.
     assert_same_bytes "$I/processed/test.mkv" "$SRC"
 done
+
+[ "$(packet_hashes "$WORKDIR/svt-av1/out/test.mkv" v:0)" \
+    != "$(packet_hashes "$WORKDIR/svt-av1-hdr/out/test.mkv" v:0)" ] || \
+    fail "svt-av1 and svt-av1-hdr produced the same bitstream - both ran the same binary"
 
 # -- video = copy: the video stream comes through bit for bit ------------------------
 I="$WORKDIR/copy/in"; O="$WORKDIR/copy/out"; mkdir -p "$I/p" "$O"
@@ -80,6 +83,9 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "audio encode: no output"
 assert_audio_codec "$O/test.mkv" 0 flac
 assert_audio_codec "$O/test.mkv" 1 opus
+assert_track_flags_match "$O/test.mkv" "$SRC" a
+assert_audio_title "$O/test.mkv" 0 "English (FLAC)"
+assert_audio_title "$O/test.mkv" 1 "Kommentar (Opus)"
 assert_audio_samples_identical "$O/test.mkv" "$SRC" 0
 assert_av_sync "$O/test.mkv" "$SRC" 0
 assert_av_sync "$O/test.mkv" "$SRC" 1

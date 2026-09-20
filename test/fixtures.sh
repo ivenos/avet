@@ -344,6 +344,11 @@ $FF -f lavfi -i "nullsrc=size=640x276:rate=24,$PATTERN,format=yuv420p,pad=640:36
     -c:v libx264 -qp 0 -preset ultrafast pattern_bars.mkv
 $FF -display_rotation 90 -i pattern_bars.mkv -map 0:v -c:v copy pattern_bars_rot90.mp4
 
+echo "  pattern_dark.mkv"
+$FF -f lavfi -i "color=c=black:size=320x180:rate=24" -frames:v 48 \
+    -vf "drawbox=x=40:y=30:w=100:h=50:color=white:t=fill" \
+    -c:v libx264 -qp 0 -preset ultrafast pattern_dark.mkv
+
 echo "  pattern_odd.mkv, pattern_422.mkv, pattern_444.mkv"
 $FF -f lavfi -i "$(pattern 321x181 24 yuv420p)" -frames:v 48 -c:v ffv1 pattern_odd.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuv422p10le)" -frames:v 48 -c:v ffv1 pattern_422.mkv
@@ -380,7 +385,7 @@ if [ "$GEN_RC" -ne 0 ]; then
 fi
 
 # The pattern as real sources carry it: GOP structures and containers, audio codecs and
-# channel layouts, bitmap and text subtitles, colour descriptions.
+# channel layouts, bitmap and text subtitles, color descriptions.
 docker run --rm -i \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
@@ -401,7 +406,7 @@ bytes() { for v in "$@"; do printf "\\$(printf '%03o' "$v")"; done; }
 u16() { bytes $(($1 >> 8 & 255)) $(($1 & 255)); }
 u32() { bytes $(($1 >> 24 & 255)) $(($1 >> 16 & 255)) $(($1 >> 8 & 255)) $(($1 & 255)); }
 segment() { printf 'PG'; u32 "$1"; u32 0; bytes "$2"; u16 "$3"; }
-# PGS, one START_MS:END_MS:CR per subtitle: a 120x20 box, half white, half coloured.
+# PGS, one START_MS:END_MS:CR per subtitle: a 120x20 box, half white, half colored.
 pgs() {
     n=0
     for event in "$@"; do
@@ -504,14 +509,14 @@ $FF -i pattern.mkv -i eng.srt -i ger.srt -map 0:v -map 0:a:0 -map 1 -map 2 -c:v 
 $FF -i pattern.mkv -i ger.srt -i eng.srt -map 0:v -map 0:a:0 -map 1 -map 2 -c:v copy -c:a aac \
     -c:s:0 ttml -c:s:1 mov_text -metadata:s:s:0 language=ger -metadata:s:s:1 language=eng subs_ttml.mp4
 
-echo "  colour_pal.mkv, colour_ntsc.mkv, colour_full8.mkv, colour_center.avi"
+echo "  color_pal.mkv, color_ntsc.mkv, color_full8.mkv, color_center.avi"
 $FF -f lavfi -i "$(pattern 320x180 25 yuv420p),setparams=range=tv:color_primaries=bt470bg:color_trc=bt709:colorspace=bt470bg" \
-    -frames:v 50 -c:v mpeg2video -q:v 1 colour_pal.mkv
+    -frames:v 50 -c:v mpeg2video -q:v 1 color_pal.mkv
 $FF -f lavfi -i "$(pattern 320x180 30000/1001 yuv420p),setparams=range=tv:color_primaries=smpte170m:color_trc=smpte170m:colorspace=smpte170m" \
-    -frames:v 60 -c:v libx264 -qp 0 -preset ultrafast colour_ntsc.mkv
+    -frames:v 60 -c:v libx264 -qp 0 -preset ultrafast color_ntsc.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuv420p),setparams=range=pc:color_primaries=bt709:color_trc=bt709:colorspace=bt709" \
-    -frames:v 48 -c:v libx264 -qp 0 -preset ultrafast colour_full8.mkv
-$FF -f lavfi -i "$(pattern 320x180 24 yuvj420p)" -frames:v 48 -c:v mjpeg -q:v 1 colour_center.avi
+    -frames:v 48 -c:v libx264 -qp 0 -preset ultrafast color_full8.mkv
+$FF -f lavfi -i "$(pattern 320x180 24 yuvj420p)" -frames:v 48 -c:v mjpeg -q:v 1 color_center.avi
 
 echo "  one_frame.mkv, audio_only.mkv"
 $FF -f lavfi -i "$(pattern 320x180 24 yuv420p)" -frames:v 1 -c:v libx264 -qp 0 -preset ultrafast one_picture.mkv

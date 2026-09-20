@@ -2,8 +2,7 @@
 # Tests for hdr.rs: HDR type detection, static and dynamic metadata, encoder arg generation.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- HDR10 source: detected, logged, color_transfer in output file -------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
@@ -59,28 +58,6 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "SDR: no output"
 assert_log_not_contains "HDR:"
 assert_file_nonempty "$O/test.mkv"
-
-frames_with_side_data() {
-    ffprobe -v error "$1" -select_streams v:0 -show_frames \
-        -show_entries frame_side_data=side_data_type -of csv=p=0 | grep -c "$2"
-}
-
-assert_frames_with_side_data() {
-    local file="$1" pattern="$2" expected="$3"
-    local actual
-    actual=$(frames_with_side_data "$file" "$pattern")
-    [ "$actual" = "$expected" ] || \
-        fail "frames with '$pattern': expected $expected, got $actual ($file)"
-}
-
-assert_dovi_record() {
-    local file="$1" expected="$2"
-    local actual
-    actual=$(ffprobe -v error "$file" -select_streams v:0 \
-        -show_entries stream_side_data=dv_profile,dv_bl_signal_compatibility_id -of default=nw=1:nk=1 | paste -sd, -)
-    [ "$actual" = "$expected" ] || \
-        fail "Dolby Vision record (profile,compatibility): expected '$expected', got '$actual' ($file)"
-}
 
 # -- Dolby Vision 8.1 + HDR10+: both carried per frame, across chunks and a crop -
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"

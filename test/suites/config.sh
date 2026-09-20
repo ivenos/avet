@@ -2,8 +2,7 @@
 # Tests for config.rs: TOML parsing, validation errors, encoder param serialization.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- unknown encoder value: TOML deserialization fails ------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"

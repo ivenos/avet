@@ -3,8 +3,7 @@
 # here; the CVVDP search itself is covered by the Rust unit tests.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- No GPU: target_quality fails with a clear error, no output, no crash --------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"

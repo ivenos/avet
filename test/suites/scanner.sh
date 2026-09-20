@@ -2,15 +2,16 @@
 # Tests for scanner.rs: profile discovery, skip logic, file extensions, env vars.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- no encode.toml: profile silently skipped ----------------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-run_avet_timed "$I" "$O" 15
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 20 "no jobs"
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$I/p/test.mkv"
+assert_log_contains    "avet started"
+assert_log_contains    "no jobs"
 assert_log_not_contains "ERROR"
 
 # -- existing output: job skipped, source not moved ----------------------------
@@ -40,8 +41,9 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avet_timed "$I" "$O" 15
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 20 "no jobs"
 assert_file_not_exists "$O/test.mkv"
+assert_log_contains    "no jobs"
 
 # -- POLL_INTERVAL env var is logged at startup -------------------------------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
@@ -53,7 +55,7 @@ preset = 12
 crf    = 50
 EOF
 RUN_LOGS=""
-CID=$(docker run -d \
+CID=$(docker run -d --label avet-test-tools \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \
@@ -87,15 +89,20 @@ assert_file_exists   "$I/processed/b.webm"
 
 # -- invalid POLL_INTERVAL: warning logged, default used ----------------------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I" "$O"
-CID=$(docker run -d \
+CID=$(docker run -d --label avet-test-tools \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \
     -e POLL_INTERVAL=notanumber \
     -e RUST_LOG=warn \
     "${TEST_IMAGE:-avet:test}")
-sleep 5
-RUN_LOGS=$(docker logs "$CID" 2>&1) || true
+ELAPSED=0
+while [ "$ELAPSED" -lt 30 ]; do
+    RUN_LOGS=$(docker logs "$CID" 2>&1) || true
+    printf '%s\n' "$RUN_LOGS" | grep -qF "invalid value" && break
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
 docker rm -f "$CID" >/dev/null 2>&1 || true
 assert_log_contains "invalid value"
 

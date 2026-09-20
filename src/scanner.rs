@@ -47,20 +47,28 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
 
         for (source_file, rel_dir) in find_video_files(&profile_dir) {
             let job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir };
-            let job_output = job.output_dir(output_dir);
-            if output_exists(&job_output, &job.source_file) {
+            if output_exists(&job.output_dir(output_dir), &job.source_file) {
                 tracing::debug!(file = %job.source_file.display(), "skip: output exists");
-                continue;
-            }
-            if let Some(marker) = failed_marker(&job_output, &job.source_file) {
-                tracing::warn!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display());
                 continue;
             }
             jobs.push(job);
         }
     }
 
-    Ok(drop_name_collisions(jobs))
+    // Before the marker filter: a marker hiding one side of a name clash lets the other
+    // side run, and its `claim_source` wipes the temp dir the marker lives in.
+    let jobs = drop_name_collisions(jobs)
+        .into_iter()
+        .filter(|job| match failed_marker(&job.output_dir(output_dir), &job.source_file) {
+            Some(marker) => {
+                tracing::warn!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display());
+                false
+            }
+            None => true,
+        })
+        .collect();
+
+    Ok(jobs)
 }
 
 /// Folder and stem name output, temp dir and archive, so two files sharing both stop.
@@ -253,6 +261,18 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_output_file_is_a_leftover_not_a_finished_encode() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        fs::write(output.join("film.mkv"), b"").unwrap();
+
+        assert_eq!(scan(&input, &output).unwrap().len(), 1);
+    }
+
+    #[test]
     fn scan_skips_dir_without_toml() {
         let (_tmp, input, output) = make_dirs();
         let profile = input.join("no-toml");
@@ -376,6 +396,25 @@ mod tests {
         let jobs = scan(&input, &output).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(jobs.len(), 2);
+    }
+
+    #[test]
+    fn a_marker_on_one_half_of_a_name_clash_still_stops_the_other() {
+        let (_tmp, input, output) = make_dirs();
+        for p in ["a", "b"] {
+            let profile = input.join(p);
+            fs::create_dir_all(&profile).unwrap();
+            fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+            fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        }
+
+        let temp = crate::resume::TempDir::for_video(&output, "film");
+        temp.create_dirs().unwrap();
+        fs::write(&temp.failed_path, b"boom").unwrap();
+        fs::write(&temp.source_id_path, crate::resume::source_id(&input.join("a").join("film.mkv"))).unwrap();
+
+        // Running b would discard the temp dir the marker of a lives in.
+        assert_eq!(scan(&input, &output).unwrap().len(), 0);
     }
 
     #[test]

@@ -431,6 +431,20 @@ pub struct AudioPlan {
     tracks: Vec<PlannedTrack>,
 }
 
+/// A rule keyed by a name ffprobe never reports, such as `ac-3` or `dts-hd`, silently
+/// leaves its tracks on the `[audio]` default.
+fn warn_about_unused_codec_rules(config: &AudioConfig, tracks: &[AudioTrack]) {
+    for key in config.codec_rules.keys() {
+        if tracks.iter().any(|t| &t.codec_name == key) {
+            continue;
+        }
+        let present: Vec<&str> = tracks.iter().map(|t| t.codec_name.as_str()).collect();
+        tracing::warn!(
+            "audio.codec_rules.{key} matches no track of this file, which has {present:?}"
+        );
+    }
+}
+
 pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
     let tracks = probe_audio_tracks(source_file)?;
     if tracks.is_empty() {
@@ -460,6 +474,8 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
         );
         return Ok(AudioPlan { tracks: vec![] });
     }
+
+    warn_about_unused_codec_rules(config, &kept);
 
     let lossless_set = lossless_codecs();
     let mut planned = Vec::with_capacity(kept.len());
@@ -633,8 +649,11 @@ pub fn extract(
     // Transcoding every kept track, so it scales with the runtime of the file.
     let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg track extraction")?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("ffmpeg track extraction failed:\n{stderr}");
+        return Err(crate::ext::tool_error(
+            "ffmpeg track extraction",
+            out.status,
+            &String::from_utf8_lossy(&out.stderr),
+        ));
     }
 
     Ok(())
@@ -708,7 +727,7 @@ pub fn mux_final(
     let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
     // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
-        bail!("mkvmerge failed:\n{}", String::from_utf8_lossy(&out.stdout));
+        return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
     }
     // Exit 1 also covers "track skipped: unsupported codec", which silently drops a track.
     if out.status.code() == Some(1) {

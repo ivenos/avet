@@ -2,8 +2,7 @@
 # Interrupted jobs: whatever a kill leaves behind, the finished file is the same.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 SRC="$FIXTURES_DIR/pattern.mkv"
 
@@ -49,8 +48,9 @@ assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 # -- a finished chunk cut short and half-written leftovers do not reach the output ------
 setup damaged 40
 killed_after "chunk 3/"
-chunk=$(ls "$O/.avet_test/chunks/"*.ivf | head -n 1)
-truncate -s 200 "$chunk"
+chunk=$(grep -o '"[0-9]\{5\}"' "$O/.avet_test/done.json" | head -n 1 | tr -d '"')
+[ -n "$chunk" ] || fail "damaged: done.json lists no finished chunk"
+truncate -s 200 "$O/.avet_test/chunks/$chunk.ivf"
 printf 'not a video' > "$O/.avet_test/video.ivf"
 printf 'not a video' > "$O/.avet_test/muxed.mkv"
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "damaged: no output after the restart"

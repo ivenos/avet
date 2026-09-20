@@ -87,10 +87,12 @@ impl DoneFile {
         Ok(Self { path: path.to_owned(), state: Mutex::new(state) })
     }
 
-    pub fn is_done(&self, chunk_key: &str, chunk_path: &Path) -> bool {
+    /// `frames` too: scenes.json can be re-detected with other boundaries while done.json
+    /// survives, and then the chunk holds the wrong range at a coincidentally equal size.
+    pub fn is_done(&self, chunk_key: &str, chunk_path: &Path, frames: u64) -> bool {
         let expected = match self.state.lock().unwrap().chunks.get(chunk_key) {
-            Some(info) => info.size_bytes,
-            None       => return false,
+            Some(info) if info.frames == frames => info.size_bytes,
+            _ => return false,
         };
         // Recorded size must match on-disk size; truncated/missing files are not "done".
         matches!(std::fs::metadata(chunk_path), Ok(m) if m.len() == expected && expected > 0)
@@ -126,18 +128,26 @@ impl CrfCache {
     }
 }
 
+/// FNV-1a, not `DefaultHasher`: that one is explicitly free to change between Rust
+/// releases, and a new value here discards every chunk of every job in flight.
+pub fn stable_hash(text: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in text.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 /// `.avet_<stem>`, shortened with a hash of the stem where that passes the 255-byte name limit.
 fn temp_dir_name(stem: &str) -> String {
-    use std::hash::{Hash, Hasher};
     const NAME_MAX: usize = 255;
 
     let name = format!(".avet_{stem}");
     if name.len() <= NAME_MAX {
         return name;
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    stem.hash(&mut h);
-    let suffix = format!("-{:016x}", h.finish());
+    let suffix = format!("-{:016x}", stable_hash(stem));
     let mut end = NAME_MAX - suffix.len();
     while !name.is_char_boundary(end) {
         end -= 1;
@@ -289,6 +299,23 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         TempDir::for_video(dir.path(), &long).create_dirs().unwrap();
+    }
+
+    #[test]
+    fn a_solved_crf_survives_into_the_next_run() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tq.json");
+
+        let cache = CrfCache::load_or_create(&path).unwrap();
+        assert_eq!(cache.get("00001"), None);
+        cache.insert("00001", 28.25).unwrap();
+        cache.insert("00002", 31.0).unwrap();
+
+        // Each chunk costs several probe encodes and measurements to solve again.
+        let reloaded = CrfCache::load_or_create(&path).unwrap();
+        assert_eq!(reloaded.get("00001"), Some(28.25));
+        assert_eq!(reloaded.get("00002"), Some(31.0));
+        assert_eq!(reloaded.get("00003"), None);
     }
 
     #[test]

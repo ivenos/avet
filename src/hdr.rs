@@ -33,7 +33,7 @@ impl HdrInfo {
     }
 
     pub fn encoder_args(&self) -> Vec<String> {
-        let mut args = self.colour_args();
+        let mut args = self.color_args();
         if let Some(ref cll) = self.content_light_level {
             args.extend_from_slice(&["--content-light".into(), cll.clone()]);
         }
@@ -43,7 +43,7 @@ impl HdrInfo {
         args
     }
 
-    fn colour_args(&self) -> Vec<String> {
+    fn color_args(&self) -> Vec<String> {
         let mut args: Vec<String> = Vec::new();
         if let Some(cp) = self.color_primaries {
             args.extend_from_slice(&["--color-primaries".into(), cp.to_string()]);
@@ -235,7 +235,10 @@ pub struct Geometry {
     pub scale: Option<(u32, u32)>,
 }
 
-const HDR10PLUS_T35_HEADER: [u8; 6] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+/// Country code, provider code and provider-oriented code of ST 2094-40. `hevc.rs` strips
+/// exactly these bytes on the way in, and FFMS2 hands out the payload from right after
+/// them, so the two sides only line up while there is one definition.
+pub const HDR10PLUS_T35_HEADER: [u8; 6] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
 
 /// ITU-T T.35 messages for one frame, country code first, in the order SVT-AV1 writes them.
 pub fn t35_messages(frame: &FrameHdrMetadata, carry: DynamicHdr, geometry: Geometry) -> Result<Vec<Vec<u8>>> {
@@ -286,15 +289,15 @@ fn remap_active_area((left, right, top, bottom): (u16, u16, u16, u16), g: Geomet
     };
     (
         fit(left, c.x, c.w, out_w),
-        fit(right, g.width.saturating_sub(c.x + c.w), c.w, out_w),
+        fit(right, g.width.saturating_sub(c.x.saturating_add(c.w)), c.w, out_w),
         fit(top, c.y, c.h, out_h),
-        fit(bottom, g.height.saturating_sub(c.y + c.h), c.h, out_h),
+        fit(bottom, g.height.saturating_sub(c.y.saturating_add(c.h)), c.h, out_h),
     )
 }
 
-/// The colour flags among `encoder_args` as mkvmerge options for `track`. mkvmerge takes
+/// The color flags among `encoder_args` as mkvmerge options for `track`. mkvmerge takes
 /// none of them from an IVF input.
-pub fn mkvmerge_colour_args(encoder_args: &[String], track: u32) -> Vec<String> {
+pub fn mkvmerge_color_args(encoder_args: &[String], track: u32) -> Vec<String> {
     let value = |flag: &str| {
         encoder_args.chunks(2).find(|p| p.len() == 2 && p[0] == flag).map(|p| p[1].as_str())
     };
@@ -637,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn colour_flags_become_mkvmerge_options() {
+    fn color_flags_become_mkvmerge_options() {
         let args: Vec<String> = [
             "--crf", "30",
             "--color-primaries", "9", "--transfer-characteristics", "16",
@@ -646,7 +649,7 @@ mod tests {
             "--mastering-display", "G(0.2650,0.6900)B(0.1500,0.0600)R(0.6800,0.3200)WP(0.3127,0.3290)L(1000.0000,0.0050)",
         ].iter().map(|s| s.to_string()).collect();
 
-        assert_eq!(mkvmerge_colour_args(&args, 0), [
+        assert_eq!(mkvmerge_color_args(&args, 0), [
             "--color-matrix-coefficients", "0:9",
             "--color-transfer-characteristics", "0:16",
             "--color-primaries", "0:9",
@@ -661,8 +664,8 @@ mod tests {
         ]);
 
         let full = ["--color-primaries", "1", "--color-range", "1"].map(String::from);
-        assert!(mkvmerge_colour_args(&full, 0).windows(2).any(|w| w == ["--color-range", "0:2"]));
-        assert!(mkvmerge_colour_args(&["--crf".to_string(), "30".to_string()], 0).is_empty());
+        assert!(mkvmerge_color_args(&full, 0).windows(2).any(|w| w == ["--color-range", "0:2"]));
+        assert!(mkvmerge_color_args(&["--crf".to_string(), "30".to_string()], 0).is_empty());
     }
 
     #[test]

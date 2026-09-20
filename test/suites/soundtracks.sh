@@ -2,8 +2,7 @@
 # Audio codecs and channel layouts: copied bit for bit, decoded in sync, every channel in place.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 VIDEO='encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n'
 OPUS='[audio]\nmode = "encode"\ncodec = "libopus"\nbitrate = "192k"\n[audio.lossless]\ncodec = "flac"\n'
@@ -93,7 +92,7 @@ i=0
 while [ $i -lt 13 ]; do
     assert_audio_samples_identical "$O/test.mkv" "$SRC" "$i"
     assert_stream_value "$O/test.mkv" "a:$i" stream=channel_layout \
-        "$(ffprobe -v error -select_streams "a:$i" -show_entries stream=channel_layout -of default=nw=1:nk=1 "$SRC")"
+        "$(stream_value "$SRC" "a:$i" stream=channel_layout)"
     i=$((i + 1))
 done
 

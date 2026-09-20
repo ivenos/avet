@@ -1,4 +1,4 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -10,7 +10,7 @@ use crate::ext::external_bin;
 const NAL_SEI_PREFIX: u8 = 39;
 const NAL_SEI_SUFFIX: u8 = 40;
 const SEI_USER_DATA_REGISTERED_ITU_T_T35: u32 = 4;
-const HDR10PLUS_T35_HEADER: [u8; 6] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+use crate::hdr::HDR10PLUS_T35_HEADER;
 
 /// ST 2094-40 from application_version on, for every frame in display order.
 pub type Hdr10PlusFrames = Arc<Vec<Option<Arc<[u8]>>>>;
@@ -202,11 +202,14 @@ fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
     });
 
     let status = child.wait().context("wait for ffmpeg")?;
-    if !status.success() {
-        bail!("ffmpeg could not read the HEVC stream:\n{err}");
-    }
+    // The reader before the exit status: a reader that gave up closed the pipe itself, and
+    // the SIGPIPE it earned would be classified as transient and retried forever.
+    let units = units.context("read the HDR10+ messages")?;
     let pts = pts.map_err(|_| anyhow::anyhow!("packet probe panicked"))??;
-    in_display_order(&pts, units?)
+    if !status.success() {
+        return Err(crate::ext::tool_error("ffmpeg reading the HEVC stream", status, &err));
+    }
+    in_display_order(&pts, units)
 }
 
 #[derive(Serialize, Deserialize)]

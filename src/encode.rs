@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
 use std::io::{BufWriter, Read};
 use std::path::Path;
@@ -123,11 +123,18 @@ fn insert_hdr_metadata(
 
 /// Ctrl-C reaches the whole process group, so a signalled tool is no verdict on the source.
 fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> anyhow::Error {
-    let err = anyhow!("{what} failed (chunk {:05}):\n{stderr}", index + 1);
-    match status.code() {
-        Some(_) => err,
-        None => err.context(crate::job::Transient),
-    }
+    crate::ext::tool_error(&format!("{what} (chunk {:05})", index + 1), status, stderr)
+}
+
+/// A decode error behind the encoder's complaint. Not a broken pipe: that one is the
+/// encoder's own death coming back, and naming it would blame the source for it.
+fn feed_failure(write_res: Result<()>) -> Option<String> {
+    let err = write_res.err()?;
+    let broken = err.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    });
+    (!broken).then(|| format!("{err:#}"))
 }
 
 /// FFMS2 Y4M piped straight into the encoder.
@@ -166,7 +173,11 @@ fn encode_direct(
 
     // Status first: an encoder that died early turns the write into a broken pipe.
     if !status.success() {
-        return Err(tool_failure("encoder", status, &stderr, scene.index));
+        let err = tool_failure("encoder", status, &stderr, scene.index);
+        return Err(match feed_failure(write_res) {
+            Some(cause) => err.context(format!("reading the source failed first: {cause}")),
+            None => err,
+        });
     }
     write_res.context("write Y4M frames to encoder")?;
     Ok(())
@@ -218,11 +229,17 @@ fn encode_scaled(
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
     // Encoder first: it is its death that breaks the scaler's pipe, never the other way round.
-    if !enc_status.success() {
-        return Err(tool_failure("encoder", enc_status, &enc_stderr, scene.index));
-    }
-    if !ff_status.success() {
-        return Err(tool_failure("ffmpeg scaler", ff_status, &ff_stderr, scene.index));
+    if !enc_status.success() || !ff_status.success() {
+        let (what, status, stderr) = if !enc_status.success() {
+            ("encoder", enc_status, &enc_stderr)
+        } else {
+            ("ffmpeg scaler", ff_status, &ff_stderr)
+        };
+        let err = tool_failure(what, status, stderr, scene.index);
+        return Err(match feed_failure(write_res) {
+            Some(cause) => err.context(format!("reading the source failed first: {cause}")),
+            None => err,
+        });
     }
     write_res.context("write Y4M frames to ffmpeg scaler")?;
     Ok(())
@@ -311,8 +328,11 @@ pub fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> 
     cmd.args(["-v", "error", "-i"]).arg(path);
     let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffprobe output validation")?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("output file is invalid: {stderr}");
+        return Err(crate::ext::tool_error(
+            "the output file is unreadable, ffprobe",
+            out.status,
+            &String::from_utf8_lossy(&out.stderr),
+        ));
     }
 
     // A merge that lost a chunk is valid Matroska that ends early.
@@ -407,6 +427,18 @@ mod tests {
 
         let keyint_pos = args.iter().position(|a| a == "--keyint").unwrap();
         assert_eq!(args[keyint_pos + 1], "120");
+    }
+
+    #[test]
+    fn a_decode_error_reaches_the_log_and_a_broken_pipe_does_not() {
+        let decode = Err(anyhow::anyhow!("FFMS_GetFrame(5000) failed").context("write Y4M frames"));
+        assert!(feed_failure(decode).unwrap().contains("FFMS_GetFrame(5000)"));
+
+        let pipe = Err(anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            .context("write Y4M frames"));
+        assert_eq!(feed_failure(pipe), None);
+
+        assert_eq!(feed_failure(Ok(())), None);
     }
 
     #[test]

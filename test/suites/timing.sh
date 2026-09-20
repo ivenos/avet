@@ -2,8 +2,7 @@
 # Timestamps and sync: variable and fractional frame rates, stream offsets, start times.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 encode() { # NAME FIXTURE [SCENE_SPLIT]
     I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"

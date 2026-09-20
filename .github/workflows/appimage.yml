@@ -11,10 +11,10 @@ on:
         description: "Version for the artifact names, e.g. v1.0.0. Empty uses dev-<sha>."
         required: false
   pull_request:
-    paths: [".github/workflows/appimage.yml", "packaging/ffms2-frame-hdr-metadata.patch"]
+    paths: [".github/workflows/appimage.yml", "packaging/**"]
   push:
     branches: [main]
-    paths: [".github/workflows/appimage.yml", "packaging/ffms2-frame-hdr-metadata.patch"]
+    paths: [".github/workflows/appimage.yml", "packaging/**"]
 
 env:
   SVT_AV1_VERSION: v4.2.0
@@ -59,6 +59,7 @@ jobs:
   appimage:
     needs: test
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     permissions:
       contents: write
     strategy:
@@ -144,7 +145,7 @@ jobs:
 
       - name: Build FFmpeg
         # Ubuntu 24.04 ships 6.1, too old for Vship (AVCOL_SPC_YCGCO_RE), and the Docker
-        # image gets 8.1 from Alpine. Both artefacts run the same ffmpeg this way.
+        # image gets 8.1 from Alpine. Both artifacts run the same ffmpeg this way.
         run: |
           git clone --depth 1 --branch "$FFMPEG_VERSION" \
             https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg
@@ -219,9 +220,12 @@ jobs:
           cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
           cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
 
+          # The AppImage redistributes the same GPL binaries the image does.
+          install -Dm644 LICENSE "$APPDIR/usr/share/licenses/avet/LICENSE"
+
       - name: Build AppImage
         # A release tag, not "continuous": the same avet tag has to keep producing the
-        # same artefact.
+        # same artifact.
         run: |
           set -eux
           curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-${{ matrix.arch }}.AppImage"

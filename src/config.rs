@@ -217,9 +217,11 @@ pub fn language_selected(whitelist: &[String], tag: Option<&str>) -> bool {
     }
 }
 
-/// True if the output codec is lossless (bitrate then irrelevant).
+/// True if the output codec is lossless (bitrate then irrelevant). ffmpeg's lossless
+/// audio encoders, which is fewer than the lossless formats it decodes.
 pub fn output_is_lossless(codec: &str) -> bool {
-    matches!(codec, "flac" | "alac" | "wavpack" | "tta") || codec.starts_with("pcm_")
+    matches!(codec, "flac" | "alac" | "wavpack" | "tta" | "truehd" | "mlp" | "s302m")
+        || codec.starts_with("pcm_")
 }
 
 /// Stringify a TOML value for the ffmpeg/encoder CLI (booleans as 1/0).
@@ -297,16 +299,18 @@ impl Default for SceneDetectionConfig {
     }
 }
 
+/// One encoder process and one resume entry per frame below this.
+const MIN_EXTRA_SPLIT: u32 = 24;
+
 impl SceneDetectionConfig {
     /// Only used after indexing and detection, so a bad value would cost minutes first.
     fn validate(&self) -> Result<()> {
         if self.min_scene_len == 0 {
             bail!("scene_detection.min_scene_len must be >= 1");
         }
-        // One encoder process and one resume entry per frame otherwise.
-        if self.extra_split > 0 && self.extra_split < 24 {
+        if self.extra_split > 0 && self.extra_split < MIN_EXTRA_SPLIT {
             bail!(
-                "scene_detection.extra_split must be >= 24 frames (got {}); use 0 to disable",
+                "scene_detection.extra_split must be >= {MIN_EXTRA_SPLIT} frames (got {}); use 0 to disable",
                 self.extra_split
             );
         }
@@ -327,8 +331,9 @@ impl SceneDetectionConfig {
         if self.extra_split > 0 {
             Some(self.extra_split as usize)
         } else if self.extra_split_sec > 0 {
+            // A slideshow's frame rate turns the same number of seconds into single frames.
             let frames = (self.extra_split_sec as f64 * fps).round() as usize;
-            if frames > 0 { Some(frames) } else { None }
+            if frames > 0 { Some(frames.max(MIN_EXTRA_SPLIT as usize)) } else { None }
         } else {
             None
         }
@@ -410,6 +415,16 @@ impl Config {
             if self.avet.video == VideoMode::Copy {
                 bail!("target_quality requires avet.video = \"encode\"");
             }
+            // FFVship scores the encode against the source at source resolution, so a
+            // downscale reads as loss: 1080p to 540p alone measures 0.8 JOD below the
+            // untouched encode, and every chunk burns its whole probe budget for nothing.
+            if self.avet.scale.is_some() {
+                bail!(
+                    "target_quality cannot be combined with avet.scale: the quality score \
+                     compares against the source at its own resolution, so the downscale \
+                     itself counts as a loss and no CRF reaches the floor. Remove one of them."
+                );
+            }
             if tq.jod == 0.0 {
                 bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
             }
@@ -481,6 +496,7 @@ impl Config {
 /// Encode needs a codec; lossy codecs also need a bitrate.
 fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Option<&Bitrate>) -> Result<()> {
     validate_bitrate_keys(ctx, bitrate)?;
+    validate_bitrate_values(ctx, bitrate)?;
     if mode != AudioMode::Encode {
         return Ok(());
     }
@@ -491,6 +507,39 @@ fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Opti
         bail!("{ctx}: bitrate required when mode = encode ({codec} is lossy)");
     }
     Ok(())
+}
+
+/// ffmpeg reads a bare `192` as 192 bit/s and encodes it without complaint, which is only
+/// visible in the finished file.
+fn validate_bitrate_values(ctx: &str, bitrate: Option<&Bitrate>) -> Result<()> {
+    let values: Vec<&String> = match bitrate {
+        None => return Ok(()),
+        Some(Bitrate::Single(s)) => vec![s],
+        Some(Bitrate::PerLayout(map)) => map.values().collect(),
+    };
+    for value in values {
+        let bits = parse_bitrate(value)
+            .with_context(|| format!("{ctx}: bitrate \"{value}\" is not a number with an optional k or M suffix"))?;
+        if bits < 1000 {
+            bail!("{ctx}: bitrate \"{value}\" is {bits} bit/s; write it as \"{value}k\" for kbit/s");
+        }
+    }
+    Ok(())
+}
+
+/// The forms ffmpeg's `-b:a` takes: a plain count of bits, or one with a k/M suffix.
+fn parse_bitrate(value: &str) -> Result<u64> {
+    let text = value.trim();
+    let (digits, factor) = match text.as_bytes().last() {
+        Some(b'k' | b'K') => (&text[..text.len() - 1], 1_000),
+        Some(b'm' | b'M') => (&text[..text.len() - 1], 1_000_000),
+        _ => (text, 1),
+    };
+    let number: f64 = digits.parse().map_err(|_| anyhow::anyhow!("not a number"))?;
+    if !number.is_finite() || number <= 0.0 {
+        bail!("not a positive number");
+    }
+    Ok((number * factor as f64) as u64)
 }
 
 /// A plain table, so `deny_unknown_fields` cannot reach its keys.
@@ -599,6 +648,7 @@ mod tests {
 
     #[test]
     fn output_lossless_classification() {
+        assert!(output_is_lossless("truehd"));
         assert!(output_is_lossless("flac"));
         assert!(output_is_lossless("pcm_s24le"));
         assert!(!output_is_lossless("libopus"));
@@ -666,11 +716,36 @@ mod tests {
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_encoded_percent = 0",
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_cambi = -1",
             "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\nmax_cambi_diff = -0.5",
+            "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\ntolerance = -0.1",
         ];
         for t in bad {
             let c: Config = toml::from_str(t).unwrap();
             assert!(c.validate().is_err(), "should reject:\n{t}");
         }
+    }
+
+    #[test]
+    fn a_misspelled_enum_value_is_refused_instead_of_falling_back_to_the_default() {
+        for t in [
+            "encoder = \"x264\"",
+            "encoder = \"svt-av1\"\n[avet]\nvideo = \"kopie\"",
+            "encoder = \"svt-av1\"\n[subtitles]\nmode = \"remove\"",
+            "encoder = \"svt-av1\"\n[audio]\nmode = \"transcode\"",
+            "encoder = \"svt-av1\"\n[scene_detection]\nspeed = \"slow\"",
+        ] {
+            assert!(Config::from_str_for_test(t).is_err(), "should reject:\n{t}");
+        }
+    }
+
+    #[test]
+    fn a_lossless_override_onto_a_lossy_codec_still_needs_its_bitrate() {
+        let profile = |body: &str| format!("encoder = \"svt-av1\"\n[audio.lossless]\n{body}");
+        let err = Config::from_str_for_test(&profile("mode = \"encode\"\ncodec = \"libopus\""))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("audio.lossless"), "got: {err:#}");
+
+        Config::from_str_for_test(&profile("mode = \"encode\"\ncodec = \"flac\"")).unwrap();
+        Config::from_str_for_test(&profile("mode = \"encode\"\ncodec = \"libopus\"\nbitrate = \"256k\"")).unwrap();
     }
 
     #[test]
@@ -680,6 +755,20 @@ mod tests {
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn target_quality_and_scale_are_refused_together() {
+        // The score compares against the source, so the downscale reads as lost quality.
+        let err = Config::from_str_for_test(
+            "encoder = \"svt-av1\"\n[avet]\nscale = 1080\n[target_quality]\njod = 9.5",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("avet.scale"), "got: {err}");
+
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[target_quality]\njod = 9.5").unwrap();
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\nscale = 1080").unwrap();
     }
 
     #[test]
@@ -727,6 +816,17 @@ mod tests {
     }
 
     #[test]
+    fn a_low_frame_rate_does_not_turn_extra_split_sec_into_single_frame_chunks() {
+        let cfg = SceneDetectionConfig { extra_split_sec: 1, ..Default::default() };
+        assert_eq!(cfg.effective_extra_split_frames(1.0), Some(24));
+        assert_eq!(cfg.effective_extra_split_frames(24.0), Some(24));
+        assert_eq!(cfg.effective_extra_split_frames(60.0), Some(60));
+
+        let off = SceneDetectionConfig { extra_split_sec: 0, ..Default::default() };
+        assert_eq!(off.effective_extra_split_frames(24.0), None);
+    }
+
+    #[test]
     fn non_finite_target_quality_values_are_rejected() {
         let bad = |toml: &str| Config::from_str_for_test(toml).unwrap_err().to_string();
         let base = "encoder = \"svt-av1\"\n[target_quality]\njod = 9.5\n";
@@ -749,6 +849,27 @@ mod tests {
              bitrate = { stereo = \"192k\", \"5.1\" = \"320k\", default = \"128k\" }",
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_bitrate_missing_its_k_is_rejected_before_anything_is_encoded() {
+        let profile = |bitrate: &str| format!(
+            "encoder = \"svt-av1\"\n[audio]\nmode = \"encode\"\ncodec = \"libopus\"\nbitrate = {bitrate}"
+        );
+
+        for good in ["\"192k\"", "\"192000\"", "\"1M\"", "{ stereo = \"192k\", default = \"320k\" }"] {
+            Config::from_str_for_test(&profile(good)).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
+
+        // ffmpeg encodes this at 192 bit/s and reports success.
+        let err = Config::from_str_for_test(&profile("\"192\"")).unwrap_err().to_string();
+        assert!(err.contains("192 bit/s"), "got: {err}");
+
+        let err = Config::from_str_for_test(&profile("\"loud\"")).unwrap_err().to_string();
+        assert!(err.contains("loud"), "got: {err}");
+
+        let err = Config::from_str_for_test(&profile("{ stereo = \"128\" }")).unwrap_err().to_string();
+        assert!(err.contains("128 bit/s"), "got: {err}");
     }
 
     #[test]

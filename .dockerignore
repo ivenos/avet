@@ -4,9 +4,8 @@ target/
 test/
 packaging/
 !packaging/ffms2-frame-hdr-metadata.patch
-docs.md
-README.md
-LICENSE
 .gitignore
 .dockerignore
 *.md
+proptest-regressions/
+

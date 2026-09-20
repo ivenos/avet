@@ -157,11 +157,13 @@ COPY --from=ffms2       /usr/local/bin/ffmsindex        /usr/local/bin/ffmsindex
 COPY --from=builder     /avet                           /usr/local/bin/avet
 # Not in Alpine's package manager.
 COPY --from=ffms2       /usr/local/lib/libffms2.so*     /usr/local/lib/
-# FFVship + libvship, for target_quality.
 COPY --from=vship       /usr/local/bin/FFVship          /usr/local/bin/FFVship
 COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
 COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
+
+# The image redistributes GPL binaries, which have to carry the license text.
+COPY LICENSE /usr/share/licenses/avet/LICENSE
 
 ENV INPUT_DIR=/input
 ENV OUTPUT_DIR=/output

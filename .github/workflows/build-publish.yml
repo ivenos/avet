@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The version the image builds with, not `stable`: a newly stabilised API would
+      # The version the image builds with, not `stable`: a newly stabilized API would
       # pass here and fail 25 minutes later inside the image build.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -72,7 +72,8 @@ jobs:
       - name: Build fixture tools image
         uses: docker/build-push-action@v7
         with:
-          context: test
+          # Not test/: the context would carry test/local/ with it.
+          context: .
           file: test/tools.Dockerfile
           tags: avet:fixture-tools
           outputs: type=docker,dest=${{ runner.temp }}/avet-fixture-tools.tar
@@ -91,7 +92,10 @@ jobs:
       - name: List suites
         id: suites
         run: |
-          echo "list=$(find test/suites -name '*.sh' -printf '%f\n' | sed 's/\.sh$//' | sort | jq -Rsc 'split("\n")[:-1]')" >> "$GITHUB_OUTPUT"
+          list=$(find test/suites -name '*.sh' -printf '%f\n' | sed 's/\.sh$//' | sort | jq -Rsc 'split("\n")[:-1]')
+          # An empty matrix skips the job, and a skipped job counts as passed below.
+          [ "$list" != "[]" ] || { echo "::error::no test suites found"; exit 1; }
+          echo "list=$list" >> "$GITHUB_OUTPUT"
 
   integration:
     name: integration (${{ matrix.suite }})
@@ -167,12 +171,13 @@ jobs:
           '
 
   build:
-    needs: [test, integration]
+    needs: [test, integration, build-arm64]
     if: github.event_name != 'pull_request'
     permissions:
       contents: read
       packages: write
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -237,6 +242,7 @@ jobs:
   push:
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 20
     # The tag rules below produce nothing off main or a tag, leaving imagetools no -t.
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -304,6 +310,7 @@ jobs:
             $(printf 'docker.io/${{ env.DOCKERHUB_IMAGE }}@sha256:%s ' *)
 
       - name: Update Docker Hub description
+        if: startsWith(github.ref, 'refs/tags/')
         uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

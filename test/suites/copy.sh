@@ -2,8 +2,7 @@
 # video = copy from every container, checked against the lossless pattern each fixture was made from.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 MASTER="$FIXTURES_DIR/pattern.mkv"
 COPY='[avet]\nvideo = "copy"\n'

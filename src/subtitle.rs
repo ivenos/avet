@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
@@ -46,40 +46,70 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
     };
     let mut plan = SubtitlePlan::default();
     let mut unsupported = Vec::new();
+    let mut total = 0usize;
     for (index, stream) in probe.streams.into_iter().enumerate() {
+        total += 1;
         let codec = stream.codec_name.unwrap_or_else(|| "unknown".into());
-        if MATROSKA_SUBTITLES.contains(&codec.as_str()) {
-            if selected(stream.tags.language.as_deref()) {
-                plan.extract.push((index, None));
+        match route(&codec) {
+            Route::ExtractWithFfmpeg(convert) if selected(stream.tags.language.as_deref()) => {
+                plan.extract.push((index, convert));
             }
-        } else if codec == "mov_text" {
-            if selected(stream.tags.language.as_deref()) {
-                plan.extract.push((index, Some("srt")));
-            }
-        } else {
-            unsupported.push((stream.id, codec));
+            Route::ExtractWithFfmpeg(_) => {}
+            Route::FromSourceWithMkvmerge => unsupported.push((index, stream.id, codec)),
         }
     }
-    if unsupported.is_empty() {
-        return Ok(plan);
+    if !unsupported.is_empty() {
+        let tracks = identify_subtitles(source)?;
+        for (index, id, codec) in unsupported {
+            for track in match_track(&tracks, index, id.as_deref()) {
+                if selected(track.2.as_deref()) {
+                    plan.from_source.push(track.0);
+                }
+            }
+            if match_track(&tracks, index, id.as_deref()).is_empty() {
+                tracing::warn!("subtitle stream {} ({codec}) cannot be stored in Matroska - skipped",
+                    id.as_deref().unwrap_or("?"));
+            }
+        }
     }
 
-    // mkvmerge's track number (PID, MP4 track ID, Matroska track number) is ffprobe's stream ID.
-    let tracks = identify_subtitles(source)?;
-    for (id, codec) in unsupported {
-        let number = id.as_deref()
-            .and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok());
-        let matching: Vec<&(u64, Option<u64>, Option<String>)> =
-            tracks.iter().filter(|(_, n, _)| number.is_some() && *n == number).collect();
-        if matching.is_empty() {
-            tracing::warn!("subtitle stream {} ({codec}) cannot be stored in Matroska - skipped",
-                id.as_deref().unwrap_or("?"));
-        }
-        plan.from_source.extend(
-            matching.into_iter().filter(|(_, _, language)| selected(language.as_deref())).map(|(tid, _, _)| *tid),
+    // Filtering every track away is a plausible profile, but rarely the intent: a
+    // whitelist in ISO 639-1 ("en") never matches a three-letter tag.
+    if total > 0 && plan.extract.is_empty() && plan.from_source.is_empty() {
+        tracing::warn!(
+            "subtitles: the language whitelist {:?} matched none of the {total} subtitle track(s) - the output has none",
+            config.language_whitelist
         );
     }
     Ok(plan)
+}
+
+/// By mkvmerge's track number where ffprobe reports one. The matroska demuxer does not,
+/// so there the Nth subtitle stream is the Nth subtitle track.
+fn match_track<'a>(
+    tracks: &'a [(u64, Option<u64>, Option<String>)],
+    index: usize,
+    id: Option<&str>,
+) -> Vec<&'a (u64, Option<u64>, Option<String>)> {
+    let number = id.and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok());
+    if let Some(number) = number {
+        return tracks.iter().filter(|(_, n, _)| *n == Some(number)).collect();
+    }
+    tracks.get(index).into_iter().collect()
+}
+
+#[derive(Debug, PartialEq)]
+enum Route {
+    ExtractWithFfmpeg(Option<&'static str>),
+    FromSourceWithMkvmerge,
+}
+
+fn route(codec: &str) -> Route {
+    match codec {
+        c if MATROSKA_SUBTITLES.contains(&c) => Route::ExtractWithFfmpeg(None),
+        "mov_text" => Route::ExtractWithFfmpeg(Some("srt")),
+        _ => Route::FromSourceWithMkvmerge,
+    }
 }
 
 fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<String>)>> {
@@ -88,7 +118,7 @@ fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<Str
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
 
     if out.status.code().unwrap_or(2) >= 2 {
-        bail!("mkvmerge identify failed:\n{}", String::from_utf8_lossy(&out.stdout));
+        return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
     }
 
     #[derive(Deserialize)]
@@ -111,4 +141,41 @@ fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<Str
         .filter(|t| t.track_type == "subtitles")
         .map(|t| (t.id, t.properties.number, t.properties.language))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_matroska_track_is_matched_by_position_because_ffprobe_reports_no_id() {
+        let tracks = vec![
+            (2u64, Some(3u64), Some("eng".to_string())),
+            (3u64, Some(4u64), Some("jpn".to_string())),
+        ];
+
+        // MP4 and MPEG-TS: ffprobe prints the id, and the number decides.
+        assert_eq!(match_track(&tracks, 0, Some("0x4"))[0].0, 3);
+        assert_eq!(match_track(&tracks, 1, Some("0x3"))[0].0, 2);
+
+        // Matroska: no id at all, so the second subtitle stream is the second track.
+        assert_eq!(match_track(&tracks, 1, None)[0].0, 3);
+        assert_eq!(match_track(&tracks, 0, None)[0].0, 2);
+        assert!(match_track(&tracks, 2, None).is_empty());
+
+        // An id mkvmerge does not list stays unmatched rather than falling back.
+        assert!(match_track(&tracks, 0, Some("0x99")).is_empty());
+    }
+
+    #[test]
+    fn only_what_ffmpeg_can_write_into_matroska_is_extracted() {
+        for codec in ["subrip", "ass", "webvtt", "dvd_subtitle", "hdmv_pgs_subtitle", "dvb_subtitle"] {
+            assert_eq!(route(codec), Route::ExtractWithFfmpeg(None), "{codec} should be extracted as it is");
+        }
+        assert_eq!(route("mov_text"), Route::ExtractWithFfmpeg(Some("srt")));
+
+        for codec in ["ttml", "dvb_teletext", "eia_608", "unknown"] {
+            assert_eq!(route(codec), Route::FromSourceWithMkvmerge, "{codec} should go through mkvmerge");
+        }
+    }
 }

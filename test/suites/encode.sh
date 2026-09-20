@@ -2,8 +2,7 @@
 # Tests for encode.rs: output codec, encoder param injection, keyint and HDR override logic.
 . "$(dirname "$0")/../lib.sh"
 
-WORKDIR=$(mktemp -d)
-trap 'rm -rf "$WORKDIR"' EXIT
+WORKDIR=$(test_workdir)
 
 # -- output video codec is av1 -------------------------------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
@@ -47,7 +46,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR override: no output"
 assert_log_contains     "color-primaries=1"
 assert_color_primaries  "$O/test.mkv" "bt709"
 
-# -- auto-keyint with no manual override: keyint appears in encoder args -------
+# -- auto-keyint with no manual override: a keyframe every five seconds --------
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -59,8 +58,24 @@ crf    = 50
 keyint = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "auto-keyint: no output"
-assert_log_contains "auto-keyint"
-assert_log_contains "keyint="
+assert_log_contains "auto-keyint: 120"
+KEYFRAMES=$(keyframe_indices "$O/test.mkv" | tr '\n' ' ')
+[ "$KEYFRAMES" = "0 120 " ] || fail "auto-keyint: keyframes at [$KEYFRAMES], expected 0 and 120"
+
+# -- a manual keyint reaches the bitstream too ---------------------------------
+I="$WORKDIR/5/in"; O="$WORKDIR/5/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+keyint = 30
+EOF
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "manual keyint: no output"
+KEYFRAMES=$(keyframe_indices "$O/test.mkv" | tr '\n' ' ')
+[ "$KEYFRAMES" = "0 30 60 90 120 150 180 210 " ] || \
+    fail "keyint=30: keyframes at [$KEYFRAMES], expected every 30 frames"
 
 # -- bit_depth: 8 to 10 bits and back, conversion logged; a matching depth logs none ---
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"

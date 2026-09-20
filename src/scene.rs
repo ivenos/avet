@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use av_scenechange::{DetectionOptions, SceneDetectionSpeed, av_decoders};
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -104,10 +104,7 @@ pub fn detect(
 
     // A truncated Y4M stream reaches the detector as a clean end of input.
     if !status.success() {
-        bail!(
-            "ffmpeg failed during scene detection ({status}):\n{}",
-            ffmpeg_stderr.trim()
-        );
+        return Err(crate::ext::tool_error("ffmpeg during scene detection", status, &ffmpeg_stderr));
     }
     if !ffmpeg_stderr.is_empty() {
         tracing::warn!("ffmpeg scene detection: {}", ffmpeg_stderr.trim());

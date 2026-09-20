@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use std::ffi::OsString;
 use std::io::Read;
@@ -72,14 +72,69 @@ pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<O
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
+                // Not a plain wait(): a child wedged in uninterruptible I/O on a dead
+                // share never reaps, and waiting on it hangs the daemon for good.
+                let reaped = wait_briefly(&mut child);
+                if !reaped {
+                    tracing::warn!("{what} did not react to the kill - leaving it behind");
+                }
                 // Transient: a share that stopped answering or a GPU mid-reset comes back.
-                return Err(anyhow::Error::new(crate::job::Transient)
-                    .context(format!("{what} did not finish within {secs}s - killed")));
+                return Err(anyhow::Error::new(crate::job::Transient).context(format!(
+                    "{what} did not finish within {secs}s - killed{}",
+                    last_output(stderr)
+                )));
             }
             None => std::thread::sleep(Duration::from_millis(200)),
         }
     }
+}
+
+/// What the tool said before it wedged, as a suffix for the timeout error. Polled rather
+/// than joined: a grandchild holding the pipe open would block the join forever.
+fn last_output(handle: JoinHandle<Vec<u8>>) -> String {
+    const LINES: usize = 15;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !handle.is_finished() {
+        return String::new();
+    }
+    let raw = handle.join().unwrap_or_default();
+    let text = String::from_utf8_lossy(&raw);
+    let text = text.trim_end();
+    if text.is_empty() {
+        return String::new();
+    }
+    let tail: Vec<&str> = text.lines().rev().take(LINES).collect();
+    format!(":\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+}
+
+fn wait_briefly(child: &mut std::process::Child) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return true,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    false
+}
+
+/// The error for a tool that ran and failed. A signalled tool (`code()` is None, which is
+/// how the OOM killer and Ctrl-C arrive) and a full disk both clear on their own.
+pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -> anyhow::Error {
+    let err = anyhow::anyhow!("{what} failed:\n{}", message.trim());
+    if status.code().is_none() || out_of_space(message) {
+        err.context(crate::job::Transient)
+    } else {
+        err
+    }
+}
+
+fn out_of_space(message: &str) -> bool {
+    message.contains("No space left on device") || message.contains("ENOSPC")
 }
 
 /// `Child::drop` does not wait, so a tool left behind by an early return stays a zombie.
@@ -112,7 +167,7 @@ pub fn ffprobe_json_with_timeout<T: DeserializeOwned>(
     cmd.args(args).arg(input);
     let out = output_with_timeout(&mut cmd, secs, "ffprobe")?;
     if !out.status.success() {
-        bail!("ffprobe failed:\n{}", String::from_utf8_lossy(&out.stderr).trim());
+        return Err(tool_error("ffprobe", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
     serde_json::from_slice(&out.stdout).context("parse ffprobe json")
 }
@@ -127,6 +182,45 @@ mod tests {
         let err = output_with_timeout(Command::new("sleep").arg("30"), 1, "sleep").unwrap_err();
         assert!(t0.elapsed() < Duration::from_secs(5));
         assert!(err.downcast_ref::<crate::job::Transient>().is_some(), "got: {err:#}");
+    }
+
+    #[test]
+    fn what_a_wedged_tool_said_before_the_kill_is_in_the_error() {
+        // Without it the operator is left with the timeout alone and no idea what it hung on.
+        let err = output_with_timeout(
+            Command::new("sh").args(["-c", "echo 'Cannot open display' >&2; sleep 30"]),
+            1,
+            "FFVship",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("Cannot open display"), "got: {err:#}");
+    }
+
+    #[test]
+    fn a_signalled_tool_is_retried_even_under_a_caller_context() {
+        use anyhow::Context as _;
+
+        // How the OOM killer and a Ctrl-C to the process group arrive.
+        let out = output_with_timeout(Command::new("sh").args(["-c", "kill -TERM $$"]), 30, "sh").unwrap();
+        assert_eq!(out.status.code(), None, "the shell was not signalled");
+
+        let err = tool_error("mkvmerge", out.status, "");
+        assert!(err.downcast_ref::<crate::job::Transient>().is_some(), "got: {err:#}");
+
+        // Callers add their own step name on top, and that must not hide it.
+        let wrapped = Err::<(), _>(err).context("mux the final file").unwrap_err();
+        assert!(wrapped.downcast_ref::<crate::job::Transient>().is_some(), "got: {wrapped:#}");
+    }
+
+    #[test]
+    fn a_full_disk_is_retried_and_an_ordinary_failure_is_not() {
+        let out = output_with_timeout(Command::new("sh").args(["-c", "exit 1"]), 30, "sh").unwrap();
+
+        let full = tool_error("ffmpeg", out.status, "av_interleaved_write_frame(): No space left on device");
+        assert!(full.downcast_ref::<crate::job::Transient>().is_some(), "got: {full:#}");
+
+        let broken = tool_error("ffmpeg", out.status, "Invalid data found when processing input");
+        assert!(broken.downcast_ref::<crate::job::Transient>().is_none(), "got: {broken:#}");
     }
 
     #[test]

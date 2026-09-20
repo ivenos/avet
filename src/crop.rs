@@ -29,7 +29,7 @@ pub fn detect(
     tracing::info!("[{stem}] auto-crop: running cropdetect...");
 
     let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = [10u64, 25, 40, 55, 70]
+        let handles: Vec<_> = [5u64, 20, 40, 60, 80, 95]
             .iter()
             .map(|&pct| {
                 let seek = (duration_secs * pct as f64 / 100.0) as u64;
@@ -51,8 +51,13 @@ pub fn detect(
     }
 
     // A failure is not evidence of "no black bars", and the cache survives resumes.
-    if samples.is_empty() && failed > 0 {
-        bail!("auto-crop: all {failed} cropdetect samples failed");
+    if samples.is_empty() {
+        if failed > 0 {
+            bail!("auto-crop: all {failed} cropdetect samples failed");
+        }
+        // Nothing was measured, so there is nothing worth caching either.
+        tracing::warn!("[{stem}] auto-crop: no sample produced a crop box - leaving the video as it is");
+        return Ok(None);
     }
 
     // Union, not majority: a narrower agreement cuts content only one sample saw.
@@ -61,22 +66,18 @@ pub fn detect(
         .reduce(Crop::union)
         .and_then(|c| c.normalized(orig_w, orig_h));
 
-    let src_area = u64::from(orig_w) * u64::from(orig_h);
-    let area = |c: &Crop| u64::from(c.w) * u64::from(c.h);
-
-    let (detected, cacheable) = match union {
-        // cropdetect boxes what is not black, so an all-dark scene boxes the only lit part.
-        Some(c) if area(&c) * 100 < src_area * 40 => {
-            tracing::warn!(
-                "[{stem}] auto-crop: ignoring implausible {} for a {orig_w}x{orig_h} source",
-                c.to_filter()
-            );
-            (None, false)
-        }
-        // Rounding noise, not a crop.
-        Some(c) if area(&c) * 100 >= src_area * 99 => (None, true),
-        other => (other, true),
-    };
+    let (detected, mut cacheable) = classify(union, orig_w, orig_h);
+    if !cacheable {
+        tracing::warn!(
+            "[{stem}] auto-crop: ignoring implausible {} for a {orig_w}x{orig_h} source",
+            union.map(|c| c.to_filter()).unwrap_or_default()
+        );
+    }
+    // A cached box outlives the retry that would measure the missing samples.
+    if failed > 0 {
+        tracing::warn!("[{stem}] auto-crop: {failed} sample(s) failed - measuring again next time");
+        cacheable = false;
+    }
 
     let result = detected.map(|c| c.to_filter());
     if cacheable {
@@ -89,6 +90,31 @@ pub fn detect(
     }
 
     Ok(result)
+}
+
+/// `(crop, cacheable)`. cropdetect boxes what is not black, so an all-dark scene boxes
+/// the only lit part; caching that would keep it for the whole film.
+fn classify(union: Option<Crop>, src_w: u32, src_h: u32) -> (Option<Crop>, bool) {
+    let src_area = u64::from(src_w) * u64::from(src_h);
+    let area = |c: &Crop| u64::from(c.w) * u64::from(c.h);
+    match union {
+        Some(c) if area(&c) * 100 < src_area * 40 => (None, false),
+        Some(c) if !is_bars(&c, src_w, src_h) => (None, false),
+        Some(c) if area(&c) * 100 >= src_area * 99 => (None, true),
+        other => (other, true),
+    }
+}
+
+/// Bars sit roughly opposite each other. A box offset to one side is the lit part of a
+/// dark scene, and cutting to it would take real picture off the other side. The margin
+/// is wide: a transfer's bars are often a few lines apart, deliberately so in the fixtures.
+fn is_bars(c: &Crop, src_w: u32, src_h: u32) -> bool {
+    let centered = |near: u32, far: u32, total: u32| {
+        let slack = (total / 20).max(8);
+        near.abs_diff(far) <= slack
+    };
+    centered(c.x, src_w.saturating_sub(c.x + c.w), src_w)
+        && centered(c.y, src_h.saturating_sub(c.y + c.h), src_h)
 }
 
 fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
@@ -128,10 +154,11 @@ fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
     let output = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg cropdetect")?;
 
     if !output.status.success() {
-        bail!(
-            "ffmpeg cropdetect failed at {seek_secs}s:\n{}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(crate::ext::tool_error(
+            &format!("ffmpeg cropdetect at {seek_secs}s"),
+            output.status,
+            &String::from_utf8_lossy(&output.stderr),
+        ));
     }
 
     // cropdetect writes results to stderr
@@ -147,5 +174,37 @@ fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
 fn cache_result(path: &Path, content: &str) {
     if let Err(e) = std::fs::write(path, content) {
         tracing::warn!("could not write crop cache {}: {e:#}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_letterbox_is_a_crop_and_a_lit_corner_of_a_dark_scene_is_not() {
+        let crop = |w, h, x, y| Some(Crop { w, h, x, y });
+
+        assert_eq!(classify(crop(1920, 800, 0, 140), 1920, 1080), (crop(1920, 800, 0, 140), true));
+        assert_eq!(classify(crop(1440, 1080, 240, 0), 1920, 1080), (crop(1440, 1080, 240, 0), true));
+
+        assert_eq!(classify(crop(640, 360, 100, 100), 1920, 1080), (None, false));
+        assert_eq!(classify(crop(1920, 1072, 0, 4), 1920, 1080), (None, true));
+        assert_eq!(classify(None, 1920, 1080), (None, true));
+    }
+
+    #[test]
+    fn a_box_that_is_not_centered_is_a_lit_scene_and_not_a_bar() {
+        let crop = |w, h, x, y| Some(Crop { w, h, x, y });
+
+        // Both are large enough to clear the area check on their own.
+        assert_eq!(classify(crop(1400, 700, 100, 50), 1920, 1080), (None, false));
+        assert_eq!(classify(crop(1500, 1080, 420, 0), 1920, 1080), (None, false));
+
+        // Bars a few lines apart are still bars, which pattern_bars.mkv relies on.
+        assert_eq!(classify(crop(640, 276, 0, 44), 640, 360), (crop(640, 276, 0, 44), true));
+        assert_eq!(classify(crop(1920, 800, 0, 140), 1920, 1080), (crop(1920, 800, 0, 140), true));
+        // Windowboxed: both axes cut, both roughly centered.
+        assert_eq!(classify(crop(1440, 800, 240, 140), 1920, 1080), (crop(1440, 800, 240, 140), true));
     }
 }

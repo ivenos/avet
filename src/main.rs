@@ -57,6 +57,11 @@ fn main() -> Result<()> {
             Ok(jobs) => {
                 tracing::info!("{} job(s) queued", jobs.len());
                 for j in &jobs {
+                    // Checked here too: a signal during the scan would otherwise start a
+                    // fresh multi-hour encode before anything reads the flag.
+                    if shutdown.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
                     let stem = j.stem();
 
                     if let Err(e) = job::run(j, &ctx) {
@@ -93,9 +98,14 @@ fn shutdown_signal() -> Arc<AtomicBool> {
     };
     let set = Arc::clone(&flag);
     std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
+        // Kept iterating for the process lifetime: dropping `Signals` leaves its own
+        // no-op handler installed, and every later signal short of SIGKILL is swallowed.
+        for _ in signals.forever() {
+            if set.swap(true, Ordering::Relaxed) {
+                tracing::warn!("second signal - stopping now, the current file stays unfinished");
+                std::process::exit(130);
+            }
             tracing::info!("signal received - finishing the current job, then stopping");
-            set.store(true, Ordering::Relaxed);
         }
     });
 
