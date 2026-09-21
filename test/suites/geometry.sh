@@ -17,11 +17,9 @@ encode crop pattern_bars.mkv 'crop = true'
 assert_log_contains "auto-crop: detected crop=640:276:0:44"
 assert_frames_match "$O/test.mkv" "$SRC" "crop=640:276:0:44"
 
-# Downscaled chroma planes are small enough to cost a few dB, still twice what a shifted
-# frame reaches.
-
 # -- crop, then scale what is left ----------------------------------------------------
 encode crop_scale pattern_bars.mkv 'crop = true\nscale = 138'
+# Downscaled chroma planes cost a few dB, still twice what a shifted frame reaches.
 assert_frames_match "$O/test.mkv" "$SRC" "crop=640:276:0:44,scale=320:138:flags=lanczos" 22
 
 # -- scale alone ------------------------------------------------------------------------

@@ -33,7 +33,7 @@ jobs:
       # The version the image builds with, not `stable`: a newly stabilized API would
       # pass here and fail 25 minutes later inside the image build.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
@@ -160,8 +160,6 @@ jobs:
             SvtAv1EncApp     --version     >/dev/null
             SvtAv1EncApp-hdr --version     >/dev/null
             vmaf             --version     >/dev/null
-            # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
-            # Piping it into head only ever reports on head.
             ffmsindex 2>&1 | grep -qi usage
             FFVship --list-gpu             >/dev/null
             # avet is a daemon and takes no arguments, so `avet --version` would run the
@@ -172,7 +170,7 @@ jobs:
 
   build:
     needs: [test, integration, build-arm64]
-    if: github.event_name != 'pull_request'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       packages: write

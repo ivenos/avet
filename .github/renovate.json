@@ -17,6 +17,8 @@
     },
     {
       "matchPackageNames": [
+        "actions/download-artifact",
+        "docker/build-push-action",
         "docker/login-action",
         "docker/metadata-action",
         "peter-evans/dockerhub-description",

@@ -172,7 +172,7 @@ fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
 }
 
 fn cache_result(path: &Path, content: &str) {
-    if let Err(e) = std::fs::write(path, content) {
+    if let Err(e) = crate::resume::write_atomic(path, content.as_bytes()) {
         tracing::warn!("could not write crop cache {}: {e:#}", path.display());
     }
 }

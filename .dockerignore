@@ -1,6 +1,7 @@
 target/
 .git/
 .github/
+!.github/scripts/crate-licenses.sh
 test/
 packaging/
 !packaging/ffms2-frame-hdr-metadata.patch

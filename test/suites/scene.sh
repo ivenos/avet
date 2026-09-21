@@ -77,7 +77,7 @@ assert_log_contains "reusing scenes.json"
 
 # -- a scene list short of the source is extended, a longer one clamped -------
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O/.avet_test"
-# pattern.mkv, not a flat colour: the 40 frames the extension adds have to be the real
+# pattern.mkv, not a flat color: the 40 frames the extension adds have to be the real
 # tail, and every frame of a constant fixture matches every other.
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
 printf '[{"index":0,"start_frame":0,"end_frame":199}]\n' > "$O/.avet_test/scenes.json"

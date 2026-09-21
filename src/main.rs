@@ -57,8 +57,7 @@ fn main() -> Result<()> {
             Ok(jobs) => {
                 tracing::info!("{} job(s) queued", jobs.len());
                 for j in &jobs {
-                    // Checked here too: a signal during the scan would otherwise start a
-                    // fresh multi-hour encode before anything reads the flag.
+                    // A signal during the scan must not start a multi-hour encode.
                     if shutdown.load(Ordering::Relaxed) {
                         return Ok(());
                     }
@@ -123,9 +122,7 @@ fn init_logging() {
 }
 
 fn env_path(var: &str, default: &str) -> PathBuf {
-    std::env::var(var)
-        .unwrap_or_else(|_| default.to_string())
-        .into()
+    std::env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
 }
 
 fn env_u64(var: &str, default: u64) -> u64 {

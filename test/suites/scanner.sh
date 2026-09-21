@@ -55,7 +55,7 @@ preset = 12
 crf    = 50
 EOF
 RUN_LOGS=""
-CID=$(docker run -d --label avet-test-tools \
+CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \
@@ -89,7 +89,7 @@ assert_file_exists   "$I/processed/b.webm"
 
 # -- invalid POLL_INTERVAL: warning logged, default used ----------------------
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I" "$O"
-CID=$(docker run -d --label avet-test-tools \
+CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
     --user "$(id -u):$(id -g)" \
     -v "${I}:/input:z" \
     -v "${O}:/output:z" \

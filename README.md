@@ -22,7 +22,7 @@ avet is an AV1 encoding service that watches a folder, splits each video at its 
 
 ## Features
 
-- Scene-based parallel encoding with [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr)
+- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) per profile
 - Resumes from the last finished chunk after a restart
 - Target quality: a CRF per chunk from a [CVVDP](https://codeberg.org/Line-fr/Vship) score, with optional [CAMBI](https://github.com/Netflix/vmaf/blob/master/resource/doc/cambi.md) banding limits (GPU required)
 - HDR10, HLG, HDR10+ and Dolby Vision profiles 5, 7 and 8
@@ -44,18 +44,18 @@ services:
     restart: unless-stopped
 ```
 
-Without `user:` the container runs as root and its files on the host belong to root.
+Create `input/` and `output/` before the first start, otherwise Docker creates them owned by root. Without `user:` the container runs as root and its files on the host belong to root.
 
 `[target_quality]` needs a GPU, nothing else does:
 
-- Intel or AMD: add `devices: ["/dev/dri:/dev/dri"]` and `group_add: ["render"]`.
-- NVIDIA: install the [nvidia-container-toolkit](https://github.com/NVIDIA/nvidia-container-toolkit) and add a GPU reservation, or run with `--gpus all`.
+- Intel or AMD: add `devices: ["/dev/dri:/dev/dri"]` and `group_add` with the numeric ID of the host's `render` group (`getent group render`).
+- NVIDIA: use the AppImage. The image is built on musl, where NVIDIA's Vulkan driver does not load.
 
 The arm64 image has no hardware Vulkan driver.
 
 ### AppImage
 
-Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory. It needs glibc 2.39 or newer and FUSE 2; without FUSE, run it with `--appimage-extract-and-run`.
+Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory. It needs glibc 2.39 or newer and FUSE; without FUSE, run it with `--appimage-extract-and-run`.
 
 ## Usage
 
@@ -84,10 +84,10 @@ output/
 - Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Aspect ratio, rotation, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
 - A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
-- Output files are named after the source, so two queued files with the same name in the same folder wait until one is renamed.
+- Output files keep the source's name with `.mkv`, so queued files that would end up at the same output path, such as `film.mkv` and `film.mp4`, wait until one is renamed.
 - Work in progress lives in `.avet_<name>/` next to the output file. Delete that folder to encode a file from scratch.
 - A failure that can clear on its own, such as a typo in the profile, a timeout or a full disk, is retried on the next scan. Any other failure writes a `.failed` file into that folder, and the video is skipped until you delete it.
-- On `SIGTERM` or `SIGINT` avet finishes the current file, then exits.
+- On `SIGTERM` or `SIGINT` avet exits after the current file, on a second signal at once. A file stopped mid-encode, e.g. by Ctrl-C in a terminal or by `docker stop` after its timeout, resumes from its last finished chunk.
 
 ## Environment variables
 
@@ -100,7 +100,7 @@ output/
 
 ## Configuration
 
-Only `encoder` is required. Unknown keys are rejected, so a typo fails the profile instead of turning a feature off.
+Only `encoder` is required. Unknown keys are rejected.
 
 ```toml
 encoder = "svt-av1"
@@ -135,7 +135,7 @@ language_whitelist = ["eng", "jpn"]
 
 ### `[encoder_params]`
 
-Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: `lp` (default `6`) together with free RAM sets how many chunks encode at once, and `crf` is the first probe when `[target_quality]` is set.
+Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `rc` or `tbr`.
 
 ### `[target_quality]`
 
@@ -148,28 +148,28 @@ jod = 9.5
 
 | Key | Default | Description |
 |---|---|---|
-| `jod` | - | Minimum CVVDP score per chunk, in `(0, 10)` (required) |
-| `min_crf` | `1` | Lowest CRF to try |
-| `max_crf` | `70` | Highest CRF to try (max `70`) |
+| `jod` | - | Minimum CVVDP score per chunk, above `0` and below `10` (required) |
+| `min_crf` | `1` | Lowest CRF to try, at least `1` and below `max_crf` |
+| `max_crf` | `70` | Highest CRF to try, at most `70` |
 | `min_probes` | `2` | Probes before `tolerance` may stop the search, at least `2` |
-| `max_probes` | `7` | Maximum probes per chunk |
-| `tolerance` | `0.05` | Stop once a probe is at most this far above `jod` |
+| `max_probes` | `7` | Maximum probes per chunk, at least `min_probes` |
+| `tolerance` | `0.05` | Stop once a probe is at most this far above `jod`, at least `0` |
 | `probe_preset` | `13` | Encoder preset for probes, `0` to `13` |
-| `max_encoded_percent` | `90` | Maximum chunk size as a percent of the source's bytes for that chunk |
-| `max_cambi` | - | Maximum CAMBI of the encode, `>= 0` |
-| `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, `>= 0` |
+| `max_encoded_percent` | `90` | Maximum chunk size as a percent of the source's bytes for that chunk, above `0` |
+| `max_cambi` | - | Maximum CAMBI of the encode, at least `0` |
+| `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, at least `0` |
 
-- Needs `avet.video = "encode"` and cannot be combined with `avet.scale`: the score compares against the source at its own resolution, so a downscale would count as lost quality.
-- `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged.
-- CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both apply to the worst 5% of a chunk's frames and are measured without film grain.
-- If no probe holds every limit, the chunk uses the lowest CRF under `max_encoded_percent`.
+- Needs `avet.video = "encode"` and cannot be combined with `avet.scale`.
+- `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged. Where the source's packet sizes cannot be read, the limit is off for that file.
+- CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both are compared with the 95th percentile of a chunk's frames and are measured without film grain.
+- If no probe holds every limit, the chunk uses the lowest probed CRF under `max_encoded_percent`, or the smallest probe if none is under it.
 
 ### `[avet]`
 
 | Key | Default | Description |
 |---|---|---|
 | `video` | `"encode"` | `"copy"` passes the video through and only processes audio and subtitles |
-| `dv` | `false` | Carry Dolby Vision into the output as AV1 profile 10, converting profile 7 to 8.1 first. Without it, Dolby Vision 7 and 8 keep only their HDR10 base layer and Dolby Vision 5 is refused |
+| `dv` | `false` | Carry Dolby Vision from an HEVC source into the output as AV1 profile 10, converting profile 7 to 8.1 first. Not with `bit_depth = 8`. Without it, Dolby Vision 7 and 8 keep only their base layer, and Dolby Vision without one, such as profile 5, is refused |
 | `crop` | `false` | Remove black bars |
 | `keyint` | `false` | Keyframe every ~5 s from the frame rate, unless `keyint` is in `[encoder_params]` |
 | `scale` | - | Maximum output height, at least `64`. Taller sources are scaled down with Lanczos |
@@ -182,7 +182,7 @@ jod = 9.5
 |---|---|---|
 | `mode` | `"copy"` | `"copy"` or `"encode"` |
 | `codec` | - | ffmpeg encoder, e.g. `"libopus"`. Required for `"encode"` |
-| `bitrate` | - | A single value, or a table keyed by `mono`, `stereo`, `3.0`, `quad`, `5.0`, `5.1`, `6.1`, `7.1` and `default`. Required for lossy codecs |
+| `bitrate` | - | A single value such as `"192k"`, or a table keyed by `mono`, `stereo`, `3.0`, `quad`, `5.0`, `5.1`, `6.1`, `7.1` and `default`. Required for lossy codecs; a layout missing from a table without `default` gets the encoder's own bitrate |
 | `options` | `{}` | Extra per-track encoder options, e.g. `{ compression_level = 12 }` |
 | `language_whitelist` | `[]` | Keep only these ISO 639-2 languages. Empty keeps all |
 
@@ -206,17 +206,17 @@ eac3 = { mode = "encode", codec = "libopus", bitrate = "192k" }
 | `mode` | `"copy"` | `"copy"` or `"strip"` |
 | `language_whitelist` | `[]` | Same rules as for audio |
 
-Chapters are always kept. Subtitle tracks Matroska cannot hold, such as TTML, are skipped.
+Chapters are always kept. MP4 text subtitles become SRT, and subtitle tracks Matroska cannot hold, such as TTML, are skipped.
 
 ### `[scene_detection]`
 
 | Key | Default | Description |
 |---|---|---|
-| `min_scene_len` | `24` | Minimum chunk length in frames |
-| `extra_split_sec` | `10` | Maximum chunk length in seconds, `0` disables |
-| `extra_split` | `0` | Maximum chunk length in frames (at least `24`), `0` disables, overrides `extra_split_sec` |
+| `min_scene_len` | `24` | Minimum chunk length in frames, at least `1` |
+| `extra_split_sec` | `10` | Maximum chunk length in seconds, never below 24 frames, `0` disables |
+| `extra_split` | `0` | Maximum chunk length in frames, at least `24`, `0` disables, overrides `extra_split_sec` |
 | `speed` | `"standard"` | `"fast"` trades accuracy for speed |
-| `downscale_height` | - | Detect scenes on a copy scaled to this height (at least `64`) |
+| `downscale_height` | - | Detect scenes on a copy scaled to this height, at least `64` |
 
 ## License
 
@@ -230,5 +230,7 @@ The Docker image and the AppImage bundle third-party software, each under its ow
 - [Vship](https://codeberg.org/Line-fr/Vship): MIT NON-AI License
 - [libvmaf](https://github.com/Netflix/vmaf): BSD-2-Clause-Patent
 - [MKVToolNix](https://mkvtoolnix.download): GPL-2.0-only
+
+The license texts are in `/usr/share/licenses/` in the image, with those of its Alpine packages in the apk database, and in `usr/share/licenses/` and `usr/share/doc/` inside the AppImage.
 
 avet is not affiliated with or endorsed by any of them. "Dolby Vision" is a trademark of Dolby Laboratories Licensing Corporation, "HDR10+" is a trademark of HDR10+ Technologies, LLC.

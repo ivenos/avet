@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::ffms2::{PixelSubsampling, VideoInfo};
+use crate::ffms2::VideoInfo;
 
 pub fn calculate(info: &VideoInfo, stem: &str, threads_per_worker: usize) -> usize {
     let cpu_cores = std::thread::available_parallelism()
@@ -11,18 +11,11 @@ pub fn calculate(info: &VideoInfo, stem: &str, threads_per_worker: usize) -> usi
 
     let megapixels = (info.width as f64 * info.height as f64) / 1_000_000.0;
 
-    let pix_mult = match info.pixel_format.subsampling {
-        PixelSubsampling::Yuv444 => 1.5,
-        PixelSubsampling::Yuv422 => 1.25,
-        PixelSubsampling::Yuv420 => 1.0,
-    };
-
     const CM_RAM: f64 = 0.3;
     const ENC_RAM: f64 = 1.2;
 
     let by_cpu = cpu_cores / threads_per_worker;
-    let ram_per_worker = megapixels * (ENC_RAM + CM_RAM) * pix_mult;
-    // floor, not round: the cgroup answers an extra worker with an OOM kill mid-chunk.
+    let ram_per_worker = megapixels * (ENC_RAM + CM_RAM);
     let by_ram = if ram_per_worker > 0.0 {
         (ram_gb / ram_per_worker).floor() as usize
     } else {
@@ -78,9 +71,11 @@ fn cgroup_available_gib() -> Option<f64> {
 
 /// Keyed by controller; v2's unified hierarchy is the empty string (`0::/path`).
 fn own_cgroup_paths() -> std::collections::HashMap<String, String> {
-    std::fs::read_to_string("/proc/self/cgroup")
-        .unwrap_or_default()
-        .lines()
+    parse_cgroup_paths(&std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default())
+}
+
+fn parse_cgroup_paths(text: &str) -> std::collections::HashMap<String, String> {
+    text.lines()
         .filter_map(|line| {
             let mut parts = line.splitn(3, ':');
             let _id = parts.next()?;
@@ -145,7 +140,7 @@ mod tests {
     use super::*;
     use crate::ffms2::{PixelFormat, PixelSubsampling};
 
-    fn info(w: u32, h: u32, sub: PixelSubsampling) -> VideoInfo {
+    fn info(w: u32, h: u32) -> VideoInfo {
         VideoInfo {
             width: w,
             height: h,
@@ -157,14 +152,14 @@ mod tests {
             pixel_format: PixelFormat {
                 pix_fmt: 0,
                 bit_depth: 10,
-                subsampling: sub,
+                subsampling: PixelSubsampling::Yuv420,
             },
         }
     }
 
     #[test]
     fn workers_at_least_one() {
-        let i = info(1920, 1080, PixelSubsampling::Yuv420);
+        let i = info(1920, 1080);
         assert!(calculate(&i, "test", 6) >= 1);
     }
 
@@ -192,26 +187,15 @@ mod tests {
 
     #[test]
     fn own_cgroup_paths_reads_both_hierarchies() {
-        let sample = "0::/system.slice/avet.service\n\
-                      4:memory:/docker/abc123\n";
-        let map: std::collections::HashMap<String, String> = sample
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(3, ':');
-                parts.next()?;
-                Some((parts.next()?.to_string(), parts.next()?.to_string()))
-            })
-            .collect();
+        let map = parse_cgroup_paths("0::/system.slice/avet.service\n4:memory:/docker/abc123\n");
         assert_eq!(map.get("").map(String::as_str), Some("/system.slice/avet.service"));
         assert_eq!(map.get("memory").map(String::as_str), Some("/docker/abc123"));
     }
 
     #[test]
-    fn workers_4k_hdr_fewer_than_1080p() {
-        let hd = info(1920, 1080, PixelSubsampling::Yuv420);
-        let uhd = info(3840, 2160, PixelSubsampling::Yuv444);
-        let w_hd = calculate(&hd, "test", 6);
-        let w_uhd = calculate(&uhd, "test", 6);
-        assert!(w_hd >= w_uhd, "4K/444 should use <= workers than 1080p/420");
+    fn workers_4k_fewer_than_1080p() {
+        let w_hd = calculate(&info(1920, 1080), "test", 6);
+        let w_uhd = calculate(&info(3840, 2160), "test", 6);
+        assert!(w_hd >= w_uhd, "4K should use <= workers than 1080p");
     }
 }

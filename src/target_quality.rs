@@ -89,6 +89,8 @@ impl GpuSelection {
 
 /// A software Vulkan device is rejected: CVVDP on the CPU is too slow to be practical.
 pub fn ensure_available() -> Result<GpuSelection> {
+    const HINT: &str = "Pass /dev/dri for an Intel or AMD GPU; NVIDIA's driver loads only in the AppImage.";
+
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
     cmd.arg("--list-gpu");
     let out = crate::ext::output_with_timeout(&mut cmd, 120, "FFVship --list-gpu")
@@ -96,8 +98,7 @@ pub fn ensure_available() -> Result<GpuSelection> {
     // With no usable Vulkan driver at all, FFVship aborts creating the instance.
     if !out.status.success() {
         bail!(
-            "target_quality requires a GPU, but FFVship could not initialize Vulkan:\n{}\n\
-             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit).",
+            "target_quality requires a GPU, but FFVship could not initialize Vulkan:\n{}\n{HINT}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
@@ -105,15 +106,10 @@ pub fn ensure_available() -> Result<GpuSelection> {
     match select_gpu(&text) {
         Some(g) if g.hardware => Ok(g),
         Some(g) => bail!(
-            "target_quality requires a GPU, but FFVship found only a software Vulkan device ({}). \
-             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit), \
-             or remove [target_quality].",
+            "target_quality requires a GPU, but FFVship found only a software Vulkan device ({}). {HINT}",
             g.label
         ),
-        None => bail!(
-            "target_quality requires a GPU, but FFVship found no Vulkan device. \
-             Provide a GPU (Intel/AMD: pass the render device /dev/dri; NVIDIA: nvidia-container-toolkit)."
-        ),
+        None => bail!("target_quality requires a GPU, but FFVship found no Vulkan device. {HINT}"),
     }
 }
 
@@ -517,7 +513,7 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
         return res(p, outcome);
     }
 
-    // Every probe over the cap: the smallest chunk is the closest thing to honouring it.
+    // Every probe over the cap: the smallest chunk is the closest thing to honoring it.
     pts.iter()
         .min_by(|a, b| a.size_pct.total_cmp(&b.size_pct))
         .map(|&p| res(p, SolveOutcome::CapBinding))
@@ -739,18 +735,24 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
 
     // Status first: any of them dying turns the others' writes into a broken pipe. vmaf
     // scores a decoder that stopped early on the frames it got, so its success is not enough.
-    let mut failed = Vec::new();
-    if !dec_status.is_some_and(|s| s.success()) {
-        failed.push(format!("ffmpeg probe decoder failed:\n{}", dec_err.unwrap_or_default()));
-    }
-    if !vmaf_status.is_some_and(|s| s.success()) {
-        failed.push(format!("vmaf failed:\n{}", vmaf_err.unwrap_or_default()));
-    }
+    let failed: Vec<anyhow::Error> = [
+        ("ffmpeg probe decoder", dec_status, dec_err),
+        ("vmaf", vmaf_status, vmaf_err),
+        ("ffmpeg scaler", scaler_status, scaler_err),
+    ]
+    .into_iter()
+    .filter_map(|(what, status, stderr)| {
+        let status = status.filter(|s| !s.success())?;
+        Some(crate::ext::tool_error(what, status, &stderr.unwrap_or_default()))
+    })
+    .collect();
     if !failed.is_empty() {
-        bail!("{}", failed.join("\n"));
-    }
-    if scaler_status.is_some_and(|s| !s.success()) {
-        bail!("ffmpeg scaler failed:\n{}", scaler_err.unwrap_or_default());
+        let transient = failed.iter().any(|e| e.downcast_ref::<crate::job::Transient>().is_some());
+        let mut err = anyhow!("{}", failed.iter().map(|e| e.root_cause().to_string()).collect::<Vec<_>>().join("\n"));
+        if let Some(cause) = encode::feed_failure(write_res) {
+            err = err.context(format!("reading the source failed first: {cause}"));
+        }
+        return Err(if transient { err.context(crate::job::Transient) } else { err });
     }
     write_res.context("write Y4M reference to vmaf")?;
 

@@ -23,6 +23,7 @@ pub struct HdrInfo {
     pub mastering_display: Option<String>,
     /// Dolby Vision profile from the DOVI configuration record, when there is one.
     pub dv_profile: Option<u32>,
+    pub dv_bl_compatibility: Option<u32>,
     /// HDR10+ in the probed frames; also set under Dolby Vision, which wins `hdr_type`.
     pub hdr10plus: bool,
 }
@@ -63,10 +64,14 @@ impl HdrInfo {
         args
     }
 
-    /// HLG has no static metadata by design.
+    pub fn ipt_base_layer(&self) -> bool {
+        self.dv_profile == Some(5) || self.dv_bl_compatibility == Some(0)
+    }
+
+    /// HLG has no static metadata by design, also under Dolby Vision 8.4.
     pub fn missing_static_metadata(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-        if self.is_hdr() && self.hdr_type != "HLG" {
+        if self.is_hdr() && self.transfer_characteristics != Some(18) {
             if self.content_light_level.is_none() { missing.push("MaxCLL/MaxFALL"); }
             if self.mastering_display.is_none()   { missing.push("Mastering Display"); }
         }
@@ -126,6 +131,7 @@ struct SideData {
     min_luminance: Option<serde_json::Value>,
     max_luminance: Option<serde_json::Value>,
     dv_profile: Option<serde_json::Value>,
+    dv_bl_signal_compatibility_id: Option<serde_json::Value>,
 }
 
 pub fn detect(source_file: &Path) -> Result<HdrInfo> {
@@ -137,7 +143,7 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
             "-read_intervals", "%+#48",
             "-show_entries", "stream=codec_name,color_primaries,color_transfer,color_space,chroma_location,color_range",
             // Sections accumulate, so this does not replace the two around it.
-            "-show_entries", "stream_side_data=dv_profile",
+            "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-show_frames",
             "-show_entries", "frame=side_data_list",
             "-print_format", "json",
@@ -170,6 +176,11 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         .side_data_list
         .iter()
         .find_map(|s| s.dv_profile.as_ref())
+        .map(|v| val_to_i64(v) as u32);
+    info.dv_bl_compatibility = stream
+        .side_data_list
+        .iter()
+        .find_map(|s| s.dv_bl_signal_compatibility_id.as_ref())
         .map(|v| val_to_i64(v) as u32);
 
     info.hdr10plus = has_side_type("hdr10+");

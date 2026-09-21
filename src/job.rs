@@ -39,7 +39,7 @@ fn is_transient(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::StorageFull)
+            .is_some_and(|io| matches!(io.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded))
     })
 }
 
@@ -123,13 +123,19 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let hdr = crate::hdr::detect(&job.source_file)?;
     let chroma_center = hdr.chroma_center;
-    let dv = config.avet.dv;
+    let hevc_source = hdr.codec_name == "hevc";
+    // FFMS2 hands out the RPU of HEVC only.
+    let dv = config.avet.dv && hevc_source;
+    if config.avet.dv && !hevc_source && hdr.hdr_type == "Dolby Vision" {
+        tracing::warn!("[{stem}] HDR: Dolby Vision is only carried from HEVC, not from {}", hdr.codec_name);
+    }
     // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
-    if hdr.dv_profile == Some(5) && !dv {
+    if hdr.ipt_base_layer() && !dv {
         bail!(
-            "Dolby Vision profile 5 has no HDR10 base layer, so avet cannot encode it \
-             without its RPU. Set avet.dv = true, or convert the source to \
-             profile 8 or to plain HDR10 first."
+            "this Dolby Vision stream (profile {}) has no HDR10 base layer, so avet cannot \
+             encode it without its RPU. Set avet.dv = true for an HEVC source, or convert \
+             the source to profile 8 or to plain HDR10 first.",
+            hdr.dv_profile.map_or("unknown".into(), |p| p.to_string())
         );
     }
     match (hdr.dv_profile, hdr.hdr_type.as_str()) {
@@ -137,14 +143,14 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
             "[{stem}] HDR: Dolby Vision profile {p} (carried as AV1 profile 10)"
         ),
         (Some(p), _) => tracing::info!(
-            "[{stem}] HDR: Dolby Vision profile {p} (RPU dropped, HDR10 base layer kept)"
+            "[{stem}] HDR: Dolby Vision profile {p} (RPU dropped, base layer kept)"
         ),
         (None, "Dolby Vision") if dv => tracing::warn!(
             "[{stem}] HDR: Dolby Vision of unknown profile (carried as AV1 profile 10)"
         ),
         (None, "Dolby Vision") => tracing::warn!(
             "[{stem}] HDR: Dolby Vision of unknown profile (RPU dropped; the base layer \
-             is only a valid HDR10 picture on profiles 7 and 8)"
+             is only a valid picture on profiles 7 and 8)"
         ),
         (None, "HDR10+") => tracing::info!(
             "[{stem}] HDR: HDR10+ (dynamic metadata carried)"
@@ -165,7 +171,6 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         dolby_vision: dv && hdr.hdr_type == "Dolby Vision",
     };
     let hdr_args = hdr.encoder_args();
-    let hevc_source = hdr.codec_name == "hevc";
 
     let hdr10plus_frames = if dynamic_hdr.hdr10plus && hevc_source {
         tracing::info!("[{stem}] HDR10+: reading it from the bitstream");
@@ -345,7 +350,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
 
     let source_byte_index = if config.target_quality.is_some() {
-        probe_source_byte_index(&job.source_file, ffms2_frames, stem)
+        probe_source_byte_index(&job.source_file, ffms2_frames, stem)?
     } else {
         Vec::new()
     };
@@ -522,6 +527,10 @@ fn finalize(
     tracing::info!("[{stem}] validating output");
     encode::validate_output(&temp.mux_path, video.expected_frames)?;
 
+    if !temp.source_unchanged(&job.source_file) {
+        return Err(anyhow::Error::new(Transient)
+            .context(format!("{} changed during the encode", job.source_file.display())));
+    }
     std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
         format!("move {} to {}", temp.mux_path.display(), final_output.display())
     })?;
@@ -661,6 +670,9 @@ fn track_types(path: &Path) -> Result<Vec<String>> {
     let mut cmd = std::process::Command::new(crate::ext::external_bin("mkvmerge"));
     cmd.args(["--identify", "--identification-format", "json"]).arg(path);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
+    if out.status.code().unwrap_or(2) >= 2 {
+        return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
+    }
     let identify: Identify = serde_json::from_slice(&out.stdout).context("parse mkvmerge identify output")?;
     Ok(identify.tracks.into_iter().map(|t| t.track_type).collect())
 }
@@ -769,20 +781,27 @@ fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Opt
 }
 
 pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error, shutting_down: bool) {
+    let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
+    // A source replaced or gone mid-job is no verdict on the file now in its place.
+    let source_moved = temp.recorded_id().is_some() && !temp.source_unchanged(&job.source_file);
+
     // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
-    if shutting_down || is_transient(err) {
+    if shutting_down || source_moved || is_transient(err) {
         tracing::error!("[{stem}] job failed - retrying on the next scan\n{err:#}");
         return;
     }
 
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 
-    let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     if let Err(e) = temp.create_dirs() {
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
     }
     // So the marker locks out this file, not the next one with the same name.
-    if let Err(e) = std::fs::write(&temp.source_id_path, crate::resume::source_id(&job.source_file)) {
+    if temp.recorded_id().is_none()
+        && let Err(e) = crate::resume::write_atomic(
+            &temp.source_id_path, crate::resume::source_id(&job.source_file).as_bytes(),
+        )
+    {
         tracing::warn!("[{stem}] could not record source path: {e:#}");
     }
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
@@ -1031,8 +1050,8 @@ fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
 
 /// Cumulative source bytes by frame; empty when it cannot be trusted, which disables the
 /// size cap for the whole job rather than silently for its tail.
-fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Vec<u64> {
-    // Demuxes the whole file, and a killed probe disables the cap silently.
+fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Result<Vec<u64>> {
+    // Demuxes the whole file.
     const TIMEOUT_SECS: u64 = 3600;
 
     let parsed: Packets = match crate::ext::ffprobe_json_with_timeout(
@@ -1042,9 +1061,10 @@ fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Vec<u64> {
         TIMEOUT_SECS,
     ) {
         Ok(p) => p,
+        Err(e) if is_transient(&e) => return Err(e).context("probe the source's packet sizes"),
         Err(e) => {
             tracing::warn!("[{stem}] source packet-size probe failed: {e:#} - size cap disabled");
-            return Vec::new();
+            return Ok(Vec::new());
         }
     };
 
@@ -1053,14 +1073,14 @@ fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Vec<u64> {
             "[{stem}] the source has {} video packets but {frames} frames - size cap disabled",
             parsed.packets.len()
         );
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     match cumulative_packet_bytes(&parsed.packets) {
-        Some(cum) => cum,
+        Some(cum) => Ok(cum),
         None => {
             tracing::warn!("[{stem}] only some of the source's video packets are timestamped - size cap disabled");
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 }
@@ -1548,6 +1568,26 @@ mod output_param_tests {
         handle_failure(&job, &ctx, "film", &err, false);
         assert!(marker.exists(), "a real failure wrote no marker");
         assert!(std::fs::read_to_string(&marker).unwrap().contains("status 1"));
+    }
+
+    #[test]
+    fn a_source_replaced_mid_job_is_retried_and_not_locked_out() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("input").join("p");
+        std::fs::create_dir_all(&profile).unwrap();
+        let source = profile.join("film.mkv");
+        std::fs::write(&source, b"first").unwrap();
+
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output") };
+        let job = Job { encode_toml: profile.join("encode.toml"), source_file: source.clone(), rel_dir: PathBuf::new() };
+        let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film");
+        temp.claim_source(&source, "film").unwrap();
+        let claimed = temp.recorded_id();
+
+        std::fs::write(&source, b"a longer replacement").unwrap();
+        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("the index does not match the source file"), false);
+        assert!(!temp.failed_path.exists(), "the replacement was locked out");
+        assert_eq!(temp.recorded_id(), claimed);
     }
 
     #[test]

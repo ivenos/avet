@@ -63,7 +63,6 @@ pub fn encode_chunk(
         OpenOpts { target_bit_depth: opts.target_bit_depth },
     )
     .context("open FFMS2 VideoSource")?;
-    // Override FFMS2 fps with ffprobe value (FFMS2 returns 0/0 for some containers, corrupting IVF timestamps).
     vs.info.fps_num = opts.fps_num;
     vs.info.fps_den = opts.fps_den;
 
@@ -79,6 +78,7 @@ pub fn encode_chunk(
             &mut vs, scene, opts.crop, capture,
         )?,
     }
+    ensure_complete(output_path, scene)?;
 
     if opts.dynamic_hdr.any() {
         let geometry = Geometry { width: vs.info.width, height: vs.info.height, crop: opts.crop, scale: opts.scale };
@@ -91,7 +91,9 @@ pub fn encode_chunk(
         insert_hdr_metadata(output_path, &hdr_metadata, opts.dynamic_hdr, geometry, scene)?;
     }
 
-    chunk_size(output_path)
+    Ok(std::fs::metadata(output_path)
+        .with_context(|| format!("chunk output not found: {}", output_path.display()))?
+        .len())
 }
 
 fn insert_hdr_metadata(
@@ -128,7 +130,7 @@ fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> a
 
 /// A decode error behind the encoder's complaint. Not a broken pipe: that one is the
 /// encoder's own death coming back, and naming it would blame the source for it.
-fn feed_failure(write_res: Result<()>) -> Option<String> {
+pub(crate) fn feed_failure(write_res: Result<()>) -> Option<String> {
     let err = write_res.err()?;
     let broken = err.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
@@ -258,13 +260,16 @@ pub fn spawn_scaler((w, h): (u32, u32)) -> Result<std::process::Child> {
         .context("start ffmpeg scaler")
 }
 
-fn chunk_size(output_path: &Path) -> Result<u64> {
-    let meta = std::fs::metadata(output_path)
-        .with_context(|| format!("chunk output not found: {}", output_path.display()))?;
-    if meta.len() == 0 {
-        bail!("encoder produced empty file: {}", output_path.display());
+/// SvtAv1EncApp exits 0 on a full disk, leaving a short or empty file without a word.
+fn ensure_complete(chunk: &Path, scene: &SceneEntry) -> Result<()> {
+    let frames = crate::av1::ivf_frame_count(chunk).unwrap_or(0);
+    if frames != scene.frame_count() {
+        return Err(anyhow::Error::new(crate::job::Transient).context(format!(
+            "chunk {:05} holds {frames} of its {} frames - is the disk full?",
+            scene.index + 1, scene.frame_count()
+        )));
     }
-    Ok(meta.len())
+    Ok(())
 }
 
 fn encoder_binary(enc: Encoder) -> &'static str {
@@ -439,6 +444,18 @@ mod tests {
         assert_eq!(feed_failure(pipe), None);
 
         assert_eq!(feed_failure(Ok(())), None);
+    }
+
+    #[test]
+    fn a_chunk_left_short_by_the_encoder_is_retried() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("00001.ivf");
+        std::fs::write(&path, b"").unwrap();
+
+        let scene = SceneEntry { index: 0, start_frame: 0, end_frame: 47 };
+        let err = ensure_complete(&path, &scene).unwrap_err();
+        assert!(err.downcast_ref::<crate::job::Transient>().is_some(), "got: {err:#}");
+        assert!(format!("{err:#}").contains("0 of its 48 frames"), "got: {err:#}");
     }
 
     #[test]

@@ -83,7 +83,7 @@ set -- "0 300 500 0 90 0 0" \
 for track; do
     assert_channel_frequencies "$O/test.mkv" "${track%% *}" "${track#* }"
 done
-# No Opus layout has front centre pairs or a back centre next to back left and right.
+# No Opus layout has front center pairs or a back center next to back left and right.
 assert_audio_channels "$O/test.mkv" 11 8
 assert_audio_channels "$O/test.mkv" 12 8
 

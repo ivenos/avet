@@ -132,6 +132,24 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "DV 5: no output"
 assert_dovi_record "$O/test.mkv" "10,0"
 assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 48
 
+# -- Dolby Vision 10.0 as the source: no RPU from AV1, so refused with dv too ----
+DV10="$O/test.mkv"
+for dv in false true; do
+    I="$WORKDIR/9$dv/in"; O="$WORKDIR/9$dv/out"; mkdir -p "$I/p" "$O"
+    cp "$DV10" "$I/p/test.mkv"
+    cat > "$I/p/encode.toml" << EOF
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avet]
+dv  = $dv
+EOF
+    run_avet_timed "$I" "$O" 60 "job failed"
+    assert_log_contains    "has no HDR10 base layer"
+    assert_file_not_exists "$O/test.mkv"
+done
+
 # -- Dolby Vision 8.4 on HLG: profile 10.4 --------------------------------------
 I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/dv84.mkv" "$I/p/test.mkv"
@@ -144,6 +162,7 @@ crf    = 50
 dv  = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "DV 8.4: no output"
+assert_log_not_contains "HDR metadata incomplete"
 assert_color_transfer "$O/test.mkv" "arib-std-b67"
 assert_dovi_record    "$O/test.mkv" "10,4"
 assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 48

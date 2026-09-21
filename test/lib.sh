@@ -32,7 +32,7 @@ _ESC=$(printf '\033')
 # Every probe runs the image's ffmpeg and mkvtoolnix: a host build of another version
 # reads side data, timestamps and dispositions differently, or not at all.
 _TMP_ROOT=$(dirname "$(mktemp -u)")
-_TOOLS=$(docker run -d --rm --label avet-test-tools \
+_TOOLS=$(docker run -d --rm --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
     --security-opt label=disable \
     --user "$(id -u):$(id -g)" \
     -v "${_TMP_ROOT}:${_TMP_ROOT}" \
@@ -55,7 +55,6 @@ fail() {
 "
 }
 
-# Owning the EXIT trap here keeps a suite from replacing the one that calls test_done.
 test_workdir() {
     local d
     d=$(mktemp -d)
@@ -73,7 +72,7 @@ run_avet() {
     RUN_LOGS=""
 
     local cid
-    cid=$(docker run -d --label avet-test-tools \
+    cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
@@ -123,7 +122,7 @@ run_avet_timed() {
     RUN_LOGS=""
 
     local cid
-    cid=$(docker run -d --label avet-test-tools \
+    cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
@@ -153,7 +152,7 @@ run_avet_timed() {
 # Leaves avet running under AVET_CID, for a test that acts on a live daemon.
 start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
     RUN_LOGS=""
-    AVET_CID=$(docker run -d --label avet-test-tools \
+    AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         -v "${1}:/input:z" \
         -v "${2}:/output:z" \
@@ -456,7 +455,7 @@ packet_count() {
 
 # Frame by frame against REFERENCE after FILTER, by index rather than by time. The
 # fixtures change completely from one frame to the next (about 11 dB between
-# neighbours), so a dropped, doubled, swapped or shifted frame lands far below MIN_DB.
+# neighbors), so a dropped, doubled, swapped or shifted frame lands far below MIN_DB.
 assert_frames_match() {
     local out="$1" ref="$2" filter="${3:-null}" min="${4:-26}"
     local n_out n_ref pix report
@@ -906,3 +905,5 @@ _on_exit() {
 }
 
 trap _on_exit EXIT
+# dash skips the EXIT trap when a signal ends the shell.
+trap 'exit 130' INT TERM

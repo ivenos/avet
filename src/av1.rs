@@ -154,6 +154,27 @@ pub fn insert_t35_metadata(path: &Path, messages: &[Vec<Vec<u8>>]) -> Result<()>
     std::fs::rename(&tmp, path).with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
 }
 
+/// Complete frames in an IVF file, read from the frame headers alone.
+pub fn ivf_frame_count(path: &Path) -> Result<u64> {
+    let mut r = BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let len = r.get_ref().metadata().with_context(|| format!("stat {}", path.display()))?.len();
+    read_ivf_header(&mut r, path)?;
+    let mut pos = r.stream_position()?;
+    let mut frames = 0;
+    let mut head = [0u8; 12];
+    while pos + 12 <= len {
+        r.read_exact(&mut head).with_context(|| format!("read {}", path.display()))?;
+        let size = u64::from(u32::from_le_bytes([head[0], head[1], head[2], head[3]]));
+        pos += 12 + size;
+        if pos > len {
+            break;
+        }
+        r.seek_relative(size as i64)?;
+        frames += 1;
+    }
+    Ok(frames)
+}
+
 /// Joins IVF files into one with continuous timestamps; returns the frame count.
 pub fn concat_ivf(inputs: &[PathBuf], output: &Path) -> Result<u64> {
     ensure!(!inputs.is_empty(), "no chunks to join");
@@ -258,6 +279,21 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_cut_off_by_a_full_disk_is_not_counted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("00001.ivf");
+        let tu = [obu(TD, &[]), obu(OBU_FRAME, &[0x10, 0xAA, 0xBB])].concat();
+        let data = ivf(&[tu.clone(), tu.clone()]);
+
+        std::fs::write(&path, &data).unwrap();
+        assert_eq!(ivf_frame_count(&path).unwrap(), 2);
+        for cut in [1, tu.len() + 6] {
+            std::fs::write(&path, &data[..data.len() - cut]).unwrap();
+            assert_eq!(ivf_frame_count(&path).unwrap(), 1, "cut {cut} bytes");
+        }
+    }
+
+    #[test]
     fn leb128_round_trips_multi_byte_sizes() {
         for value in [0usize, 127, 128, 300, 1 << 20] {
             let mut buf = Vec::new();
@@ -351,6 +387,9 @@ mod tests {
             .collect();
         assert_eq!(pts, [0, 1, 2]);
         assert_eq!(frames(&data), [tu(1), tu(2), tu(3)]);
+
+        assert_eq!(ivf_frame_count(&dir.path().join("a.ivf")).unwrap(), 2);
+        assert_eq!(ivf_frame_count(&out).unwrap(), 3);
 
         let mut other_rate = ivf(&[tu(4)]);
         other_rate[16..20].copy_from_slice(&30u32.to_le_bytes());

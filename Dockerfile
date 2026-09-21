@@ -47,6 +47,7 @@ RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
         -DNATIVE=OFF && \
     cmake --build /svt-av1/build --parallel $(nproc) && \
     cmake --install /svt-av1/build && \
+    install -Dm644 -t /licenses/svt-av1 /svt-av1/LICENSE.md /svt-av1/LICENSE-BSD2.md /svt-av1/PATENTS.md && \
     rm -rf /svt-av1
 
 FROM base AS svt-av1-hdr
@@ -65,6 +66,7 @@ RUN git clone --filter=blob:none --no-checkout \
         -DNATIVE=OFF && \
     cmake --build /svt-av1-hdr/build --parallel $(nproc) && \
     cmake --install /svt-av1-hdr/build && \
+    install -Dm644 -t /licenses/svt-av1-hdr /svt-av1-hdr/LICENSE.md /svt-av1-hdr/LICENSE-BSD2.md /svt-av1-hdr/PATENTS.md && \
     rm -rf /svt-av1-hdr
 
 FROM base AS ffms2
@@ -82,6 +84,7 @@ RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
     ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no && \
     make -j$(nproc) && \
     make install && \
+    install -Dm644 -t /licenses/ffms2 COPYING && \
     rm -rf /ffms2
 
 FROM ffms2 AS vship
@@ -95,6 +98,7 @@ RUN git clone --depth 1 --branch ${VSHIP_VERSION} \
     PKG_CONFIG_PATH=/usr/local/lib/pkgconfig make buildFFVSHIP && \
     install -m755 FFVship /usr/local/bin/FFVship && \
     install -m755 libvship.so /usr/local/lib/libvship.so && \
+    install -Dm644 -t /licenses/vship LICENSE && \
     rm -rf /vship
 
 FROM base AS vmaf
@@ -112,6 +116,7 @@ RUN git clone --depth 1 --branch ${VMAF_VERSION} \
         -Denable_docs=false && \
     ninja -C /vmaf/libvmaf/build && \
     install -m755 /vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf && \
+    install -Dm644 -t /licenses/libvmaf /vmaf/LICENSE && \
     rm -rf /vmaf
 
 FROM ffms2 AS builder
@@ -119,13 +124,15 @@ FROM ffms2 AS builder
 ARG RUST_VERSION
 ARG TARGETARCH
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+RUN apk add --no-cache jq && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY .github/scripts/crate-licenses.sh ./
 
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV RUSTFLAGS="-C target-feature=-crt-static"
@@ -136,7 +143,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
     find src build.rs -type f -exec touch {} + && \
     cargo build --release --locked && \
-    cp /src/target/release/avet /avet
+    cp /src/target/release/avet /avet && \
+    sh crate-licenses.sh /licenses/avet/crates
 
 FROM alpine:3.24 AS runtime
 
@@ -162,8 +170,14 @@ COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
 COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
-# The image redistributes GPL binaries, which have to carry the license text.
-COPY LICENSE /usr/share/licenses/avet/LICENSE
+# Alpine records the licenses of its own packages in the apk database.
+COPY LICENSE                                  /usr/share/licenses/avet/LICENSE
+COPY --from=builder     /licenses/avet/crates /usr/share/licenses/avet/crates
+COPY --from=svt-av1     /licenses/svt-av1     /usr/share/licenses/svt-av1
+COPY --from=svt-av1-hdr /licenses/svt-av1-hdr /usr/share/licenses/svt-av1-hdr
+COPY --from=ffms2       /licenses/ffms2       /usr/share/licenses/ffms2
+COPY --from=vship       /licenses/vship       /usr/share/licenses/vship
+COPY --from=vmaf        /licenses/libvmaf     /usr/share/licenses/libvmaf
 
 ENV INPUT_DIR=/input
 ENV OUTPUT_DIR=/output

@@ -11,10 +11,10 @@ on:
         description: "Version for the artifact names, e.g. v1.0.0. Empty uses dev-<sha>."
         required: false
   pull_request:
-    paths: [".github/workflows/appimage.yml", "packaging/**"]
+    paths: [".github/workflows/appimage.yml", ".github/scripts/crate-licenses.sh", "packaging/**"]
   push:
     branches: [main]
-    paths: [".github/workflows/appimage.yml", "packaging/**"]
+    paths: [".github/workflows/appimage.yml", ".github/scripts/crate-licenses.sh", "packaging/**"]
 
 env:
   SVT_AV1_VERSION: v4.2.0
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust ${{ env.RUST_VERSION }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
@@ -108,7 +108,7 @@ jobs:
             fuse libfuse2
 
       - name: Install Rust ${{ env.RUST_VERSION }}
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
@@ -220,8 +220,17 @@ jobs:
           cp /usr/local/lib/libffms2.so*      "$APPDIR/usr/lib/"
           cp /usr/local/lib/libvship.so       "$APPDIR/usr/lib/"
 
-          # The AppImage redistributes the same GPL binaries the image does.
-          install -Dm644 LICENSE "$APPDIR/usr/share/licenses/avet/LICENSE"
+          LICENSES="$APPDIR/usr/share/licenses"
+          install -Dm644 LICENSE "$LICENSES/avet/LICENSE"
+          .github/scripts/crate-licenses.sh "$LICENSES/avet/crates"
+          install -Dm644 -t "$LICENSES/svt-av1"     /tmp/svt-av1/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md}
+          install -Dm644 -t "$LICENSES/svt-av1-hdr" /tmp/svt-av1-hdr/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md}
+          install -Dm644 -t "$LICENSES/ffmpeg"      /tmp/ffmpeg/{LICENSE.md,COPYING.GPLv2,COPYING.LGPLv2.1}
+          install -Dm644 -t "$LICENSES/ffms2"       /tmp/ffms2/COPYING
+          install -Dm644 -t "$LICENSES/vship"       /tmp/vship/LICENSE
+          install -Dm644 -t "$LICENSES/libvmaf"     /tmp/vmaf/LICENSE
+          # linuxdeploy adds the copyright files of the libraries it bundles, not of a copied binary.
+          install -Dm644 /usr/share/doc/mkvtoolnix/copyright "$APPDIR/usr/share/doc/mkvtoolnix/copyright"
 
       - name: Build AppImage
         # A release tag, not "continuous": the same avet tag has to keep producing the
@@ -247,30 +256,31 @@ jobs:
           grep -q "avet started" smoke.log
 
       # avet logs "avet started" before touching a tool, so the smoke test above passes
-      # on an AppImage with nothing bundled.
+      # on an AppImage with nothing bundled. On this runner /usr/local/lib has every library.
       - name: Every bundled tool starts
         run: |
           set -eux
           cd /tmp
           "$GITHUB_WORKSPACE/avet-${APP_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract >/dev/null
-          BIN="/tmp/squashfs-root/usr/bin"
-
-          "$BIN/ffmpeg"           -hide_banner -version >/dev/null
-          "$BIN/ffprobe"          -hide_banner -version >/dev/null
-          "$BIN/mkvmerge"         --version             >/dev/null
-          "$BIN/SvtAv1EncApp"     --version             >/dev/null
-          "$BIN/SvtAv1EncApp-hdr" --version             >/dev/null
-          "$BIN/vmaf"             --version             >/dev/null
-          # ffmsindex exits non-zero without arguments; the usage text proves it loaded.
-          "$BIN/ffmsindex" 2>&1 | grep -qi usage
-          # No GPU here, so "no device" is success and only a loader error is a failure.
-          # `grep -v` cannot tell them apart: one clean line and it passes.
-          "$BIN/FFVship" --list-gpu >ffvship.log 2>&1 || true
-          if grep -qiE "error relocating|symbol not found|cannot open shared object" ffvship.log; then
-            echo "::error::FFVship did not load"
-            cat ffvship.log
-            exit 1
-          fi
+          docker run --rm -v /tmp/squashfs-root:/app:ro -w /tmp ubuntu:24.04 sh -eux -c '
+            BIN=/app/usr/bin
+            "$BIN/ffmpeg"           -hide_banner -version >/dev/null
+            "$BIN/ffprobe"          -hide_banner -version >/dev/null
+            "$BIN/mkvmerge"         --version             >/dev/null
+            "$BIN/SvtAv1EncApp"     --version             >/dev/null
+            "$BIN/SvtAv1EncApp-hdr" --version             >/dev/null
+            "$BIN/vmaf"             --version             >/dev/null
+            "$BIN/ffmsindex" 2>&1 | grep -qi usage
+            timeout -s KILL 5 "$BIN/avet" >start.log 2>&1 || true
+            grep -q "avet started" start.log
+            # No GPU here, so "no device" is success and only a loader error is a failure.
+            "$BIN/FFVship" --list-gpu >ffvship.log 2>&1 || true
+            if grep -qiE "error while loading|symbol lookup error|cannot open shared object|error relocating|symbol not found" ffvship.log; then
+              echo "::error::FFVship did not load"
+              cat ffvship.log
+              exit 1
+            fi
+          '
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7

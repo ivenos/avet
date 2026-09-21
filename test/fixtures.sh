@@ -257,7 +257,7 @@ if [ "$GEN_RC" -ne 0 ]; then
     exit 1
 fi
 
-# Content fixtures. Every frame's luma differs completely from its neighbours, chroma is
+# Content fixtures. Every frame's luma differs completely from its neighbors, chroma is
 # smooth enough for a fast preset, every 48th frame (from frame 12) is white, and a 50 ms
 # beep starts under each white frame.
 docker run --rm -i \

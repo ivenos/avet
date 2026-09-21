@@ -181,7 +181,8 @@ fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
     let mut child = Command::new(external_bin("ffmpeg"))
         .args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(source)
-        .args(["-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "pipe:1"])
+        // -copyinkf: a stream cut mid-GOP starts with pictures ffmpeg would drop, but ffprobe counts.
+        .args(["-map", "0:v:0", "-c:v", "copy", "-copyinkf", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -202,8 +203,7 @@ fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
     });
 
     let status = child.wait().context("wait for ffmpeg")?;
-    // The reader before the exit status: a reader that gave up closed the pipe itself, and
-    // the SIGPIPE it earned would be classified as transient and retried forever.
+    // The reader first: one that gave up closed the pipe, and ffmpeg's SIGPIPE is only the echo.
     let units = units.context("read the HDR10+ messages")?;
     let pts = pts.map_err(|_| anyhow::anyhow!("packet probe panicked"))??;
     if !status.success() {

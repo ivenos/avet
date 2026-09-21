@@ -38,8 +38,7 @@ Environment:
   TOOLS_IMAGE      Fixture tools image tag (default: avet:fixture-tools)
 EOF
             exit 0 ;;
-        # Anything else is a filter, but a mistyped flag must not become one: it would
-        # match no suite and the run would report success without testing anything.
+        # A mistyped flag as the filter would match no suite and pass.
         -*)         printf "ERROR: unknown option %s\n" "$1" >&2; exit 2 ;;
         *)          [ -z "$FILTER" ] || { printf "ERROR: only one filter, got '%s' and '%s'\n" "$FILTER" "$1" >&2; exit 2; }
                     FILTER="$1" ;;
@@ -72,8 +71,11 @@ fi
 
 FIXTURES_DIR=$(mktemp -d)
 RESULTS=$(mktemp -d)
-trap 'rm -rf "$FIXTURES_DIR" "$RESULTS"; docker rm -f $(docker ps -aq --filter label=avet-test-tools) >/dev/null 2>&1' EXIT
-export FIXTURES_DIR RESULTS CASES_DIR GREEN RED NC
+AVET_TEST_RUN=$$
+trap 'rm -rf "$FIXTURES_DIR" "$RESULTS"; docker rm -f $(docker ps -aq --filter "label=avet-test-tools=$AVET_TEST_RUN") >/dev/null 2>&1' EXIT
+# dash skips the EXIT trap when a signal ends the shell.
+trap 'exit 130' INT TERM
+export FIXTURES_DIR RESULTS CASES_DIR GREEN RED NC AVET_TEST_RUN
 
 printf "\n=== Generating fixtures ===\n"
 sh "$SCRIPT_DIR/fixtures.sh" || exit 1

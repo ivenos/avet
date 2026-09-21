@@ -20,7 +20,7 @@ pub fn external_bin(name: &str) -> OsString {
     OsString::from(name)
 }
 
-/// A neighbour that exists but is not executable must not shadow a working copy on PATH.
+/// A neighbor that exists but is not executable must not shadow a working copy on PATH.
 fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -122,19 +122,30 @@ fn wait_briefly(child: &mut std::process::Child) -> bool {
     false
 }
 
-/// The error for a tool that ran and failed. A signalled tool (`code()` is None, which is
-/// how the OOM killer and Ctrl-C arrive) and a full disk both clear on their own.
+/// The error for a tool that ran and failed. A tool stopped from outside (the OOM killer,
+/// Ctrl-C) and a full disk both clear on their own; a tool that crashed does not.
 pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -> anyhow::Error {
     let err = anyhow::anyhow!("{what} failed:\n{}", message.trim());
-    if status.code().is_none() || out_of_space(message) {
+    if stopped_from_outside(status) || out_of_space(message) {
         err.context(crate::job::Transient)
     } else {
         err
     }
 }
 
+fn stopped_from_outside(status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt;
+    const SIGHUP: i32 = 1;
+    const SIGINT: i32 = 2;
+    const SIGKILL: i32 = 9;
+    const SIGTERM: i32 = 15;
+    matches!(status.signal(), Some(SIGHUP | SIGINT | SIGKILL | SIGTERM))
+}
+
 fn out_of_space(message: &str) -> bool {
-    message.contains("No space left on device") || message.contains("ENOSPC")
+    ["No space left on device", "ENOSPC", "Disk quota exceeded", "EDQUOT"]
+        .iter()
+        .any(|m| message.contains(m))
 }
 
 /// `Child::drop` does not wait, so a tool left behind by an early return stays a zombie.
@@ -188,7 +199,7 @@ mod tests {
     fn what_a_wedged_tool_said_before_the_kill_is_in_the_error() {
         // Without it the operator is left with the timeout alone and no idea what it hung on.
         let err = output_with_timeout(
-            Command::new("sh").args(["-c", "echo 'Cannot open display' >&2; sleep 30"]),
+            Command::new("sh").args(["-c", "echo 'Cannot open display' >&2; exec sleep 30"]),
             1,
             "FFVship",
         )
@@ -213,11 +224,25 @@ mod tests {
     }
 
     #[test]
+    fn a_crashed_tool_is_not_retried_forever() {
+        use std::os::unix::process::ExitStatusExt;
+
+        for signal in [6, 11] {
+            let err = tool_error("SvtAv1EncApp", std::process::ExitStatus::from_raw(signal), "");
+            assert!(err.downcast_ref::<crate::job::Transient>().is_none(), "signal {signal}: {err:#}");
+        }
+        let killed = tool_error("SvtAv1EncApp", std::process::ExitStatus::from_raw(9), "");
+        assert!(killed.downcast_ref::<crate::job::Transient>().is_some(), "got: {killed:#}");
+    }
+
+    #[test]
     fn a_full_disk_is_retried_and_an_ordinary_failure_is_not() {
         let out = output_with_timeout(Command::new("sh").args(["-c", "exit 1"]), 30, "sh").unwrap();
 
         let full = tool_error("ffmpeg", out.status, "av_interleaved_write_frame(): No space left on device");
         assert!(full.downcast_ref::<crate::job::Transient>().is_some(), "got: {full:#}");
+        let quota = tool_error("mkvmerge", out.status, "Error: Disk quota exceeded");
+        assert!(quota.downcast_ref::<crate::job::Transient>().is_some(), "got: {quota:#}");
 
         let broken = tool_error("ffmpeg", out.status, "Invalid data found when processing input");
         assert!(broken.downcast_ref::<crate::job::Transient>().is_none(), "got: {broken:#}");

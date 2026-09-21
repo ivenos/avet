@@ -405,6 +405,9 @@ impl Config {
         {
             bail!("avet.bit_depth must be 8 or 10 (got {d})");
         }
+        if self.avet.dv && self.avet.bit_depth == Some(8) {
+            bail!("avet.dv cannot be combined with avet.bit_depth = 8: AV1 Dolby Vision is 10-bit only");
+        }
         // A zero edge reads as "keep the input size" to ffmpeg.
         if let Some(h) = self.avet.scale
             && h < 64
@@ -424,6 +427,11 @@ impl Config {
                      compares against the source at its own resolution, so the downscale \
                      itself counts as a loss and no CRF reaches the floor. Remove one of them."
                 );
+            }
+            if self.encoder_params.contains_key("tbr")
+                || self.encoder_params.get("rc").is_some_and(|v| toml_value_to_arg(v) != "0")
+            {
+                bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc or tbr");
             }
             if tq.jod == 0.0 {
                 bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
@@ -903,6 +911,25 @@ mod tests {
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_qualtiy]\njod = 9.5\n").is_err());
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avet]\nbitdepth = 10\n").is_err());
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_quality]\nmax_probe = 2\n").is_err());
+    }
+
+    #[test]
+    fn dv_needs_a_10_bit_encode() {
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\ndv = true\nbit_depth = 10\n").unwrap();
+        let err = Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\ndv = true\nbit_depth = 8\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bit_depth"), "got: {err}");
+    }
+
+    #[test]
+    fn target_quality_refuses_a_bitrate_target() {
+        let tq = |params: &str| format!("encoder = \"svt-av1\"\n[encoder_params]\n{params}\n[target_quality]\njod = 9.5\n");
+        Config::from_str_for_test(&tq("rc = 0\npreset = 6")).unwrap();
+        for bad in ["rc = 1", "tbr = 3000", "rc = \"2\""] {
+            let err = Config::from_str_for_test(&tq(bad)).unwrap_err().to_string();
+            assert!(err.contains("rc or tbr"), "{bad}: {err}");
+        }
     }
 
     #[test]
