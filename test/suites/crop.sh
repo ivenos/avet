@@ -17,7 +17,7 @@ crop      = true
 keep_temp = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "crop: no output"
-assert_video_height_lt "$O/test.mkv" 480
+assert_video_height    "$O/test.mkv" 360
 assert_log_contains    "auto-crop"
 assert_file_exists     "$O/.avet_test/crop.cache"
 [ -s "$O/.avet_test/crop.cache" ] || fail "crop.cache is empty after detection"

@@ -116,6 +116,8 @@ expect_pass "subtitles shown on time" assert_subtitle_events_match "$SRC" s:0 "$
 expect_fail "subtitles 100 ms late"  assert_subtitle_events_match "$W/sub100.mkv" s:0 "$SRC" s:0
 expect_pass "a chunk on a keyframe"  assert_keyframes_at_chunks "$SRC" "$W/one_chunk.json"
 expect_fail "a chunk without one"    assert_keyframes_at_chunks "$SRC" "$W/two_chunks.json"
+printf '[]' > "$W/no_chunks.json"
+expect_fail "a list with no chunk"   assert_keyframes_at_chunks "$SRC" "$W/no_chunks.json"
 expect_pass "40 samples short, allowed"  assert_audio_samples_identical "$W/short40.mkv" "$SRC" 0 0 40
 expect_fail "40 samples short"       assert_audio_samples_identical "$W/short40.mkv" "$SRC" 0
 expect_fail "100 samples short"      assert_audio_samples_identical "$W/short100.mkv" "$SRC" 0 0 40
@@ -130,7 +132,8 @@ expect_pass "two gapless chunks"     assert_scenes_cover "$W/two_chunks.json"
 expect_fail "a gap between chunks"   assert_scenes_cover "$W/gap.json"
 expect_fail "two chunks overlapping" assert_scenes_cover "$W/overlap.json"
 expect_fail "a list starting late"   assert_scenes_cover "$W/late.json"
-expect_fail "an empty scene list"    assert_scenes_cover "$W/missing.json"
+expect_fail "a missing scene list"   assert_scenes_cover "$W/missing.json"
+expect_fail "an empty scene list"    assert_scenes_cover "$W/no_chunks.json"
 expect_pass "chunks of 100 frames"   assert_min_chunk_frames "$W/two_chunks.json" 100
 expect_fail "a ten-frame chunk"      assert_min_chunk_frames "$W/short.json" 24
 expect_pass "a short last chunk"     assert_min_chunk_frames "$W/gap.json" 100

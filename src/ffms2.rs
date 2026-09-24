@@ -13,7 +13,6 @@ const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
 const FFMS_SEEK_NORMAL: c_int = 1; // FFMS2 5.0: enum shifted, 1 = SEEK_NORMAL (supports random access)
 const FFMS_TYPE_VIDEO: c_int = 0;
 const FFMS_RESIZER_BICUBIC: c_int  = 4;
-const FFMS_RESIZER_LANCZOS: c_int  = 512;
 
 // Must match FFMS2's FFMS_ErrorInfo exactly: ErrorType, SubType, BufferSize, Buffer
 #[repr(C)]
@@ -218,7 +217,6 @@ pub struct Crop {
 }
 
 impl Crop {
-    /// Parse from "crop=W:H:X:Y" or "W:H:X:Y". Requires exactly 4 parts.
     pub fn from_str(s: &str) -> Option<Self> {
         let s = s.trim_start_matches("crop=");
         let p: Vec<&str> = s.split(':').collect();
@@ -494,14 +492,6 @@ pub struct OpenOpts {
 
 impl VideoSource {
     pub fn open(source_file: &Path, index_file: &Path, opts: OpenOpts) -> Result<Self> {
-        Self::open_inner(source_file, index_file, opts)
-    }
-
-    fn open_inner(
-        source_file: &Path,
-        index_file: &Path,
-        opts: OpenOpts,
-    ) -> Result<Self> {
         let mut idx = Index::read(index_file)?;
         let track = idx.first_video_track()?;
 

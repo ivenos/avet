@@ -9,7 +9,7 @@
 #
 # Environment:
 #   TEST_IMAGE      Docker image to use (default: avet:test)
-#   FIXTURES_DIR    Path to test fixtures (default: sibling fixtures/ dir)
+#   FIXTURES_DIR    Path to the fixtures run.sh generates
 #   VERBOSE=1       Print Docker logs on failure
 
 TEST_IMAGE="${TEST_IMAGE:-avet:test}"
@@ -23,7 +23,7 @@ fi
 _FAIL=0
 _ERRORS=""
 _DONE=0
-_CLEANUP=""
+_SCRATCH=$(mktemp -d)
 RUN_LOGS=""
 _ESC=$(printf '\033')
 
@@ -56,10 +56,7 @@ fail() {
 }
 
 test_workdir() {
-    local d
-    d=$(mktemp -d)
-    _CLEANUP="$_CLEANUP $d"
-    printf '%s' "$d"
+    mktemp -d -p "$_SCRATCH"
 }
 
 # -- Docker helpers ----------------------------------------------------------
@@ -504,8 +501,6 @@ assert_frame_times_match() {
     [ -z "$diff" ] || fail "frame times: $out: $diff"
 }
 
-_SCRATCH=$(mktemp -d)
-
 _tmp_file() {
     local f
     f=$(mktemp -p "$_SCRATCH")
@@ -770,13 +765,15 @@ assert_max_chunk_frames() {
 
 # Every chunk of SCENES_JSON starts on a keyframe of OUT.
 assert_keyframes_at_chunks() {
-    local keyframes missing
+    local keyframes starts start missing=""
     keyframes=" $(ffprobe -v error -select_streams v:0 -show_entries packet=flags -of csv=p=0 "$1" \
         | awk '/K/ { printf "%d ", NR - 1 }')"
-    missing=$(tr -d ' \n' < "$2" | grep -o '"start_frame":[0-9]*' | cut -d: -f2 | while read -r start; do
-        case "$keyframes" in *" $start "*) ;; *) printf '%s ' "$start" ;; esac
-    done)
-    [ -n "$(tr -d ' \n' < "$2")" ] && [ -z "$missing" ] || fail "keyframes: chunks of $1 start without one at frame(s) $missing"
+    starts=$(tr -d ' \n' < "$2" | grep -o '"start_frame":[0-9]*' | cut -d: -f2)
+    for start in $starts; do
+        case "$keyframes" in *" $start "*) ;; *) missing="$missing $start" ;; esac
+    done
+    [ -n "$starts" ] || { fail "keyframes: $2 lists no chunk"; return; }
+    [ -z "$missing" ] || fail "keyframes: chunks of $1 start without one at frame(s)$missing"
 }
 
 # A player that seeks lands on the same picture a straight decode shows at that time.
@@ -878,12 +875,11 @@ assert_hdr_static_match() {
 
 # -- Test lifecycle ------------------------------------------------------------
 
-# Call at the end of every test case.
 test_done() {
     [ "$_DONE" -eq 0 ] || return 0
     _DONE=1
     docker rm -f "$_TOOLS" >/dev/null 2>&1
-    rm -rf "$_SCRATCH" $_CLEANUP
+    rm -rf "$_SCRATCH"
     if [ "$_FAIL" -eq 0 ]; then
         exit 0
     fi

@@ -61,12 +61,13 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
     if !unsupported.is_empty() {
         let tracks = identify_subtitles(source)?;
         for (index, id, codec) in unsupported {
-            for track in match_track(&tracks, index, id.as_deref()) {
+            let matched = match_track(&tracks, index, id.as_deref());
+            for track in &matched {
                 if selected(track.2.as_deref()) {
                     plan.from_source.push(track.0);
                 }
             }
-            if match_track(&tracks, index, id.as_deref()).is_empty() {
+            if matched.is_empty() {
                 tracing::warn!("subtitle stream {} ({codec}) cannot be stored in Matroska - skipped",
                     id.as_deref().unwrap_or("?"));
             }

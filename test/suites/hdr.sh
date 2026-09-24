@@ -75,7 +75,7 @@ extra_split = 24
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "DV 8.1 + HDR10+: no output"
 assert_log_contains "HDR: Dolby Vision profile 8 (carried as AV1 profile 10)"
-assert_log_contains "2 chunks"
+assert_log_contains "encoding: 2 chunks,"
 assert_video_frames "$O/test.mkv" 48
 assert_video_height "$O/test.mkv" 280
 assert_dovi_record  "$O/test.mkv" "10,1"
@@ -115,6 +115,13 @@ crf    = 50
 EOF
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_log_contains   "Set avet.dv = true"
+assert_file_not_exists "$O/test.mkv"
+
+I="$WORKDIR/8r/in"; O="$WORKDIR/8r/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/dv5_norecord.mp4" "$I/p/test.mp4"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains    "Set avet.dv = true"
 assert_file_not_exists "$O/test.mkv"
 
 # -- Dolby Vision 5 with dv: profile 10.0 --------------------------------------
@@ -246,7 +253,7 @@ extra_split = 24
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "sparse HDR10+: no output"
 assert_log_contains "HDR10+: reading it from the bitstream"
-assert_log_contains "4 chunks"
+assert_log_contains "encoding: 4 chunks,"
 assert_video_frames "$O/test.mkv" 96
 assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" 96
 # AverageRGB 123 belongs to frame 23, the last one that has its own metadata.

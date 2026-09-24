@@ -53,7 +53,9 @@ chunk=$(grep -o '"[0-9]\{5\}"' "$O/.avet_test/done.json" | head -n 1 | tr -d '"'
 truncate -s 200 "$O/.avet_test/chunks/$chunk.ivf"
 printf 'not a video' > "$O/.avet_test/video.ivf"
 printf 'not a video' > "$O/.avet_test/muxed.mkv"
+printf 'not an index' > "$O/.avet_test/frame-index.ffindex"
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "damaged: no output after the restart"
+assert_log_contains "indexing again"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
@@ -64,5 +66,6 @@ write_profile 40
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "changed: no output after the restart"
 assert_log_contains "encode profile changed"
 assert_intact
+assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
 test_done

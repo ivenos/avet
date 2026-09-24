@@ -29,7 +29,6 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The HDR10+ message of an SEI NAL payload (after the NAL header), if it has one.
 fn hdr10plus_in_sei(nal_payload: &[u8]) -> Option<Vec<u8>> {
     let rbsp = remove_emulation_prevention(nal_payload);
     let mut pos = 0;
@@ -189,18 +188,14 @@ fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
         .spawn()
         .context("start ffmpeg to read the HEVC stream")?;
     let stdout = child.stdout.take().expect("ffmpeg stdout unavailable");
-    let mut stderr = child.stderr.take().expect("ffmpeg stderr unavailable");
+    let err = crate::ext::drain_text(child.stderr.take());
 
-    let (pts, units, err) = std::thread::scope(|s| {
+    let (pts, units) = std::thread::scope(|s| {
         let pts = s.spawn(|| packet_pts(source));
-        let err = s.spawn(move || {
-            let mut text = String::new();
-            let _ = stderr.read_to_string(&mut text);
-            text
-        });
         let units = hdr10plus_by_access_unit(BufReader::new(stdout));
-        (pts.join(), units, err.join().unwrap_or_default())
+        (pts.join(), units)
     });
+    let err = err.join().unwrap_or_default();
 
     let status = child.wait().context("wait for ffmpeg")?;
     // The reader first: one that gave up closed the pipe, and ffmpeg's SIGPIPE is only the echo.

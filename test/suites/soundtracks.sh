@@ -91,8 +91,9 @@ run layouts_flac tones_layouts.mov '[audio]\nmode = "encode"\ncodec = "flac"\n'
 i=0
 while [ $i -lt 13 ]; do
     assert_audio_samples_identical "$O/test.mkv" "$SRC" "$i"
-    assert_stream_value "$O/test.mkv" "a:$i" stream=channel_layout \
-        "$(stream_value "$SRC" "a:$i" stream=channel_layout)"
+    layout=$(stream_value "$SRC" "a:$i" stream=channel_layout)
+    [ -n "$layout" ] || fail "layouts: the source reports no layout for track $i"
+    assert_stream_value "$O/test.mkv" "a:$i" stream=channel_layout "$layout"
     i=$((i + 1))
 done
 

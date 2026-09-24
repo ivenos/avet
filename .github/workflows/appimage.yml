@@ -27,7 +27,7 @@ env:
   RUST_VERSION: 1.98.1
   LINUXDEPLOY_VERSION: 1-alpha-20251107-1
 
-# The appimage job opts into contents: write to attach release assets.
+# Only the release job, which runs nothing but the upload, gets contents: write.
 permissions:
   contents: read
 
@@ -60,8 +60,6 @@ jobs:
     needs: test
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -75,6 +73,8 @@ jobs:
             enable_avx512: "OFF"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Resolve version
         # Not interpolated: both are attacker-chosen text and this writes $GITHUB_ENV.
@@ -289,9 +289,21 @@ jobs:
           path: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
           if-no-files-found: error
 
+  release:
+    if: github.event_name == 'release'
+    needs: appimage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: avet-*.AppImage
+          merge-multiple: true
+
       - name: Attach to release
-        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v3
         with:
-          files: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
+          files: avet-*.AppImage
           fail_on_unmatched_files: true

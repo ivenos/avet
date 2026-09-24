@@ -100,7 +100,7 @@ pub struct AudioProfile {
 
 /// A single bitrate, or a per-layout table keyed by layout name (plus `default`).
 #[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
+#[serde(untagged, expecting = "a bitrate such as \"192k\", or a table of them keyed by layout")]
 pub enum Bitrate {
     Single(String),
     PerLayout(HashMap<String, String>),
@@ -344,7 +344,7 @@ impl SceneDetectionConfig {
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct TargetQualityConfig {
-    /// CVVDP JOD score to hold as a hard minimum per chunk. 0 is rejected by validate().
+    /// CVVDP JOD score to hold as a hard minimum per chunk. NaN until set.
     pub jod: f64,
     /// CRF search bounds.
     pub min_crf: u32,
@@ -364,7 +364,7 @@ pub struct TargetQualityConfig {
 impl Default for TargetQualityConfig {
     fn default() -> Self {
         Self {
-            jod: 0.0,
+            jod: f64::NAN,
             min_crf: 1,
             max_crf: 70,
             min_probes: 2,
@@ -433,7 +433,7 @@ impl Config {
             {
                 bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc or tbr");
             }
-            if tq.jod == 0.0 {
+            if tq.jod.is_nan() {
                 bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
             }
             if !(tq.jod > 0.0 && tq.jod < 10.0) {
@@ -477,6 +477,12 @@ impl Config {
             }
         }
         self.scene_detection.validate()?;
+        for (key, whitelist) in [
+            ("audio.language_whitelist", &self.audio.language_whitelist),
+            ("subtitles.language_whitelist", &self.subtitles.language_whitelist),
+        ] {
+            validate_languages(key, whitelist)?;
+        }
         validate_audio("audio", self.audio.mode, self.audio.codec.as_deref(), self.audio.bitrate.as_ref())?;
         if let Some(p) = &self.audio.lossless {
             let r = self.audio.overlay(p);
@@ -499,6 +505,17 @@ impl Config {
         }
         args
     }
+}
+
+/// ffprobe reports three-letter codes, so an `en` would drop every tagged track.
+fn validate_languages(key: &str, whitelist: &[String]) -> Result<()> {
+    for entry in whitelist {
+        let base = entry.trim().split(['-', '_']).next().unwrap_or_default();
+        if base.len() != 3 || !base.chars().all(|c| c.is_ascii_alphabetic()) {
+            bail!("{key}: \"{entry}\" is not an ISO 639-2 code such as \"eng\" or \"deu\"");
+        }
+    }
+    Ok(())
 }
 
 /// Encode needs a codec; lossy codecs also need a bitrate.
@@ -529,7 +546,12 @@ fn validate_bitrate_values(ctx: &str, bitrate: Option<&Bitrate>) -> Result<()> {
         let bits = parse_bitrate(value)
             .with_context(|| format!("{ctx}: bitrate \"{value}\" is not a number with an optional k or M suffix"))?;
         if bits < 1000 {
-            bail!("{ctx}: bitrate \"{value}\" is {bits} bit/s; write it as \"{value}k\" for kbit/s");
+            let hint = if value.trim().ends_with(|c: char| c.is_ascii_digit()) {
+                format!("; write it as \"{value}k\" for kbit/s")
+            } else {
+                String::new()
+            };
+            bail!("{ctx}: bitrate \"{value}\" is {bits} bit/s{hint}");
         }
     }
     Ok(())
@@ -881,6 +903,18 @@ mod tests {
     }
 
     #[test]
+    fn a_language_whitelist_takes_iso_639_2_codes_only() {
+        let profile = |section: &str, list: &str| format!("encoder = \"svt-av1\"\n[{section}]\nlanguage_whitelist = {list}\n");
+        for good in ["[\"eng\", \"ger\"]", "[\" deu \", \"por-BR\"]", "[]"] {
+            Config::from_str_for_test(&profile("audio", good)).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
+        for (section, bad) in [("audio", "[\"en\"]"), ("subtitles", "[\"eng\", \"de-DE\"]"), ("audio", "[\"\"]"), ("subtitles", "[\"english\"]")] {
+            let err = Config::from_str_for_test(&profile(section, bad)).unwrap_err().to_string();
+            assert!(err.contains(&format!("{section}.language_whitelist")), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn und_counts_as_untagged_not_as_a_language() {
         let wl = vec!["eng".to_string()];
         assert!(language_selected(&wl, None));
@@ -944,5 +978,34 @@ mod tests {
         let c: Config = toml::from_str("encoder = \"svt-av1\"\n[target_quality]\nmin_crf = 10\n").unwrap();
         let err = c.validate().unwrap_err().to_string();
         assert!(err.contains("jod is required"), "got: {err}");
+
+        let err = Config::from_str_for_test("encoder = \"svt-av1\"\n[target_quality]\njod = 0\n").unwrap_err().to_string();
+        assert!(err.contains("must be in (0, 10) (got 0)"), "got: {err}");
+    }
+
+    #[test]
+    fn target_quality_accepts_its_boundary_values() {
+        let tq = |body: &str| format!("encoder = \"svt-av1\"\n[target_quality]\njod = 9.99\n{body}");
+        for body in [
+            "min_crf = 69\nmax_crf = 70",
+            "min_probes = 2\nmax_probes = 2",
+            "tolerance = 0",
+            "probe_preset = 0",
+            "max_encoded_percent = 250",
+            "max_cambi = 0\nmax_cambi_diff = 0",
+        ] {
+            Config::from_str_for_test(&tq(body)).unwrap_or_else(|e| panic!("{body}: {e:#}"));
+        }
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[scene_detection]\nmin_scene_len = 1\nextra_split = 24\n").unwrap();
+    }
+
+    #[test]
+    fn a_bitrate_of_the_wrong_type_says_what_is_expected() {
+        let err = format!("{:#}", Config::from_str_for_test("encoder = \"svt-av1\"\n[audio]\nbitrate = 192\n").unwrap_err());
+        assert!(err.contains("a bitrate such as"), "got: {err}");
+
+        // Only a bare number is missing its k.
+        let err = Config::from_str_for_test("encoder = \"svt-av1\"\n[audio]\nbitrate = \"0.5k\"\n").unwrap_err().to_string();
+        assert!(err.contains("500 bit/s") && !err.contains("0.5kk"), "got: {err}");
     }
 }

@@ -6,7 +6,7 @@ WORKDIR=$(test_workdir)
 
 # -- output video codec is av1 -------------------------------------------------
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+mkvmerge -q -o "$I/p/test.mkv" --default-track-flag 0:yes --language 0:jpn "$FIXTURES_DIR/sdr_simple.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
 encoder = "svt-av1"
 [encoder_params]
@@ -15,6 +15,7 @@ crf    = 50
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "codec: no output"
 assert_video_codec "$O/test.mkv" av1
+assert_stream_value "$O/test.mkv" v:0 stream_disposition=default:stream_tags=language "1 jpn"
 
 # -- manual keyint in encoder_params: auto-keyint logged but not injected ------
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"

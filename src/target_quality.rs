@@ -1,6 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Mutex;
@@ -292,8 +291,10 @@ fn solve(
         {
             break;
         }
+        // Size falls as the CRF rises, so nothing below a probe over the cap can be picked.
+        let pickable = pts.iter().filter(|p| p.size_pct > cap).map(|p| p.crf + CRF_STEP).fold(lo, f64::max);
         match next_crf(&pts, &floor, lo, hi) {
-            Some(next) if (next - crf).abs() > 1e-9 => crf = next,
+            Some(next) if (next - crf).abs() > 1e-9 && next >= pickable - 1e-9 => crf = next,
             _ => break,
         }
     }
@@ -357,8 +358,7 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
         .clamp(lo, hi)
 }
 
-/// Both readings carry the probe preset's bias, and both err on the safe side: the
-/// final encode lands above the probed JOD and below the probed size.
+/// Both readings carry the probe preset's bias; the final encode can come out larger.
 fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
@@ -405,7 +405,7 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
 }
 
 /// Percent of the source's own bytes for these frames; 0 when the index is missing.
-fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
+pub fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
     match (cum.get(start as usize), cum.get(end as usize + 1)) {
         (Some(lo), Some(hi)) if hi > lo => encoded as f64 / (hi - lo) as f64 * 100.0,
         _ => 0.0,
@@ -493,8 +493,6 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
     let res = |p: Probe, outcome| SolveResult {
         crf: p.crf, jod: p.jod, cambi: p.cambi, size_pct: p.size_pct, outcome,
     };
-    let floor_reachable = pts.iter().any(|p| floor.holds(p));
-
     if let Some(p) = pts.iter()
         .filter(|p| floor.holds(p) && p.size_pct <= cap)
         .max_by(|a, b| a.crf.total_cmp(&b.crf))
@@ -504,12 +502,18 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
     }
 
     // Nothing holds both, so the cap wins: lowest CRF that fits is the best quality left.
+    // The search does not go below a probe over the cap, so only min_crf proves the floor out of reach.
     if let Some(p) = pts.iter()
         .filter(|p| p.size_pct <= cap)
         .min_by(|a, b| a.crf.total_cmp(&b.crf))
         .copied()
     {
-        let outcome = if floor_reachable { SolveOutcome::CapBinding } else { SolveOutcome::FloorUnreachable };
+        let out_of_reach = !pts.iter().any(|p| floor.holds(p)) && pts.iter().any(|p| p.crf <= lo + 1e-9);
+        let outcome = if out_of_reach || !pts.iter().any(|p| p.size_pct > cap) {
+            SolveOutcome::FloorUnreachable
+        } else {
+            SolveOutcome::CapBinding
+        };
         return res(p, outcome);
     }
 
@@ -647,26 +651,15 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let hold = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)
         .with_context(|| format!("open {}", fifo.display()))?;
 
-    let mut scaler = ctx.opts.scale.map(encode::spawn_scaler).transpose()?;
-    let reference = match scaler.as_mut() {
-        Some(s) => Stdio::from(s.stdout.take().expect("scaler stdout is piped")),
-        None => Stdio::piped(),
-    };
-    let mut vmaf = match std::process::Command::new(external_bin("vmaf"))
+    let mut vmaf = std::process::Command::new(external_bin("vmaf"))
         .args(["--reference", "/dev/stdin", "--distorted"]).arg(&fifo)
         .args(["--no_prediction", "--threads", &ctx.n_threads.to_string()])
         .args(["--feature", cambi_feature(&ctx.opts.hdr_args), "--json", "--output"]).arg(&json)
-        .stdin(reference)
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            scaler.as_mut().map(reap);
-            return Err(e).context("start vmaf");
-        }
-    };
+        .context("start vmaf")?;
     let mut decoder = match std::process::Command::new(external_bin("ffmpeg"))
         // CAMBI only scores flat areas, and synthesized grain leaves none: it would read 0.
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-export_side_data", "film_grain", "-i"]).arg(probe)
@@ -679,16 +672,11 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
         Ok(c) => c,
         Err(e) => {
             reap(&mut vmaf);
-            scaler.as_mut().map(reap);
             return Err(e).context("start ffmpeg probe decoder");
         }
     };
 
-    let sink = match scaler.as_mut() {
-        Some(s) => s.stdin.take(),
-        None => vmaf.stdin.take(),
-    }
-    .expect("reference input is piped");
+    let sink = vmaf.stdin.take().expect("reference input is piped");
     let (source, index, opts) = (ctx.source.to_path_buf(), ctx.index.to_path_buf(), ctx.opts.clone());
     let (start, end) = (scene.start_frame, scene.end_frame);
     let writer = std::thread::spawn(move || -> Result<()> {
@@ -700,9 +688,8 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
         vs.write_y4m_range(&mut out, start, end, opts.crop, None)
     });
 
-    let vmaf_err = drain(vmaf.stderr.take());
-    let dec_err = drain(decoder.stderr.take());
-    let scaler_err = drain(scaler.as_mut().and_then(|s| s.stderr.take()));
+    let vmaf_err = crate::ext::drain_text(vmaf.stderr.take());
+    let dec_err = crate::ext::drain_text(decoder.stderr.take());
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
     let mut hold = Some(hold);
@@ -721,7 +708,6 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
             if std::time::Instant::now() >= deadline {
                 reap(&mut vmaf);
                 reap(&mut decoder);
-                scaler.as_mut().map(reap);
                 return Err(anyhow::Error::new(crate::job::Transient)
                     .context(format!("vmaf did not finish within {TIMEOUT_SECS}s - killed")));
             }
@@ -729,16 +715,14 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
         }
     }
     drop(hold);
-    let scaler_status = scaler.as_mut().map(|s| s.wait()).transpose().context("wait for ffmpeg scaler")?;
     let write_res = writer.join().unwrap_or_else(|_| Err(anyhow!("Y4M writer panicked")));
-    let (vmaf_err, dec_err, scaler_err) = (vmaf_err.join(), dec_err.join(), scaler_err.join());
+    let (vmaf_err, dec_err) = (vmaf_err.join(), dec_err.join());
 
     // Status first: any of them dying turns the others' writes into a broken pipe. vmaf
     // scores a decoder that stopped early on the frames it got, so its success is not enough.
     let failed: Vec<anyhow::Error> = [
         ("ffmpeg probe decoder", dec_status, dec_err),
         ("vmaf", vmaf_status, vmaf_err),
-        ("ffmpeg scaler", scaler_status, scaler_err),
     ]
     .into_iter()
     .filter_map(|(what, status, stderr)| {
@@ -823,16 +807,6 @@ fn make_fifo(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut p) = pipe {
-            let _ = p.read_to_string(&mut s);
-        }
-        s
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,7 +881,6 @@ mod tests {
 
     #[test]
     fn select_gpu_reports_software_only() {
-        // software-only is detected (hardware=false); ensure_available then rejects it
         let g = select_gpu("GPU 0: llvmpipe (LLVM 22.1.7)\n").unwrap();
         assert_eq!(g.id, 0);
         assert!(!g.hardware);
@@ -939,14 +912,12 @@ mod tests {
 
     #[test]
     fn interpolate_hits_crossing() {
-        // jod 9.7 @ crf30, 9.3 @ crf40, target 9.5 -> 35
         let pts = vec![p(30.0, 9.7, 0.0), p(40.0, 9.3, 0.0)];
         assert!((interpolate_crf(&pts, 9.5) - 35.0).abs() < 1e-6);
     }
 
     #[test]
     fn decide_picks_highest_crf_above_floor() {
-        // target 9.5, all under cap: highest CRF with jod >= 9.5 is 36
         let pts = vec![p(30.0, 9.6, 50.0), p(32.0, 9.52, 45.0), p(36.0, 9.5, 40.0), p(40.0, 9.2, 35.0)];
         let r = decide(&pts, &jod(9.5), 90.0, 14.0);
         assert_eq!(r.crf, 36.0);
@@ -1189,6 +1160,18 @@ mod tests {
         });
         let Err(err) = res else { panic!("a failed measurement was swallowed") };
         assert!(err.to_string().contains("FFVship"));
+    }
+
+    #[test]
+    fn a_probe_over_the_cap_ends_the_search_below_it() {
+        let cfg = tq(9.85);
+        let (res, calls) = run_solve(&cfg, 35.5, |crf| {
+            p(crf, 10.0 - 6.074e-4 * crf.powf(1.802), 120.0 * (-0.07 * (crf - 35.5)).exp())
+        });
+        check_probes(&cfg, &calls);
+        assert!(calls.iter().all(|&c| c >= 35.5), "probed below an over-cap crf: {calls:?}");
+        assert!((39.75..=40.0).contains(&res.crf), "settled on crf {} via {calls:?}", res.crf);
+        assert!(matches!(res.outcome, SolveOutcome::CapBinding));
     }
 
     #[test]

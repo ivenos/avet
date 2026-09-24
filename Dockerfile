@@ -159,6 +159,15 @@ RUN apk add --no-cache \
         mesa-vulkan-swrast && \
     [ "$TARGETARCH" != "amd64" ] || apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati
 
+# Alpine's packages carry only an SPDX identifier, so the texts come from the same release.
+RUN version() { apk list -I "$1" | sed -n "s/^$1-\([0-9.]*\)-r[0-9]* .*/\1/p"; } && \
+    ffmpeg=$(version ffmpeg) && mkvtoolnix=$(version mkvtoolnix) && \
+    mkdir -p /usr/share/licenses/ffmpeg /usr/share/licenses/mkvtoolnix && \
+    for f in LICENSE.md COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3; do \
+        wget -q -O "/usr/share/licenses/ffmpeg/$f" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$ffmpeg/$f" || exit 1; \
+    done && \
+    wget -q -O /usr/share/licenses/mkvtoolnix/COPYING "https://codeberg.org/mbunkus/mkvtoolnix/raw/tag/release-$mkvtoolnix/COPYING"
+
 COPY --from=svt-av1     /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=svt-av1-hdr /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=ffms2       /usr/local/bin/ffmsindex        /usr/local/bin/ffmsindex
@@ -170,7 +179,6 @@ COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
 COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
 # musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
-# Alpine records the licenses of its own packages in the apk database.
 COPY LICENSE                                  /usr/share/licenses/avet/LICENSE
 COPY --from=builder     /licenses/avet/crates /usr/share/licenses/avet/crates
 COPY --from=svt-av1     /licenses/svt-av1     /usr/share/licenses/svt-av1

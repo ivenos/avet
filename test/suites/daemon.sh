@@ -23,6 +23,7 @@ cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/first.mkv"
 wait_for_file "$O/first.mkv" 180 || fail "rescan: the file added after the first scan was never encoded"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/second.mkv"
 wait_for_file "$O/second.mkv" 180 || fail "rescan: the second file was never encoded"
+wait_for_log "[second] done" 60 || fail "rescan: second never finished"
 kill_avet
 assert_video_codec "$O/first.mkv"  av1
 assert_video_codec "$O/second.mkv" av1
@@ -68,7 +69,7 @@ assert_video_frames "$O/test.mkv" 240
 assert_frames_match "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 
 # -- SIGTERM mid-encode: the job is finished, then the loop ends -------------------------
-setup sigterm 'encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
+setup sigterm 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
 start_avet "$I" "$O" 2
 wait_for_log "chunk 1/" 240 || fail "sigterm: no chunk was encoded before the signal"
@@ -83,7 +84,7 @@ assert_frames_match     "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 assert_decodes_cleanly  "$O/test.mkv"
 
 # -- a second signal stops it there and then ---------------------------------------------
-setup twice 'encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
+setup twice 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
 start_avet "$I" "$O" 2
 wait_for_log "chunk 1/" 240 || fail "twice: no chunk was encoded before the signal"

@@ -43,7 +43,6 @@ fn is_transient(err: &anyhow::Error) -> bool {
     })
 }
 
-/// Per-job context, shared by every chunk worker.
 struct WorkerCtx<'a> {
     source: &'a Path,
     temp: &'a TempDir,
@@ -84,15 +83,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     }
 
     let video_file = frame_accurate_source(&job.source_file, &temp, stem)?;
-    if !temp.index_path.exists() {
-        tracing::info!("[{stem}] indexing");
-        ffms2::run_ffmsindex(&video_file, &temp.index_path)?;
-        tracing::info!("[{stem}] indexing done");
-    } else {
-        tracing::info!("[{stem}] reusing existing index");
-    }
-
-    let video_source = ffms2::VideoSource::open(&video_file, &temp.index_path, ffms2::OpenOpts::default())?;
+    let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
     let video_info = video_source.info.clone();
     let source_timestamps = video_source.timestamps_ms()?;
     drop(video_source);
@@ -550,6 +541,21 @@ fn finalize(
     Ok(())
 }
 
+/// An index from another FFMS2 or FFmpeg build no longer opens; indexing again keeps the chunks.
+fn open_indexed(video_file: &Path, index: &Path, stem: &str) -> Result<ffms2::VideoSource> {
+    if index.exists() {
+        tracing::info!("[{stem}] reusing existing index");
+        match ffms2::VideoSource::open(video_file, index, ffms2::OpenOpts::default()) {
+            Ok(vs) => return Ok(vs),
+            Err(e) => tracing::warn!("[{stem}] the existing index does not open - indexing again: {e:#}"),
+        }
+    }
+    tracing::info!("[{stem}] indexing");
+    ffms2::run_ffmsindex(video_file, index)?;
+    tracing::info!("[{stem}] indexing done");
+    ffms2::VideoSource::open(video_file, index, ffms2::OpenOpts::default())
+}
+
 /// FFMS2 puts the frames of AVI video with runs of B-frames out of order, having only decode
 /// times to go by; with timestamps generated into a Matroska copy it does not.
 fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<PathBuf> {
@@ -683,10 +689,29 @@ fn archive_source(job: &Job, ctx: &JobContext) -> Result<()> {
     let name = job.source_file.file_name().context("source has no file name")?;
     let dest = free_path(&processed_dir.join(name))?;
 
-    std::fs::rename(&job.source_file, &dest)
+    move_file(&job.source_file, &dest)
         .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))?;
     remove_emptied_dirs(job);
     Ok(())
+}
+
+/// A profile or `processed/` can be a mount of its own, and rename(2) stops at one.
+fn move_file(from: &Path, to: &Path) -> Result<()> {
+    match std::fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+        other => return Ok(other?),
+    }
+    let mut part = to.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let copied = std::fs::copy(from, &part)
+        .and_then(|_| std::fs::File::open(&part)?.sync_all())
+        .and_then(|()| std::fs::rename(&part, to));
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e).context("copy across file systems");
+    }
+    std::fs::remove_file(from).context("remove the original after copying it")
 }
 
 fn remove_emptied_dirs(job: &Job) {
@@ -731,6 +756,13 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
 
     let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
     w.done.mark_done(&chunk_key, scene_frames, size_bytes)?;
+
+    if let Some(tq) = &w.config.target_quality {
+        let pct = target_quality::chunk_size_pct(size_bytes, &w.source_byte_index, scene.start_frame, scene.end_frame);
+        if pct > tq.max_encoded_percent {
+            tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.0}% of the source, over max_encoded_percent", w.stem);
+        }
+    }
 
     let n_chunks = w.completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
     let n_frames = w.completed_frames.fetch_add(scene_frames, Ordering::Relaxed) + scene_frames;
@@ -791,8 +823,6 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
         return;
     }
 
-    tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
-
     if let Err(e) = temp.create_dirs() {
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
     }
@@ -807,6 +837,7 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
     if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
     }
+    tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
 }
 
 fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir) -> Result<()> {
@@ -982,8 +1013,7 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
         let _ = std::fs::remove_dir_all(&temp.chunks_dir);
         temp.create_dirs()?;
     }
-    std::fs::write(&temp.fingerprint_path, fingerprint)
-        .with_context(|| format!("write {}", temp.fingerprint_path.display()))
+    crate::resume::write_atomic(&temp.fingerprint_path, fingerprint.as_bytes())
 }
 
 /// Size and mtime have to hold still for 3 s: NFS caches attributes for `acregmin`,
@@ -1323,7 +1353,7 @@ mod failure_class_tests {
         std::fs::write(&toml, "encoder = \"svt-av1\"\n[avet]\nscale = 0\n").unwrap();
 
         let err = Config::from_file(&toml).context(Transient).unwrap_err();
-        assert!(err.to_string().contains("retrying") || format!("{err:#}").contains("scale"));
+        assert!(format!("{err:#}").contains("avet.scale"), "got: {err:#}");
         assert!(is_transient(&err), "got: {err:#}");
     }
 
@@ -1591,7 +1621,7 @@ mod output_param_tests {
     }
 
     #[test]
-    fn a_timeout_is_transient_but_a_bad_profile_stays_permanent() {
+    fn a_timeout_and_a_full_disk_are_transient_but_an_encoder_failure_is_not() {
         let timeout = anyhow::Error::new(Transient).context("ffprobe did not finish within 120s");
         assert!(is_transient(&timeout.context("HDR detection")));
 

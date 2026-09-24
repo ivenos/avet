@@ -249,6 +249,9 @@ $FF -i dv81_hdr10plus.mkv -c copy -f mpegts dv81_hdr10plus.m2ts
 
 echo "  dv81_hdr10plus.mp4"
 $FF -i dv81_hdr10plus.mkv -c copy -tag:v hvc1 -strict unofficial dv81_hdr10plus.mp4
+
+echo "  dv5_norecord.mp4"
+$FF -i dv5.mkv -c copy -tag:v hvc1 dv5_norecord.mp4
 GEN
 
 GEN_RC=$?
@@ -315,6 +318,10 @@ mkvmerge -q -o pattern_video_delay.mkv --sync 0:300 pattern.mkv
 mkvmerge -q -o pattern_audio_delay.mkv --sync 1:250 --sync 2:250 pattern.mkv
 mkvmerge -q -o pattern_global_offset.mkv --sync -1:5000 --chapter-sync 5000 pattern.mkv
 
+echo "  pattern_offset_vtt.mkv"
+printf 'WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nFirst line.\n' > eng.vtt
+mkvmerge -q -o pattern_offset_vtt.mkv --sync -1:5000 pattern_av.mkv --sync 0:5000 --language 0:eng eng.vtt
+
 echo "  pattern_offset.m2ts"
 $FF -itsoffset 0.321 -i pattern_av.mkv -i pattern_av.mkv -map 0:v -map 1:a:1 -c copy -f mpegts pattern_offset.m2ts
 
@@ -354,6 +361,10 @@ $FF -f lavfi -i "$(pattern 321x181 24 yuv420p)" -frames:v 48 -c:v ffv1 pattern_o
 $FF -f lavfi -i "$(pattern 320x180 24 yuv422p10le)" -frames:v 48 -c:v ffv1 pattern_422.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuv444p)" -frames:v 48 -c:v ffv1 pattern_444.mkv
 
+echo "  pattern_rgb.mkv, pattern_gray.mkv"
+$FF -f lavfi -i "$(pattern 320x180 24 gbrp),setparams=range=pc:colorspace=gbr" -frames:v 48 -c:v ffv1 pattern_rgb.mkv
+$FF -f lavfi -i "$(pattern 320x180 24 gray),setparams=range=pc" -frames:v 48 -c:v ffv1 pattern_gray.mkv
+
 # White point and minimum luminance off a 4-decimal grid: rounding them is a loss.
 echo "  pattern_hdr12.mkv"
 $FF -f lavfi -i "$(pattern 320x180 24 yuv420p12le),setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
@@ -375,7 +386,7 @@ $FF -f lavfi -i "$(pattern 320x180 24 yuv420p)" \
     -f lavfi -i "aevalsrc=exprs=$(tone 300)|$(tone 500)|$(tone 700)|$(tone 90)|$(tone 1700)|$(tone 1900):c=5.1(side):s=48000:d=2" \
     -frames:v 48 -map 0:v -map 1:a -c:v libx264 -qp 0 -preset ultrafast -c:a flac tones_51side.mkv
 
-rm -f pattern_av.mkv pattern_plain.mp4 eng.srt deu.srt jpn.ass font.ttf chapters.txt
+rm -f pattern_av.mkv pattern_plain.mp4 eng.srt eng.vtt deu.srt jpn.ass font.ttf chapters.txt
 GEN
 
 GEN_RC=$?

@@ -25,7 +25,7 @@ encode fullrange pattern_fullrange.mkv
 assert_frames_match "$O/test.mkv" "$SRC"
 assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,color_transfer,color_primaries,chroma_location "pc bt709 bt709 bt709 topleft"
 
-# -- 4:2:2 and 4:4:4 are brought to 4:2:0 instead of failing ----------------------------
+# -- 4:2:2, 4:4:4, RGB and gray are brought to 4:2:0 instead of failing -------------------
 for sub in 422 444; do
     encode "chroma$sub" "pattern_$sub.mkv"
     assert_log_contains "chroma conversion"
@@ -33,6 +33,11 @@ for sub in 422 444; do
 done
 assert_video_pix_fmt "$WORKDIR/chroma422/out/test.mkv" yuv420p10le
 assert_video_pix_fmt "$WORKDIR/chroma444/out/test.mkv" yuv420p
+for fmt in rgb gray; do
+    encode "$fmt" "pattern_$fmt.mkv"
+    assert_frames_match "$O/test.mkv" "$SRC"
+    assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,chroma_location "tv bt470bg left"
+done
 
 # -- bit_depth converts without touching the picture ---------------------------------------
 encode up8to10 pattern.mkv 'bit_depth = 10'

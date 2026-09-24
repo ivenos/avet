@@ -39,6 +39,10 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
         if !profile_dir.is_dir() || profile_dir.file_name() == Some(OsStr::new("processed")) {
             continue;
         }
+        if profile_dir.file_name().and_then(OsStr::to_str).is_none() {
+            tracing::warn!("skipping profile folder with non-UTF8 name: {}", profile_dir.display());
+            continue;
+        }
 
         let encode_toml = profile_dir.join("encode.toml");
         if !encode_toml.exists() {
@@ -372,6 +376,19 @@ mod tests {
         let jobs = scan(&input, &output).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].stem(), "film");
+    }
+
+    #[test]
+    fn a_profile_folder_with_a_non_utf8_name_is_skipped_not_failed() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join(OsStr::from_bytes(b"Filme_\xe4"));
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+
+        assert_eq!(scan(&input, &output).unwrap().len(), 0);
     }
 
     #[test]

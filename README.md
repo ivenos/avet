@@ -135,7 +135,7 @@ language_whitelist = ["eng", "jpn"]
 
 ### `[encoder_params]`
 
-Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `rc` or `tbr`.
+Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `tbr` or an `rc` other than `0`.
 
 ### `[target_quality]`
 
@@ -160,7 +160,7 @@ jod = 9.5
 | `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, at least `0` |
 
 - Needs `avet.video = "encode"` and cannot be combined with `avet.scale`.
-- `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged. Where the source's packet sizes cannot be read, the limit is off for that file.
+- `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged. The sizes are those of the probes; a finished chunk that still comes out larger is logged too. Where the source's packet sizes cannot be read, the limit is off for that file.
 - CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both are compared with the 95th percentile of a chunk's frames and are measured without film grain.
 - If no probe holds every limit, the chunk uses the lowest probed CRF under `max_encoded_percent`, or the smallest probe if none is under it.
 
@@ -188,8 +188,8 @@ jod = 9.5
 
 - The whitelist matches both spellings (`deu` and `ger`). Tracks without a language or tagged `und` are always kept.
 - Re-encoded tracks get the codec added to their title, e.g. `English 5.1 (Opus)`.
-- Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM.
-- Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1.
+- Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM. A track ffmpeg can neither copy into Matroska nor decode, such as AC-4, is left out with a warning.
+- Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1. A layout none of them holds, such as 7.1(wide) or 7.1.4, is mixed to the one with its channel count, at most 7.1.
 
 `[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.
 
@@ -212,7 +212,7 @@ Chapters are always kept. MP4 text subtitles become SRT, and subtitle tracks Mat
 
 | Key | Default | Description |
 |---|---|---|
-| `min_scene_len` | `24` | Minimum chunk length in frames, at least `1` |
+| `min_scene_len` | `24` | Minimum distance between scene cuts in frames, at least `1` |
 | `extra_split_sec` | `10` | Maximum chunk length in seconds, never below 24 frames, `0` disables |
 | `extra_split` | `0` | Maximum chunk length in frames, at least `24`, `0` disables, overrides `extra_split_sec` |
 | `speed` | `"standard"` | `"fast"` trades accuracy for speed |
@@ -225,12 +225,12 @@ Copyright © Iven Schlösser. avet is free software, licensed under the [GNU Gen
 The Docker image and the AppImage bundle third-party software, each under its own license:
 
 - [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) and [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr): BSD 3-Clause Clear License with the Alliance for Open Media Patent License 1.0
-- [FFmpeg](https://ffmpeg.org): GPL-2.0-or-later and LGPL-2.1-or-later
+- [FFmpeg](https://ffmpeg.org): GPL-3.0-or-later in the image, GPL-2.0-or-later in the AppImage
 - [FFMS2](https://github.com/FFMS/ffms2): MIT as source, GPL as a binary built against FFmpeg
 - [Vship](https://codeberg.org/Line-fr/Vship): MIT NON-AI License
 - [libvmaf](https://github.com/Netflix/vmaf): BSD-2-Clause-Patent
 - [MKVToolNix](https://mkvtoolnix.download): GPL-2.0-only
 
-The license texts are in `/usr/share/licenses/` in the image, with those of its Alpine packages in the apk database, and in `usr/share/licenses/` and `usr/share/doc/` inside the AppImage.
+The license texts are in `/usr/share/licenses/` in the image and in `usr/share/licenses/` and `usr/share/doc/` inside the AppImage. The image's other Alpine packages name their licenses in the apk database.
 
 avet is not affiliated with or endorsed by any of them. "Dolby Vision" is a trademark of Dolby Laboratories Licensing Corporation, "HDR10+" is a trademark of HDR10+ Technologies, LLC.

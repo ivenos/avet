@@ -164,6 +164,16 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
     })
 }
 
+pub fn drain_text<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
 /// `args` has to request JSON. A whole-file query needs [`ffprobe_json_with_timeout`].
 pub fn ffprobe_json<T: DeserializeOwned>(args: &[&str], input: &Path) -> Result<T> {
     ffprobe_json_with_timeout(args, input, 120)
@@ -246,6 +256,18 @@ mod tests {
 
         let broken = tool_error("ffmpeg", out.status, "Invalid data found when processing input");
         assert!(broken.downcast_ref::<crate::job::Transient>().is_none(), "got: {broken:#}");
+    }
+
+    #[test]
+    fn a_stderr_with_a_byte_in_another_encoding_is_kept_rather_than_dropped() {
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'cannot open Filme_\\344.mkv' >&2"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let text = drain_text(child.stderr.take()).join().unwrap();
+        child.wait().unwrap();
+        assert_eq!(text, "cannot open Filme_\u{FFFD}.mkv");
     }
 
     #[test]

@@ -19,11 +19,14 @@ pub struct HdrInfo {
     pub chroma_center: bool,
     /// Only set for full range. Studio is the encoder default and the common case.
     pub color_range: Option<u32>,
+    pub not_yuv: bool,
     pub content_light_level: Option<String>,
     pub mastering_display: Option<String>,
     /// Dolby Vision profile from the DOVI configuration record, when there is one.
     pub dv_profile: Option<u32>,
     pub dv_bl_compatibility: Option<u32>,
+    /// From the RPU itself, for a stream without a configuration record: 0 is profile 5.
+    pub dv_rpu_profile: Option<u32>,
     /// HDR10+ in the probed frames; also set under Dolby Vision, which wins `hdr_type`.
     pub hdr10plus: bool,
 }
@@ -45,6 +48,12 @@ impl HdrInfo {
     }
 
     fn color_args(&self) -> Vec<String> {
+        // FFMS2's RGB and gray conversion: BT.470BG matrix, limited range, left siting.
+        let (matrix, chroma, range) = if self.not_yuv {
+            (Some(5), Some(1), None)
+        } else {
+            (self.matrix_coefficients, self.chroma_sample_position, self.color_range)
+        };
         let mut args: Vec<String> = Vec::new();
         if let Some(cp) = self.color_primaries {
             args.extend_from_slice(&["--color-primaries".into(), cp.to_string()]);
@@ -52,20 +61,20 @@ impl HdrInfo {
         if let Some(tc) = self.transfer_characteristics {
             args.extend_from_slice(&["--transfer-characteristics".into(), tc.to_string()]);
         }
-        if let Some(mc) = self.matrix_coefficients {
+        if let Some(mc) = matrix {
             args.extend_from_slice(&["--matrix-coefficients".into(), mc.to_string()]);
         }
-        if let Some(csp) = self.chroma_sample_position {
+        if let Some(csp) = chroma {
             args.extend_from_slice(&["--chroma-sample-position".into(), csp.to_string()]);
         }
-        if let Some(cr) = self.color_range {
+        if let Some(cr) = range {
             args.extend_from_slice(&["--color-range".into(), cr.to_string()]);
         }
         args
     }
 
     pub fn ipt_base_layer(&self) -> bool {
-        self.dv_profile == Some(5) || self.dv_bl_compatibility == Some(0)
+        self.dv_profile == Some(5) || self.dv_bl_compatibility == Some(0) || self.dv_rpu_profile == Some(0)
     }
 
     /// HLG has no static metadata by design, also under Dolby Vision 8.4.
@@ -91,6 +100,8 @@ struct ProbeOutput {
 struct ProbeStream {
     #[serde(default)]
     codec_name: String,
+    #[serde(default)]
+    pix_fmt: String,
     #[serde(default)]
     color_primaries: String,
     #[serde(default)]
@@ -132,6 +143,7 @@ struct SideData {
     max_luminance: Option<serde_json::Value>,
     dv_profile: Option<serde_json::Value>,
     dv_bl_signal_compatibility_id: Option<serde_json::Value>,
+    vdr_rpu_profile: Option<serde_json::Value>,
 }
 
 pub fn detect(source_file: &Path) -> Result<HdrInfo> {
@@ -141,7 +153,7 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
             "-select_streams", "v:0",
             // A source whose first HDR10+ message sits on a later frame would read as HDR10.
             "-read_intervals", "%+#48",
-            "-show_entries", "stream=codec_name,color_primaries,color_transfer,color_space,chroma_location,color_range",
+            "-show_entries", "stream=codec_name,pix_fmt,color_primaries,color_transfer,color_space,chroma_location,color_range",
             // Sections accumulate, so this does not replace the two around it.
             "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-show_frames",
@@ -150,80 +162,89 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         ],
         source_file,
     )
-    // Only called when the profile asks for HDR, so "no metadata" is not an answer here.
     .context("HDR detection")?;
+    Ok(HdrInfo::from_probe(probe))
+}
 
-    let stream = probe.streams.into_iter().next().unwrap_or_default();
+impl HdrInfo {
+    fn from_probe(probe: ProbeOutput) -> Self {
+        let stream = probe.streams.into_iter().next().unwrap_or_default();
 
-    let mut info = HdrInfo {
-        codec_name: stream.codec_name.clone(),
-        color_primaries: map_color_primaries(&stream.color_primaries),
-        transfer_characteristics: map_transfer(&stream.color_transfer),
-        matrix_coefficients: map_matrix(&stream.color_space),
-        chroma_sample_position: map_chroma(&stream.chroma_location),
-        chroma_center: stream.chroma_location == "center",
-        color_range: map_color_range(&stream.color_range),
-        ..Default::default()
-    };
+        let mut info = HdrInfo {
+            codec_name: stream.codec_name.clone(),
+            color_primaries: map_color_primaries(&stream.color_primaries),
+            transfer_characteristics: map_transfer(&stream.color_transfer),
+            matrix_coefficients: map_matrix(&stream.color_space),
+            chroma_sample_position: map_chroma(&stream.chroma_location),
+            chroma_center: stream.chroma_location == "center",
+            color_range: map_color_range(&stream.color_range),
+            not_yuv: not_yuv(&stream.pix_fmt),
+            ..Default::default()
+        };
 
-    let side_data: Vec<_> = probe.frames.into_iter().flat_map(|f| f.side_data_list).collect();
+        let side_data: Vec<_> = probe.frames.into_iter().flat_map(|f| f.side_data_list).collect();
 
-    let has_side_type = |needle: &str| {
-        side_data.iter().any(|s| s.side_data_type.to_lowercase().contains(needle))
-    };
+        let has_side_type = |needle: &str| {
+            side_data.iter().any(|s| s.side_data_type.to_lowercase().contains(needle))
+        };
 
-    info.dv_profile = stream
-        .side_data_list
-        .iter()
-        .find_map(|s| s.dv_profile.as_ref())
-        .map(|v| val_to_i64(v) as u32);
-    info.dv_bl_compatibility = stream
-        .side_data_list
-        .iter()
-        .find_map(|s| s.dv_bl_signal_compatibility_id.as_ref())
-        .map(|v| val_to_i64(v) as u32);
+        info.dv_profile = stream
+            .side_data_list
+            .iter()
+            .find_map(|s| s.dv_profile.as_ref())
+            .map(|v| val_to_i64(v) as u32);
+        info.dv_bl_compatibility = stream
+            .side_data_list
+            .iter()
+            .find_map(|s| s.dv_bl_signal_compatibility_id.as_ref())
+            .map(|v| val_to_i64(v) as u32);
+        info.dv_rpu_profile = side_data
+            .iter()
+            .find_map(|s| s.vdr_rpu_profile.as_ref())
+            .map(|v| val_to_i64(v) as u32);
 
-    info.hdr10plus = has_side_type("hdr10+");
-    info.hdr_type = if info.dv_profile.is_some() || has_side_type("dolby") {
-        "Dolby Vision".into()
-    } else if info.hdr10plus {
-        "HDR10+".into()
-    } else if stream.color_transfer == "smpte2084" {
-        "HDR10".into()
-    } else if stream.color_transfer == "arib-std-b67" {
-        "HLG".into()
-    } else {
-        "SDR".into()
-    };
+        info.hdr10plus = has_side_type("hdr10+");
+        info.hdr_type = if info.dv_profile.is_some() || has_side_type("dolby") {
+            "Dolby Vision".into()
+        } else if info.hdr10plus {
+            "HDR10+".into()
+        } else if stream.color_transfer == "smpte2084" {
+            "HDR10".into()
+        } else if stream.color_transfer == "arib-std-b67" {
+            "HLG".into()
+        } else {
+            "SDR".into()
+        };
 
-    for sd in &side_data {
-        if info.content_light_level.is_none()
-            && let (Some(mc), Some(ma)) = (&sd.max_content, &sd.max_average)
-        {
-            info.content_light_level =
-                Some(format!("{},{}", val_to_i64(mc), val_to_i64(ma)));
+        for sd in &side_data {
+            if info.content_light_level.is_none()
+                && let (Some(mc), Some(ma)) = (&sd.max_content, &sd.max_average)
+            {
+                info.content_light_level =
+                    Some(format!("{},{}", val_to_i64(mc), val_to_i64(ma)));
+            }
+            if info.mastering_display.is_none()
+                && let (Some(rx), Some(ry), Some(gx), Some(gy), Some(bx), Some(by),
+                        Some(wpx), Some(wpy), Some(lmn), Some(lmx)) = (
+                    &sd.red_x, &sd.red_y, &sd.green_x, &sd.green_y,
+                    &sd.blue_x, &sd.blue_y, &sd.white_point_x, &sd.white_point_y,
+                    &sd.min_luminance, &sd.max_luminance,
+                )
+            {
+                let (gx, gy)   = (val_to_f64(gx),  val_to_f64(gy));
+                let (bx, by)   = (val_to_f64(bx),  val_to_f64(by));
+                let (rx, ry)   = (val_to_f64(rx),  val_to_f64(ry));
+                let (wpx, wpy) = (val_to_f64(wpx), val_to_f64(wpy));
+                let (lmx, lmn) = (val_to_f64(lmx), val_to_f64(lmn));
+                // Unrounded: the source's 1/50000 steps fall between 4-decimal ones.
+                info.mastering_display = Some(format!(
+                    "G({gx},{gy})B({bx},{by})R({rx},{ry})WP({wpx},{wpy})L({lmx},{lmn})"
+                ));
+            }
         }
-        if info.mastering_display.is_none()
-            && let (Some(rx), Some(ry), Some(gx), Some(gy), Some(bx), Some(by),
-                    Some(wpx), Some(wpy), Some(lmn), Some(lmx)) = (
-                &sd.red_x, &sd.red_y, &sd.green_x, &sd.green_y,
-                &sd.blue_x, &sd.blue_y, &sd.white_point_x, &sd.white_point_y,
-                &sd.min_luminance, &sd.max_luminance,
-            )
-        {
-            let (gx, gy)   = (val_to_f64(gx),  val_to_f64(gy));
-            let (bx, by)   = (val_to_f64(bx),  val_to_f64(by));
-            let (rx, ry)   = (val_to_f64(rx),  val_to_f64(ry));
-            let (wpx, wpy) = (val_to_f64(wpx), val_to_f64(wpy));
-            let (lmx, lmn) = (val_to_f64(lmx), val_to_f64(lmn));
-            // Unrounded: the source's 1/50000 steps fall between 4-decimal ones.
-            info.mastering_display = Some(format!(
-                "G({gx},{gy})B({bx},{by})R({rx},{ry})WP({wpx},{wpy})L({lmx},{lmn})"
-            ));
-        }
+
+        info
     }
-
-    Ok(info)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -364,6 +385,13 @@ fn parse_mastering_display(s: &str) -> Option<[(f64, f64); 5]> {
         Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
     };
     Some([pair("G(")?, pair("B(")?, pair("R(")?, pair("WP(")?, pair("L(")?])
+}
+
+/// FFMS2's test: the RGB flag, or at most two components. Pixel format names say both.
+fn not_yuv(pix_fmt: &str) -> bool {
+    ["gbr", "rgb", "bgr", "argb", "abgr", "0rgb", "0bgr", "x2rgb", "x2bgr", "pal8", "gray", "ya", "mono"]
+        .iter()
+        .any(|family| pix_fmt.starts_with(family))
 }
 
 // ffprobe name to ITU-T H.273 numeric code (same values used by SVT-AV1)
@@ -521,6 +549,26 @@ mod tests {
     }
 
     #[test]
+    fn rgb_and_gray_are_described_as_what_ffms2_turns_them_into() {
+        let rgb = HdrInfo {
+            color_primaries: Some(1), transfer_characteristics: Some(13),
+            matrix_coefficients: Some(0), color_range: Some(1), not_yuv: true,
+            ..Default::default()
+        };
+        assert_eq!(rgb.encoder_args(), [
+            "--color-primaries", "1", "--transfer-characteristics", "13",
+            "--matrix-coefficients", "5", "--chroma-sample-position", "1",
+        ]);
+
+        for fmt in ["gbrp", "bgr0", "rgb24", "rgba64le", "x2rgb10le", "pal8", "gray", "gray10le", "ya8", "monow"] {
+            assert!(not_yuv(fmt), "{fmt}");
+        }
+        for fmt in ["yuv420p", "yuvj420p", "yuv444p12le", "nv12", "p010le", "yuyv422", "y210le", ""] {
+            assert!(!not_yuv(fmt), "{fmt}");
+        }
+    }
+
+    #[test]
     fn transfer_uses_the_names_ffprobe_actually_prints() {
         // Verified against ffprobe 8.1; these five differ from the AV1 spec spelling.
         assert_eq!(map_transfer("bt470m"),  Some(4));
@@ -535,22 +583,28 @@ mod tests {
     }
 
     #[test]
-    fn dv_profile_is_read_from_stream_side_data() {
+    fn profile_5_is_known_by_its_record_and_without_one_by_its_rpu() {
+        let info = |json: &str| HdrInfo::from_probe(serde_json::from_str(json).unwrap());
+
         // The frame side data carries the RPU but no profile number.
-        let json = r#"{
-            "streams": [{
-                "color_transfer": "smpte2084",
-                "side_data_list": [{"side_data_type": "DOVI configuration record",
-                                    "dv_profile": 5}]
-            }],
+        let recorded = info(r#"{
+            "streams": [{"color_transfer": "smpte2084",
+                         "side_data_list": [{"side_data_type": "DOVI configuration record", "dv_profile": 5}]}],
             "frames": [{"side_data_list": [{"side_data_type": "Dolby Vision RPU Data"}]}]
-        }"#;
-        let probe: ProbeOutput = serde_json::from_str(json).unwrap();
-        let stream = probe.streams.into_iter().next().unwrap();
-        let profile = stream.side_data_list.iter()
-            .find_map(|s| s.dv_profile.as_ref())
-            .map(|v| val_to_i64(v) as u32);
-        assert_eq!(profile, Some(5));
+        }"#);
+        assert_eq!((recorded.dv_profile, recorded.hdr_type.as_str()), (Some(5), "Dolby Vision"));
+        assert!(recorded.ipt_base_layer());
+
+        let rpu = |profile: u32| info(&format!(r#"{{
+            "streams": [{{"color_transfer": "smpte2084"}}],
+            "frames": [{{"side_data_list": [{{"side_data_type": "Dolby Vision Metadata", "vdr_rpu_profile": {profile}}}]}}]
+        }}"#));
+        assert!(rpu(0).ipt_base_layer());
+        assert!(!rpu(1).ipt_base_layer());
+        assert_eq!(rpu(1).hdr_type, "Dolby Vision");
+
+        let rgb = info(r#"{"streams": [{"pix_fmt": "bgr0", "color_space": "gbr", "color_range": "pc"}]}"#);
+        assert!(rgb.not_yuv && !rgb.encoder_args().contains(&"--color-range".to_string()));
     }
 
     fn geometry(crop: Option<Crop>, scale: Option<(u32, u32)>) -> Geometry {

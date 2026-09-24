@@ -21,7 +21,6 @@ pub fn detect(
     cmd.args(["-hide_banner", "-loglevel", "error", "-noautorotate"])
         .arg("-i")
         .arg(source_file)
-        // The track FFMS2 opens; ffmpeg's own pick is by resolution.
         .args(["-map", "0:v:0"]);
 
     if let Some(ref vf) = actual_vf {
@@ -40,14 +39,7 @@ pub fn detect(
         .context("start ffmpeg for scene detection")?;
 
     let stdout = ffmpeg.stdout.take().expect("ffmpeg stdout unavailable");
-    let stderr_handle = {
-        let stderr = ffmpeg.stderr.take().expect("ffmpeg stderr unavailable");
-        std::thread::spawn(move || {
-            let mut buf = String::new();
-            BufReader::new(stderr).read_to_string(&mut buf).ok();
-            buf
-        })
-    };
+    let stderr_handle = crate::ext::drain_text(ffmpeg.stderr.take());
     let reader: Box<dyn Read> = Box::new(BufReader::new(stdout));
 
     // ffmpeg's message is the only useful part of an "init y4m decoder" failure.

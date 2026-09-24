@@ -6,11 +6,28 @@ pub fn calculate(info: &VideoInfo, stem: &str, threads_per_worker: usize) -> usi
     let cpu_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-
     let ram_gb = available_ram_gib();
-
     let megapixels = (info.width as f64 * info.height as f64) / 1_000_000.0;
 
+    let Split { workers, by_cpu, by_ram, ram_per_worker } = split(cpu_cores, ram_gb, megapixels, threads_per_worker);
+
+    tracing::info!(
+        "[{stem}] workers: {workers} \
+         (cpu={cpu_cores}/{threads_per_worker} threads allows {by_cpu}, \
+         ram={ram_gb:.0}GB/{ram_per_worker:.1}GB allows {by_ram})"
+    );
+
+    workers
+}
+
+struct Split {
+    workers: usize,
+    by_cpu: usize,
+    by_ram: usize,
+    ram_per_worker: f64,
+}
+
+fn split(cpu_cores: usize, ram_gb: f64, megapixels: f64, threads_per_worker: usize) -> Split {
     const CM_RAM: f64 = 0.3;
     const ENC_RAM: f64 = 1.2;
 
@@ -21,16 +38,7 @@ pub fn calculate(info: &VideoInfo, stem: &str, threads_per_worker: usize) -> usi
     } else {
         usize::MAX
     };
-
-    let workers = by_cpu.min(by_ram).max(1);
-
-    tracing::info!(
-        "[{stem}] workers: {workers} \
-         (cpu={cpu_cores}/{threads_per_worker} threads allows {by_cpu}, \
-         ram={ram_gb:.0}GB/{ram_per_worker:.1}GB allows {by_ram})"
-    );
-
-    workers
+    Split { workers: by_cpu.min(by_ram).max(1), by_cpu, by_ram, ram_per_worker }
 }
 
 fn available_ram_gib() -> f64 {
@@ -158,6 +166,19 @@ mod tests {
     }
 
     #[test]
+    fn workers_split_by_cores_and_by_ram_whichever_allows_fewer() {
+        const HD: f64 = 1920.0 * 1080.0 / 1e6;
+        const UHD: f64 = 3840.0 * 2160.0 / 1e6;
+
+        assert_eq!(split(24, 64.0, HD, 6).workers, 4);
+        assert_eq!(split(24, 64.0, UHD, 6).workers, 4);
+        assert_eq!(split(24, 20.0, UHD, 6).workers, 1);
+        assert_eq!(split(24, 20.0, HD, 6).workers, 4);
+        assert_eq!(split(2, 64.0, HD, 6).workers, 1);
+        assert_eq!(split(24, 0.5, HD, 6).workers, 1);
+    }
+
+    #[test]
     fn workers_at_least_one() {
         let i = info(1920, 1080);
         assert!(calculate(&i, "test", 6) >= 1);
@@ -190,12 +211,5 @@ mod tests {
         let map = parse_cgroup_paths("0::/system.slice/avet.service\n4:memory:/docker/abc123\n");
         assert_eq!(map.get("").map(String::as_str), Some("/system.slice/avet.service"));
         assert_eq!(map.get("memory").map(String::as_str), Some("/docker/abc123"));
-    }
-
-    #[test]
-    fn workers_4k_fewer_than_1080p() {
-        let w_hd = calculate(&info(1920, 1080), "test", 6);
-        let w_uhd = calculate(&info(3840, 2160), "test", 6);
-        assert!(w_hd >= w_uhd, "4K should use <= workers than 1080p");
     }
 }

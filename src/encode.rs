@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
-use std::io::{BufWriter, Read};
+use std::io::BufWriter;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
@@ -128,15 +128,32 @@ fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> a
     crate::ext::tool_error(&format!("{what} (chunk {:05})", index + 1), status, stderr)
 }
 
+/// SvtAv1EncApp prints "Encoding" once its arguments, which come from the profile, have
+/// passed its checks; a rejection is fixed in encode.toml and must not lock the file out.
+fn encoder_failure(status: ExitStatus, stderr: &str, index: usize) -> anyhow::Error {
+    use std::os::unix::process::ExitStatusExt;
+
+    let err = tool_failure("encoder", status, stderr, index);
+    let rejected_arguments = status.signal().is_none() && !stderr.contains("Encoding");
+    if rejected_arguments && err.downcast_ref::<crate::job::Transient>().is_none() {
+        err.context(crate::job::Transient)
+    } else {
+        err
+    }
+}
+
+fn broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
 /// A decode error behind the encoder's complaint. Not a broken pipe: that one is the
 /// encoder's own death coming back, and naming it would blame the source for it.
 pub(crate) fn feed_failure(write_res: Result<()>) -> Option<String> {
     let err = write_res.err()?;
-    let broken = err.chain().any(|c| {
-        c.downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
-    });
-    (!broken).then(|| format!("{err:#}"))
+    (!broken_pipe(&err)).then(|| format!("{err:#}"))
 }
 
 /// FFMS2 Y4M piped straight into the encoder.
@@ -159,12 +176,7 @@ fn encode_direct(
         .with_context(|| format!("start encoder '{encoder_name}'"))?;
 
     // A progress line per frame: a full stderr pipe deadlocks it against the Y4M writer.
-    let mut enc_err = child.stderr.take().expect("encoder stderr unavailable");
-    let err_t = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = enc_err.read_to_string(&mut s);
-        s
-    });
+    let err_t = crate::ext::drain_text(child.stderr.take());
 
     let mut stdin = BufWriter::with_capacity(256 * 1024, child.stdin.take().expect("encoder stdin unavailable"));
     let write_res = vs.write_y4m_range(&mut stdin, scene.start_frame, scene.end_frame, crop, hdr_metadata);
@@ -173,9 +185,9 @@ fn encode_direct(
     let status = child.wait().context("wait for encoder")?;
     let stderr = err_t.join().unwrap_or_default();
 
-    // Status first: an encoder that died early turns the write into a broken pipe.
-    if !status.success() {
-        let err = tool_failure("encoder", status, &stderr, scene.index);
+    // Status first: an encoder that died early, even with exit 0, turns the write into a broken pipe.
+    if !status.success() || write_res.as_ref().is_err_and(broken_pipe) {
+        let err = encoder_failure(status, &stderr, scene.index);
         return Err(match feed_failure(write_res) {
             Some(cause) => err.context(format!("reading the source failed first: {cause}")),
             None => err,
@@ -199,7 +211,7 @@ fn encode_scaled(
     let mut ff = spawn_scaler(scale)?;
 
     let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
-    let mut ff_err = ff.stderr.take().expect("ffmpeg stderr unavailable");
+    let ff_err_t = crate::ext::drain_text(ff.stderr.take());
 
     let mut child = match std::process::Command::new(encoder_bin)
         .args(encoder_args)
@@ -215,11 +227,7 @@ fn encode_scaled(
             return Err(e).with_context(|| format!("start encoder '{encoder_name}'"));
         }
     };
-    let mut enc_err = child.stderr.take().expect("encoder stderr unavailable");
-
-    // Drain both stderr pipes on threads so neither can block the pipeline.
-    let ff_err_t = std::thread::spawn(move || { let mut s = String::new(); let _ = ff_err.read_to_string(&mut s); s });
-    let enc_err_t = std::thread::spawn(move || { let mut s = String::new(); let _ = enc_err.read_to_string(&mut s); s });
+    let enc_err_t = crate::ext::drain_text(child.stderr.take());
 
     let mut ff_in = BufWriter::with_capacity(256 * 1024, ff.stdin.take().expect("ffmpeg stdin unavailable"));
     let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, crop, hdr_metadata);
@@ -230,14 +238,14 @@ fn encode_scaled(
     let ff_stderr  = ff_err_t.join().unwrap_or_default();
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
-    // Encoder first: it is its death that breaks the scaler's pipe, never the other way round.
-    if !enc_status.success() || !ff_status.success() {
-        let (what, status, stderr) = if !enc_status.success() {
-            ("encoder", enc_status, &enc_stderr)
+    // Encoder first: its death, even with exit 0, breaks the scaler's pipe, never the other way round.
+    let enc_failed = !enc_status.success() || (!ff_status.success() && !enc_stderr.contains("Encoding"));
+    if enc_failed || !ff_status.success() {
+        let err = if enc_failed {
+            encoder_failure(enc_status, &enc_stderr, scene.index)
         } else {
-            ("ffmpeg scaler", ff_status, &ff_stderr)
+            tool_failure("ffmpeg scaler", ff_status, &ff_stderr, scene.index)
         };
-        let err = tool_failure(what, status, stderr, scene.index);
         return Err(match feed_failure(write_res) {
             Some(cause) => err.context(format!("reading the source failed first: {cause}")),
             None => err,
@@ -247,7 +255,7 @@ fn encode_scaled(
     Ok(())
 }
 
-pub fn spawn_scaler((w, h): (u32, u32)) -> Result<std::process::Child> {
+fn spawn_scaler((w, h): (u32, u32)) -> Result<std::process::Child> {
     let vf = format!("scale={w}:{h}:flags=lanczos");
     std::process::Command::new(external_bin("ffmpeg"))
         .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-i", "pipe:0"])
@@ -402,11 +410,10 @@ mod tests {
         let out = PathBuf::from("/tmp/chunk.ivf");
         let args = build_encoder_args(&config, &out, &opts).unwrap();
 
-        assert!(args.contains(&"-b".to_string()));
-        assert!(args.contains(&"--crf".to_string()));
-        assert!(args.contains(&"28".to_string()));
-        assert!(args.contains(&"--preset".to_string()));
-        assert!(args.contains(&"6".to_string()));
+        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w[0] == flag && w[1] == value);
+        assert!(pair("-b", "/tmp/chunk.ivf"));
+        assert!(pair("--crf", "28"));
+        assert!(pair("--preset", "6"));
     }
 
     #[test]
@@ -444,6 +451,23 @@ mod tests {
         assert_eq!(feed_failure(pipe), None);
 
         assert_eq!(feed_failure(Ok(())), None);
+    }
+
+    #[test]
+    fn an_encoder_that_rejects_its_arguments_is_retried_and_one_that_fails_encoding_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let exit = |code: i32| ExitStatus::from_raw(code << 8);
+        let transient = |e: &anyhow::Error| e.downcast_ref::<crate::job::Transient>().is_some();
+
+        let typo = encoder_failure(exit(1), "Unprocessed tokens: --prest \nError in configuration, could not begin encoding! ...", 0);
+        assert!(transient(&typo), "got: {typo:#}");
+        let exits_zero = encoder_failure(exit(0), "Error: EncoderMode must be in the range of [-1-13]", 0);
+        assert!(transient(&exits_zero) && format!("{exits_zero:#}").contains("EncoderMode"), "got: {exits_zero:#}");
+
+        let mid_encode = encoder_failure(exit(1), "Encoding          \nSvt[error]: bug, no frame in undisplayed queue", 0);
+        assert!(!transient(&mid_encode), "got: {mid_encode:#}");
+        let crashed = encoder_failure(ExitStatus::from_raw(11), "", 0);
+        assert!(!transient(&crashed), "got: {crashed:#}");
     }
 
     #[test]

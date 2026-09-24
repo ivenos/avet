@@ -83,41 +83,51 @@ struct AudioTrack {
     title: Option<String>,
 }
 
-/// Audio codec names ffmpeg flags as lossless, queried once from `ffmpeg -codecs`.
-static LOSSLESS_CODECS: OnceLock<HashSet<String>> = OnceLock::new();
+struct AudioCodecs {
+    lossless: HashSet<String>,
+    decodable: Option<HashSet<String>>,
+}
 
-fn lossless_codecs() -> &'static HashSet<String> {
-    LOSSLESS_CODECS.get_or_init(|| match probe_lossless_codecs() {
-        Ok(set) => set,
+static AUDIO_CODECS: OnceLock<AudioCodecs> = OnceLock::new();
+
+fn audio_codecs() -> &'static AudioCodecs {
+    AUDIO_CODECS.get_or_init(|| match probe_audio_codecs() {
+        Ok(codecs) => codecs,
         Err(e) => {
             tracing::warn!("ffmpeg -codecs query failed ({e:#}); using built-in lossless list");
-            fallback_lossless_codecs()
+            AudioCodecs { lossless: fallback_lossless_codecs(), decodable: None }
         }
     })
 }
 
-fn probe_lossless_codecs() -> Result<HashSet<String>> {
+fn probe_audio_codecs() -> Result<AudioCodecs> {
     let mut cmd = Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-codecs"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -codecs")?;
     if !out.status.success() {
         bail!("ffmpeg -codecs exited with failure");
     }
-    Ok(parse_lossless_codecs(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_audio_codecs(&String::from_utf8_lossy(&out.stdout)))
 }
 
-/// Audio codecs flagged lossless (flag 3 = A, flag 6 = S) in `ffmpeg -codecs`.
-fn parse_lossless_codecs(stdout: &str) -> HashSet<String> {
-    let mut set = HashSet::new();
+/// Flag 1 = D (decodes), flag 3 = A (audio), flag 6 = S (lossless) in `ffmpeg -codecs`.
+fn parse_audio_codecs(stdout: &str) -> AudioCodecs {
+    let (mut lossless, mut decodable) = (HashSet::new(), HashSet::new());
     for line in stdout.lines() {
         let mut fields = line.split_whitespace();
         let (Some(flags), Some(name)) = (fields.next(), fields.next()) else { continue };
         let f = flags.as_bytes();
-        if f.len() >= 6 && f[2] == b'A' && f[5] == b'S' {
-            set.insert(name.to_string());
+        if f.len() < 6 || f[2] != b'A' {
+            continue;
+        }
+        if f[5] == b'S' {
+            lossless.insert(name.to_string());
+        }
+        if f[0] == b'D' {
+            decodable.insert(name.to_string());
         }
     }
-    set
+    AudioCodecs { lossless, decodable: Some(decodable) }
 }
 
 /// Audio encoder names ffmpeg offers, queried once from `ffmpeg -encoders`.
@@ -230,6 +240,8 @@ impl FfprobeDisposition {
 struct FfprobeDispStream {
     #[serde(default)]
     disposition: FfprobeDisposition,
+    #[serde(default)]
+    tags: FfprobeTags,
 }
 
 #[derive(Deserialize)]
@@ -238,13 +250,14 @@ struct FfprobeDispOutput {
     streams: Vec<FfprobeDispStream>,
 }
 
-fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDisposition> {
+/// `stream_disposition`, not `stream=disposition`: ffprobe prints an empty object for that one.
+fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispStream> {
     match crate::ext::ffprobe_json::<FfprobeDispOutput>(
         &["-v", "error", "-select_streams", stream_spec,
-          "-show_entries", "stream=disposition", "-of", "json"],
+          "-show_entries", "stream_disposition:stream_tags=language", "-of", "json"],
         path,
     ) {
-        Ok(p) => p.streams.into_iter().map(|s| s.disposition).collect(),
+        Ok(p) => p.streams,
         Err(e) => {
             tracing::warn!("ffprobe disposition probe failed for {}: {e:#}", path.display());
             vec![]
@@ -282,12 +295,18 @@ fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
         .collect())
 }
 
+/// Into a seekable sink: into a pipe the muxer cannot finish ADTS AAC's header and refuses it.
 fn copies_into_matroska(source_file: &Path, audio_index: usize) -> Result<bool> {
+    use std::os::unix::process::ExitStatusExt;
+
     let mut cmd = Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
         .arg(source_file)
-        .args(["-map", &format!("0:a:{audio_index}"), "-c", "copy", "-frames:a", "1", "-f", "matroska", "-"]);
+        .args(["-map", &format!("0:a:{audio_index}"), "-c", "copy", "-frames:a", "1", "-f", "matroska", "/dev/null"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg copy check")?;
+    if out.status.signal().is_some() {
+        return Err(crate::ext::tool_error("ffmpeg copy check", out.status, &String::from_utf8_lossy(&out.stderr)));
+    }
     Ok(out.status.success())
 }
 
@@ -426,7 +445,6 @@ struct PlannedTrack {
     action: Action,
 }
 
-/// Per-track audio decisions, built before the encode and run by `process_plan`.
 pub struct AudioPlan {
     tracks: Vec<PlannedTrack>,
 }
@@ -477,51 +495,61 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
 
     warn_about_unused_codec_rules(config, &kept);
 
-    let lossless_set = lossless_codecs();
+    let codecs = audio_codecs();
     let mut planned = Vec::with_capacity(kept.len());
     for track in kept {
-        let lossless = is_lossless(&track.codec_name, track.profile.as_deref(), lossless_set);
+        let lossless = is_lossless(&track.codec_name, track.profile.as_deref(), &codecs.lossless);
+        let decodable = codecs.decodable.as_ref().is_none_or(|d| d.contains(&track.codec_name));
         let r = config.resolve(&track.codec_name, lossless);
-        let action = match r.mode {
-            AudioMode::Copy if !copies_into_matroska(source_file, track.audio_index)? => {
-                Action::Pcm { codec: pcm_codec(&track) }
-            }
-            AudioMode::Copy => Action::Copy { preroll: preroll_packets(source_file, &track)? },
-            AudioMode::Encode => {
-                let codec = r.codec.ok_or_else(|| anyhow::anyhow!(
-                    "audio track {}: codec is required when mode = encode", track.audio_index
-                ))?;
-                if audio_encoders().is_some_and(|known| !known.contains(codec)) {
-                    return Err(anyhow::Error::new(crate::job::Transient).context(format!(
-                        "audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index
-                    )));
+        let action = if r.mode == AudioMode::Copy || !decodable {
+            if copies_into_matroska(source_file, track.audio_index)? {
+                if r.mode == AudioMode::Encode {
+                    tracing::warn!("audio track {} ({}): ffmpeg cannot decode it - copied instead", track.audio_index, track.codec_name);
                 }
-                let layout = codec
-                    .contains("opus")
-                    .then(|| opus_layout(track.channel_layout.as_deref(), track.channels));
-                let bitrate = if output_is_lossless(codec) {
-                    None
-                } else {
-                    let b = r.bitrate.and_then(|b| match &layout {
-                        Some((name, _)) => b.resolve_layout(name),
-                        None => b.resolve(track.channels),
-                    }).map(str::to_owned);
-                    if b.is_none() {
-                        tracing::warn!(
-                            "audio track {}: no bitrate for {} channels, using encoder default",
-                            track.audio_index,
-                            track.channels.map_or_else(|| "?".into(), |c| c.to_string()),
-                        );
-                    }
-                    b
-                };
-                let mut options: Vec<(String, String)> = r.options
-                    .iter()
-                    .map(|(k, v)| (k.clone(), toml_value_to_arg(v)))
-                    .collect();
-                options.sort();
-                Action::Encode { codec: codec.to_owned(), bitrate, options, layout }
+                Action::Copy { preroll: preroll_packets(source_file, &track)? }
+            } else if decodable {
+                Action::Pcm { codec: pcm_codec(&track) }
+            } else {
+                tracing::warn!(
+                    "audio track {} ({}): ffmpeg can neither decode it nor copy it into Matroska - skipped",
+                    track.audio_index, track.codec_name
+                );
+                continue;
             }
+        } else {
+            let codec = r.codec.ok_or_else(|| anyhow::anyhow!(
+                "audio track {}: codec is required when mode = encode", track.audio_index
+            ))?;
+            if audio_encoders().is_some_and(|known| !known.contains(codec)) {
+                return Err(anyhow::Error::new(crate::job::Transient).context(format!(
+                    "audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index
+                )));
+            }
+            let layout = codec
+                .contains("opus")
+                .then(|| opus_layout(track.channel_layout.as_deref(), track.channels));
+            let bitrate = if output_is_lossless(codec) {
+                None
+            } else {
+                let b = r.bitrate.and_then(|b| match &layout {
+                    Some((name, _)) => b.resolve_layout(name),
+                    None => b.resolve(track.channels),
+                }).map(str::to_owned);
+                if b.is_none() {
+                    tracing::warn!(
+                        "audio track {}: no bitrate for {} channels, using encoder default",
+                        track.audio_index,
+                        track.channels.map_or_else(|| "?".into(), |c| c.to_string()),
+                    );
+                }
+                b
+            };
+            let mut options: Vec<(String, String)> = r.options
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_arg(v)))
+                .collect();
+            options.sort();
+            Action::Encode { codec: codec.to_owned(), bitrate, options, layout }
         };
         planned.push(PlannedTrack {
             audio_index: track.audio_index,
@@ -649,14 +677,19 @@ pub fn extract(
     // Transcoding every kept track, so it scales with the runtime of the file.
     let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg track extraction")?;
     if !out.status.success() {
-        return Err(crate::ext::tool_error(
-            "ffmpeg track extraction",
-            out.status,
-            &String::from_utf8_lossy(&out.stderr),
-        ));
+        return Err(extraction_error(out.status, &String::from_utf8_lossy(&out.stderr)));
     }
 
     Ok(())
+}
+
+fn extraction_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
+    let err = crate::ext::tool_error("ffmpeg track extraction", status, stderr);
+    if ["Option not found", "Error applying encoder options"].iter().any(|m| stderr.contains(m)) {
+        err.context(crate::job::Transient)
+    } else {
+        err
+    }
 }
 
 pub fn has_chapters(path: &Path) -> Result<bool> {
@@ -679,17 +712,17 @@ pub fn mux_final(
     let has_tracks = std::fs::metadata(tracks_path).is_ok_and(|m| m.len() > 0);
 
     // video.ivf has none; in copy mode the source has its own and track 0 may be audio.
-    let video_disps = if video_path.extension().is_some_and(|e| e == "ivf") {
-        probe_dispositions(source_file, "v")
-    } else {
-        Vec::new()
-    };
+    let encoded = video_path.extension().is_some_and(|e| e == "ivf");
+    let source_video = if encoded { probe_dispositions(source_file, "v:0") } else { Vec::new() };
 
     let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.arg("-o").arg(output_path);
 
-    if let Some(d) = video_disps.first() {
-        cmd.args(d.to_mkvmerge_flags(0));
+    if let Some(v) = source_video.first() {
+        cmd.args(v.disposition.to_mkvmerge_flags(0));
+        if let Some(lang) = v.tags.language.as_deref().filter(|l| !l.is_empty()) {
+            cmd.args(["--language".to_string(), format!("0:{lang}")]);
+        }
     }
     // In copy mode the video comes from the source, whose attachments follow once more below.
     cmd.args(["--no-audio", "--no-subtitles", "--no-chapters", "--no-attachments",
@@ -707,7 +740,7 @@ pub fn mux_final(
         cmd.arg(tracks_path);
     }
 
-    cmd.args(["--no-video", "--no-audio", "--no-global-tags", "--no-track-tags"]);
+    cmd.args(["--no-video", "--no-audio", "--no-track-tags"]);
     if source_subtitles.is_empty() {
         cmd.arg("--no-subtitles");
     } else {
@@ -715,7 +748,8 @@ pub fn mux_final(
         cmd.args(["--subtitle-tracks", &ids]);
     }
     if source_shift_ms != 0 {
-        if !source_subtitles.is_empty() {
+        // A copied video keeps mkvmerge's timeline, and realign_copied_video moves these with it.
+        if !source_subtitles.is_empty() && encoded {
             cmd.arg("--sync").arg(format!("-1:{source_shift_ms}"));
         }
         if has_chapters(source_file)? {
@@ -773,20 +807,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_codecs_picks_audio_lossless() {
+    fn parse_codecs_picks_audio_lossless_and_decodable() {
         let sample = "\
+ D..... = Decoding supported
+ ..A... = Audio codec
  DEA..S flac    FLAC (Free Lossless Audio Codec)
  DEA.L. aac     AAC (Advanced Audio Coding)
  DEAI.S truehd  TrueHD
  DEV..S ffv1    FFV1 (video, lossless)
  D.A.LS dts     DCA (DTS Coherent Acoustics)
+ ..A.L. ac4     AC-4
 ";
-        let set = parse_lossless_codecs(sample);
+        let codecs = parse_audio_codecs(sample);
+        let set = &codecs.lossless;
         assert!(set.contains("flac"));
         assert!(set.contains("truehd"));
         assert!(set.contains("dts"));
         assert!(!set.contains("aac"));
         assert!(!set.contains("ffv1"));
+
+        let decodable = codecs.decodable.unwrap();
+        assert!(decodable.contains("aac") && decodable.contains("dts"));
+        assert!(!decodable.contains("ac4") && !decodable.contains("ffv1") && !decodable.contains("="));
     }
 
     #[test]
@@ -856,6 +898,17 @@ mod tests {
         assert_eq!(pcm_codec(&track("s32", 24)), "pcm_s24le");
         assert_eq!(pcm_codec(&track("s32", 0)), "pcm_s32le");
         assert_eq!(pcm_codec(&track("fltp", 0)), "pcm_f32le");
+    }
+
+    #[test]
+    fn a_rejected_option_is_retried_and_a_broken_track_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::ExitStatus::from_raw(8 << 8);
+        let transient = |e: &anyhow::Error| e.downcast_ref::<crate::job::Transient>().is_some();
+
+        assert!(transient(&extraction_error(failed, "Unrecognized option 'compresion_level:a:0'.\nError splitting the argument list: Option not found")));
+        assert!(transient(&extraction_error(failed, "[flac] Error setting option compression_level to value abc.\n[aost#0:0/flac] Error applying encoder options: Invalid argument")));
+        assert!(!transient(&extraction_error(failed, "[truehd] Invalid data found when processing input")));
     }
 
     #[test]

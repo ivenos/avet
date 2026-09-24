@@ -38,7 +38,7 @@ cargo test --locked           # unit tests
 - Errors are `anyhow::Result` with a `.context()` naming the failed step. A failed job must never stop the scan loop.
 - Failures that clear on their own carry `job::Transient` and are retried. Everything else writes a `.failed` marker.
 - Run external tools through `ext::output_with_timeout` and report a non-zero exit with `ext::tool_error`, which classifies a tool stopped from outside and a full disk as transient.
-- Tools fed through a pipe (the encoders, the scaler, scene detection, the HDR10+ scan and CAMBI) drain their stderr on a thread.
+- Tools fed through a pipe (the encoders, the scaler, scene detection, the HDR10+ scan and CAMBI) drain their stderr with `ext::drain_text`.
 - ffmpeg calls on the source name their stream: `-map 0:v:0`, `-map 0:a:<n>`.
 - Write output and state files under a scratch name, then rename them into place.
 - Comments only for what the code cannot say, in one or two lines.

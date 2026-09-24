@@ -178,8 +178,44 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "avet.scale must be at least 64"
 
+# -- a key or value only the encoder checks is retried, not marked failed ------
+I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\nprest = 6\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains    "Error in configuration"
+assert_log_contains    "retrying on the next scan"
+assert_file_not_exists "$O/.avet_test/.failed"
+
+# SvtAv1EncApp exits 0 on this one, and only its closed input shows it.
+I="$WORKDIR/14/in"; O="$WORKDIR/14/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 99\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains    "EncoderMode must be in the range"
+assert_log_contains    "retrying on the next scan"
+assert_file_not_exists "$O/.avet_test/.failed"
+
+I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[audio]
+mode    = "encode"
+codec   = "flac"
+options = { compresion_level = 10 }
+EOF
+run_avet_timed "$I" "$O" 120 "job failed"
+assert_file_not_exists "$O/test.mkv"
+assert_log_contains    "Option not found"
+assert_log_contains    "retrying on the next scan"
+assert_file_not_exists "$O/.avet_test/.failed"
+
 # -- a transient failure leaves no .failed marker -----------------------------
 # The profile is broken, not the file, so the next scan has to pick it up after the fix.
-assert_dir_not_exists "$O/.avet_test"
+assert_dir_not_exists "$WORKDIR/12/out/.avet_test"
 
 test_done

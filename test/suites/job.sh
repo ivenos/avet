@@ -129,18 +129,17 @@ assert_file_exists   "$I/processed/beta.mkv"
 
 # -- .failed workflow: write marker, block retry, recover after fix ------------
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cp "$FIXTURES_DIR/dv5.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
 encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
-this-flag-doesnt-exist = "boom"
 EOF
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$O/.avet_test/.failed"
-assert_log_contains    "job failed"
+assert_log_contains    "Set avet.dv = true"
 
 run_avet_timed "$I" "$O" 15 "permanently failed"
 assert_log_contains "permanently failed"
@@ -151,6 +150,8 @@ encoder = "svt-av1"
 [encoder_params]
 preset = 12
 crf    = 50
+[avet]
+dv = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail ".failed recovery: no output"
 assert_file_nonempty "$O/test.mkv"
