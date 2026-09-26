@@ -15,7 +15,7 @@ run() { # NAME FIXTURE PROFILE
     run_avet "$I" "$O" "$O/test.mkv" 300 || fail "$1: no output"
 }
 
-# -- the same pictures, still in sync where mkvmerge sets its own time zero -----------------
+# the same pictures, still in sync where mkvmerge sets its own time zero
 for fixture in gop_h264.mp4 gop_h264.flv gop_h264.ts gop_mpeg4.avi; do
     run "copy_$fixture" "$fixture" "$COPY"
     assert_frames_identical "$O/test.mkv" "$SRC"

@@ -38,7 +38,7 @@ need() {
     done
 }
 
-# -- frames: swapped, shifted and mis-cropped pictures ------------------------------------
+# frames: swapped, shifted and mis-cropped pictures
 $FF -i "$SRC" -map 0:v -vf "shuffleframes=0 1 2 3 5 4" $(x264) "$W/swapped.mkv"
 $FF -i "$SRC" -map 0:v -vf "trim=start_frame=1,setpts=PTS-STARTPTS,tpad=stop=1:stop_mode=clone" $(x264) "$W/shifted.mkv"
 $FF -i "$FIXTURES_DIR/pattern_bars.mkv" -vf "crop=640:276:0:46" $(x264) "$W/crop46.mkv"
@@ -48,9 +48,9 @@ expect_fail "two swapped frames"     assert_frames_match "$W/swapped.mkv" "$SRC"
 expect_fail "every frame one late"   assert_frames_match "$W/shifted.mkv" "$SRC"
 expect_fail "a crop two lines low"   assert_frames_match "$W/crop46.mkv" "$FIXTURES_DIR/pattern_bars.mkv" "crop=640:276:0:44"
 expect_pass "the right crop"         assert_frames_match "$W/crop46.mkv" "$FIXTURES_DIR/pattern_bars.mkv" "crop=640:276:0:46"
-expect_fail "a missing frame"        assert_frames_match "$FIXTURES_DIR/pattern_vfr.mkv" "$SRC"
+expect_fail "another frame count"    assert_frames_match "$FIXTURES_DIR/pattern_vfr.mkv" "$SRC"
 
-# -- frame times: one frame five milliseconds late ------------------------------------------
+# frame times: one frame five milliseconds late
 { echo "# timestamp format v2"; i=0; while [ $i -lt 240 ]; do
       if [ $i -eq 100 ]; then echo "$((i * 1000 / 24 + 5))"; else echo "$((i * 1000 / 24))"; fi
       i=$((i + 1)); done; } > "$W/late.txt"
@@ -59,7 +59,7 @@ need "$W/late.mkv"
 expect_pass "unchanged frame times"  assert_frame_times_match "$SRC" "$SRC"
 expect_fail "one late frame"         assert_frame_times_match "$W/late.mkv" "$SRC"
 
-# -- sync, packets, stream times, tracks, chapters, attachments -----------------------------
+# sync, packets, stream times, tracks, chapters, attachments
 mkvmerge -q -o "$W/audio40.mkv" --sync 1:40 "$SRC"
 mkvmerge -q -o "$W/sub100.mkv" --sync 3:100 "$SRC"
 mkvmerge -q -o "$W/chapters50.mkv" --chapter-sync 50 "$SRC"
@@ -87,7 +87,7 @@ expect_fail "no chapters"            assert_chapters_match "$W/nochapters.mkv" "
 expect_pass "same attachments"       assert_attachments_match "$SRC" "$SRC"
 expect_fail "a changed attachment"   assert_attachments_match "$W/attachment.mkv" "$SRC"
 
-# -- a corrupted stream, a swapped channel, changed bytes -------------------------------------
+# a corrupted stream, a swapped channel, changed bytes
 cp "$SRC" "$W/corrupt.mkv"
 # A single block of random bytes still decodes cleanly about once in 200 runs.
 corrupt_size=$(stat -c %s "$W/corrupt.mkv")
@@ -101,10 +101,15 @@ expect_pass "a clean decode"         assert_decodes_cleanly "$SRC"
 expect_fail "corrupted packets"      assert_decodes_cleanly "$W/corrupt.mkv"
 expect_pass "channels in place"      assert_channel_frequencies "$FIXTURES_DIR/tones_71.mkv" 0 "300 500 700 90 1100 1300 1700 1900"
 expect_fail "left and right swapped" assert_channel_frequencies "$W/swapped_lr.mkv" 0 "300 500 700 90 1100 1300 1700 1900"
+$FF -i "$FIXTURES_DIR/tones_71.mkv" -map 0:a:0 -af "pan=7.1|c0=c0|c1=c1|c3=c3|c4=c4|c5=c5|c6=c6|c7=c7" \
+    -c:a libopus -mapping_family 1 -b:a 256k "$W/silent_fc.mkv"
+need "$W/silent_fc.mkv"
+expect_pass "a silent channel through Opus" assert_channel_frequencies "$W/silent_fc.mkv" 0 "300 500 0 90 1100 1300 1700 1900"
+expect_fail "a tone where it is silent" assert_channel_frequencies "$W/silent_fc.mkv" 0 "300 500 700 90 1100 1300 1700 1900"
 expect_pass "same bytes"             assert_same_bytes "$SRC" "$SRC"
 expect_fail "changed bytes"          assert_same_bytes "$W/corrupt.mkv" "$SRC"
 
-# -- pictures bit for bit, subtitle events, chunk keyframes, samples cut short ---------------------
+# pictures bit for bit, subtitle events, chunk keyframes, samples cut short
 printf '[{"index":0,"start_frame":0,"end_frame":239}]' > "$W/one_chunk.json"
 printf '[{"index":0,"start_frame":0,"end_frame":99},{"index":1,"start_frame":100,"end_frame":239}]' > "$W/two_chunks.json"
 $FF -i "$SRC" -map 0:a:0 -af "atrim=end_sample=479960" -c:a flac "$W/short40.mkv"
@@ -122,7 +127,7 @@ expect_pass "40 samples short, allowed"  assert_audio_samples_identical "$W/shor
 expect_fail "40 samples short"       assert_audio_samples_identical "$W/short40.mkv" "$SRC" 0
 expect_fail "100 samples short"      assert_audio_samples_identical "$W/short100.mkv" "$SRC" 0 0 40
 
-# -- scene lists: a gap, an overlap, a late start, a short chunk -------------------------------
+# scene lists: a gap, an overlap, a late start, a short chunk
 printf '[{"index":0,"start_frame":0,"end_frame":99},{"index":1,"start_frame":120,"end_frame":239}]' > "$W/gap.json"
 printf '[{"index":0,"start_frame":0,"end_frame":99},{"index":1,"start_frame":90,"end_frame":239}]' > "$W/overlap.json"
 printf '[{"index":0,"start_frame":4,"end_frame":239}]' > "$W/late.json"
@@ -141,9 +146,9 @@ expect_pass "chunks of 140 frames"   assert_max_chunk_frames "$W/two_chunks.json
 expect_fail "a chunk 40 frames over" assert_max_chunk_frames "$W/two_chunks.json" 100
 expect_fail "a long last chunk"      assert_max_chunk_frames "$W/short.json" 100
 
-# -- frame counts, stream values and track flags ------------------------------------------------
+# frame counts, stream values and track flags
 expect_pass "the frame count"        assert_video_frames "$SRC" 240
-expect_fail "120 frames too many"    assert_video_frames "$FIXTURES_DIR/pattern_vfr.mkv" 240
+expect_fail "240 frames too many"    assert_video_frames "$FIXTURES_DIR/pattern_vfr.mkv" 240
 expect_fail "counting an absent file" assert_video_frames "$W/missing.mkv" 240
 expect_pass "the pixel format"       assert_stream_value "$SRC" v:0 stream=pix_fmt yuv420p
 expect_fail "the wrong one"          assert_stream_value "$SRC" v:0 stream=pix_fmt yuv420p10le
@@ -152,7 +157,7 @@ expect_pass "no rotation, spelled out" assert_stream_value "$SRC" v:0 stream_sid
 expect_pass "language and flags"     assert_track_flags_match "$SRC" "$SRC" a
 expect_fail "a lost default flag"    assert_track_flags_match "$W/flag.mkv" "$SRC" a
 
-# -- HDR static metadata and the dynamic side data ----------------------------------------------
+# HDR static metadata and the dynamic side data
 MD="G(13250,34500)B(7500,3000)R(34000,16000)"
 for wp in 15636,16451 15635,16450; do
     $FF -f lavfi -i "color=c=gray:size=64x64:rate=24" -frames:v 2 -pix_fmt yuv420p10le \
@@ -171,13 +176,21 @@ DV="$FIXTURES_DIR/dv81_hdr10plus.mkv"
 expect_pass "HDR10+ on every frame"  assert_frames_with_side_data "$DV" "SMPTE2094-40" 48
 expect_fail "one frame too few"      assert_frames_with_side_data "$DV" "SMPTE2094-40" 47
 expect_fail "frames carrying none"   assert_frames_with_side_data "$SRC" "SMPTE2094-40" 48
+expect_pass "HDR10+ values as in the source" assert_hdr10plus_matches "$DV" "$DV"
+expect_fail "another sequence of them" assert_hdr10plus_matches "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$DV"
+expect_fail "none at all"            assert_hdr10plus_matches "$SRC" "$DV"
 expect_pass "the Dolby Vision record" assert_dovi_record "$DV" "8,1"
 expect_fail "the wrong profile"      assert_dovi_record "$DV" "10,1"
 expect_fail "no record at all"       assert_dovi_record "$SRC" "8,1"
 
 expect_pass "seeks landing correctly" assert_seeks_land_on_frames "$SRC"
+$FF -i "$SRC" -map 0:v:0 $(x264) -g 10 -bf 0 "$W/gop10.mkv"
+mkvmerge -q -o "$W/cues_everywhere.mkv" --cues 0:all "$W/gop10.mkv"
+need "$W/cues_everywhere.mkv"
+expect_pass "the same GOPs with keyframe cues" assert_seeks_land_on_frames "$W/gop10.mkv"
+expect_fail "seeks landing late"     assert_seeks_land_on_frames "$W/cues_everywhere.mkv"
 
-# -- the plain ffprobe assertions the suites lean on most --------------------------------
+# the plain ffprobe assertions the suites lean on most
 # pattern.mkv: 320x180 h264, flac "English" (eng, stereo) and aac "Kommentar" (ger),
 # three subtitle tracks eng/ger/jpn, an attachment and three chapters.
 : > "$W/empty.mkv"
@@ -217,9 +230,6 @@ expect_pass "the video codec"        assert_video_codec "$SRC" h264
 expect_fail "the wrong codec"        assert_video_codec "$SRC" av1
 expect_pass "the video height"       assert_video_height "$SRC" 180
 expect_fail "the wrong height"       assert_video_height "$SRC" 1080
-expect_pass "at most its height"     assert_video_height_le "$SRC" 180
-expect_fail "one line over"          assert_video_height_le "$SRC" 179
-expect_fail "measuring nothing"      assert_video_height_le "$W/missing.mkv" 180
 expect_pass "under the limit"        assert_video_height_lt "$SRC" 181
 expect_fail "not under it"           assert_video_height_lt "$SRC" 180
 expect_pass "the pixel format again" assert_video_pix_fmt "$SRC" yuv420p
@@ -230,12 +240,20 @@ expect_fail "PQ instead"             assert_color_transfer "$FIXTURES_DIR/hlg.mk
 expect_pass "the BT.2020 primaries"  assert_color_primaries "$FIXTURES_DIR/hlg.mkv" bt2020
 expect_fail "BT.709 instead"         assert_color_primaries "$FIXTURES_DIR/hlg.mkv" bt709
 
+mkvmerge -q -o "$W/bcp47.mkv" --language 1:en-GB --language 2:de-CH "$SRC"
+need "$W/bcp47.mkv"
+expect_pass "the BCP 47 tags"        assert_bcp47_languages "$W/bcp47.mkv" "und en-GB de-CH en de ja"
+expect_fail "their ISO 639-2 base"   assert_bcp47_languages "$SRC" "und en-GB de-CH en de ja"
+
 RUN_LOGS="[test] encoding: 4 chunks
+[test] audio track 0: eng aac stereo (lossy) -> Opus 128k
 [test] done"
 expect_pass "a line that is logged"  assert_log_contains "4 chunks"
 expect_fail "a line that is not"     assert_log_contains "job failed"
 expect_pass "a line that is absent"  assert_log_not_contains "job failed"
 expect_fail "a line that is present" assert_log_not_contains "4 chunks"
+expect_pass "a pattern with a dash"  assert_log_contains "-> Opus 128k"
+expect_fail "and its absence"        assert_log_not_contains "-> Opus 128k"
 RUN_LOGS=""
 
 # A file no seek can read at all must not pass as "every seek landed".

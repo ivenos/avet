@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
 use crate::config::{Config, Encoder};
-use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, VideoSource};
+use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, PixelSubsampling, VideoSource};
 use crate::ext::external_bin;
 use crate::hdr::{DynamicHdr, Geometry};
 use crate::resume::SceneEntry;
@@ -27,6 +27,7 @@ pub struct EncodeOptions {
     pub scale: Option<(u32, u32)>,
     /// Crop in source space, applied in the Y4M pipe before scaling.
     pub crop: Option<Crop>,
+    pub deinterlace: Option<crate::interlace::FieldOrder>,
     /// FPS from ffprobe; FFMS2 reports 0/0 for some exotic containers (e.g. DV) which breaks IVF timestamps.
     pub fps_num: u32,
     pub fps_den: u32,
@@ -60,7 +61,7 @@ pub fn encode_chunk(
     let mut vs = VideoSource::open(
         source_file,
         index_file,
-        OpenOpts { target_bit_depth: opts.target_bit_depth },
+        OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: opts.deinterlace.is_some() },
     )
     .context("open FFMS2 VideoSource")?;
     vs.info.fps_num = opts.fps_num;
@@ -68,15 +69,21 @@ pub fn encode_chunk(
 
     let mut hdr_metadata = Vec::new();
     let capture = opts.dynamic_hdr.any().then_some(&mut hdr_metadata);
-    match opts.scale {
-        Some(scale) => encode_scaled(
-            &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, scene, opts.crop, scale, capture,
-        )?,
-        None => encode_direct(
-            &encoder_bin, encoder_name, &encoder_args,
-            &mut vs, scene, opts.crop, capture,
-        )?,
+    let format = &vs.info.pixel_format;
+    let to_420 = (format.subsampling != PixelSubsampling::Yuv420)
+        .then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
+    let filters: Vec<String> = [
+        opts.deinterlace.map(|d| d.filter().to_string()),
+        to_420,
+        opts.scale.map(|(w, h)| format!("scale={w}:{h}:flags=lanczos")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if filters.is_empty() {
+        encode_direct(&encoder_bin, encoder_name, &encoder_args, &mut vs, scene, opts.crop, capture)?;
+    } else {
+        encode_filtered(&encoder_bin, encoder_name, &encoder_args, &mut vs, scene, opts.crop, &filters.join(","), capture)?;
     }
     ensure_complete(output_path, scene)?;
 
@@ -111,11 +118,24 @@ fn insert_hdr_metadata(
         );
     }
 
+    let mut unreadable: Vec<anyhow::Error> = Vec::new();
     let messages = frames
         .iter()
-        .map(|f| crate::hdr::t35_messages(f, carry, geometry))
+        .map(|f| match crate::hdr::t35_messages(f, carry, geometry) {
+            Err(e) if e.downcast_ref::<crate::hdr::UnreadableRpu>().is_some() => {
+                unreadable.push(e);
+                crate::hdr::t35_messages(&FrameHdrMetadata { dovi_rpu: None, ..f.clone() }, carry, geometry)
+            }
+            other => other,
+        })
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("HDR metadata of chunk {:05}", scene.index + 1))?;
+    if let Some(first) = unreadable.first() {
+        tracing::warn!(
+            "chunk {:05}: left out {} of {} Dolby Vision RPUs, which do not parse: {first:#}",
+            scene.index + 1, unreadable.len(), frames.len()
+        );
+    }
     if messages.iter().all(Vec::is_empty) {
         return Ok(());
     }
@@ -197,18 +217,18 @@ fn encode_direct(
     Ok(())
 }
 
-/// FFMS2 Y4M (cropped) piped through ffmpeg for scaling, then into the encoder.
-fn encode_scaled(
+/// FFMS2 Y4M (cropped) piped through ffmpeg for deinterlacing and scaling, then into the encoder.
+fn encode_filtered(
     encoder_bin: &OsStr,
     encoder_name: &str,
     encoder_args: &[String],
     vs: &mut VideoSource,
     scene: &SceneEntry,
     crop: Option<Crop>,
-    scale: (u32, u32),
+    vf: &str,
     hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
 ) -> Result<()> {
-    let mut ff = spawn_scaler(scale)?;
+    let mut ff = spawn_filter(vf, vs.info.fps_num, vs.info.fps_den)?;
 
     let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let ff_err_t = crate::ext::drain_text(ff.stderr.take());
@@ -233,45 +253,48 @@ fn encode_scaled(
     let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, crop, hdr_metadata);
     drop(ff_in);
 
-    let ff_status  = ff.wait().context("wait for ffmpeg scaler")?;
+    let ff_status  = ff.wait().context("wait for ffmpeg filter")?;
     let enc_status = child.wait().context("wait for encoder")?;
     let ff_stderr  = ff_err_t.join().unwrap_or_default();
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
-    // Encoder first: its death, even with exit 0, breaks the scaler's pipe, never the other way round.
+    // Encoder first: its death, even with exit 0, breaks the filter's pipe, never the other way round.
     let enc_failed = !enc_status.success() || (!ff_status.success() && !enc_stderr.contains("Encoding"));
     if enc_failed || !ff_status.success() {
         let err = if enc_failed {
             encoder_failure(enc_status, &enc_stderr, scene.index)
         } else {
-            tool_failure("ffmpeg scaler", ff_status, &ff_stderr, scene.index)
+            tool_failure("ffmpeg filter", ff_status, &ff_stderr, scene.index)
         };
         return Err(match feed_failure(write_res) {
             Some(cause) => err.context(format!("reading the source failed first: {cause}")),
             None => err,
         });
     }
-    write_res.context("write Y4M frames to ffmpeg scaler")?;
+    write_res.context("write Y4M frames to ffmpeg filter")?;
     Ok(())
 }
 
-fn spawn_scaler((w, h): (u32, u32)) -> Result<std::process::Child> {
-    let vf = format!("scale={w}:{h}:flags=lanczos");
+fn spawn_filter(vf: &str, fps_num: u32, fps_den: u32) -> Result<std::process::Child> {
     std::process::Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-i", "pipe:0"])
+        // Without -r, ffmpeg rounds a Y4M rate near 120 or 240 fps and drops or doubles frames.
+        .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-r", &format!("{fps_num}/{fps_den}"), "-i", "pipe:0"])
         // -strict -1: yuv4mpegpipe muxer needs it to write >8-bit Y4M.
-        .args(["-vf", &vf, "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
+        .args(["-vf", vf, "-fps_mode", "passthrough", "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("start ffmpeg scaler")
+        .context("start ffmpeg filter")
 }
 
 /// SvtAv1EncApp exits 0 on a full disk, leaving a short or empty file without a word.
 fn ensure_complete(chunk: &Path, scene: &SceneEntry) -> Result<()> {
     let frames = crate::av1::ivf_frame_count(chunk).unwrap_or(0);
-    if frames != scene.frame_count() {
+    if frames > scene.frame_count() {
+        bail!("chunk {:05} holds {frames} frames, more than its {}", scene.index + 1, scene.frame_count());
+    }
+    if frames < scene.frame_count() {
         return Err(anyhow::Error::new(crate::job::Transient).context(format!(
             "chunk {:05} holds {frames} of its {} frames - is the disk full?",
             scene.index + 1, scene.frame_count()
@@ -330,7 +353,26 @@ pub fn merged_encoder_args(config: &Config, opts: &EncodeOptions) -> Vec<String>
         args.extend_from_slice(&["--keyint".into(), keyint.to_string()]);
     }
 
+    let cpus = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| allowed_cpus(&s));
+    args.extend(single_cpu_args(config, cpus).into_iter().flatten());
     args
+}
+
+/// SvtAv1EncApp 4.2 segfaults on a single CPU unless it is given a level of parallelism.
+fn single_cpu_args(config: &Config, cpus: Option<usize>) -> Option<[String; 2]> {
+    (cpus == Some(1) && config.encoder == Some(Encoder::SvtAv1) && !config.encoder_params.contains_key("lp"))
+        .then(|| ["--lp".into(), "1".into()])
+}
+
+/// The affinity mask SVT-AV1 sizes itself by; unlike `available_parallelism`, no cgroup quota.
+fn allowed_cpus(proc_status: &str) -> Option<usize> {
+    let list = proc_status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?.trim();
+    list.split(',')
+        .map(|range| match range.split_once('-') {
+            Some((a, b)) => b.parse::<usize>().ok()?.checked_sub(a.parse().ok()?).map(|n| n + 1),
+            None => range.parse::<usize>().ok().map(|_| 1),
+        })
+        .sum()
 }
 
 /// Readable, and holding `expected_frames` when avet encoded it (None for `video = copy`).
@@ -369,14 +411,11 @@ fn video_packet_count(path: &Path) -> Result<u64> {
     #[derive(serde::Deserialize)]
     struct Stream { nb_read_packets: Option<String> }
 
-    // Walks the container, so the header-sized default would kill it on long encodes.
-    const TIMEOUT_SECS: u64 = 3600;
-
     let root: Root = crate::ext::ffprobe_json_with_timeout(
         &["-v", "error", "-select_streams", "v:0", "-count_packets",
           "-show_entries", "stream=nb_read_packets", "-of", "json"],
         path,
-        TIMEOUT_SECS,
+        crate::ext::whole_file_timeout(path, 3600),
     )
     .context("count the output's video frames")?;
 
@@ -400,6 +439,23 @@ mod tests {
 
     fn cfg(encoder_params: HashMap<String, toml::Value>) -> Config {
         Config { encoder: Some(Encoder::SvtAv1), encoder_params, ..Default::default() }
+    }
+
+    #[test]
+    fn svt_av1_gets_a_level_of_parallelism_on_a_single_cpu() {
+        assert!(single_cpu_args(&cfg(params(&[])), Some(1)).is_some());
+        assert!(single_cpu_args(&cfg(params(&[])), Some(2)).is_none());
+        assert!(single_cpu_args(&cfg(params(&[])), None).is_none());
+        assert!(single_cpu_args(&cfg(params(&[("lp", 3)])), Some(1)).is_none());
+        let hdr = Config { encoder: Some(Encoder::SvtAv1Hdr), ..Default::default() };
+        assert!(single_cpu_args(&hdr, Some(1)).is_none());
+
+        let status = |list: &str| format!("Name:\tavet\nCpus_allowed:\tff\nCpus_allowed_list:\t{list}\nMems_allowed:\t1\n");
+        assert_eq!(allowed_cpus(&status("0")), Some(1));
+        assert_eq!(allowed_cpus(&status("5")), Some(1));
+        assert_eq!(allowed_cpus(&status("0-23")), Some(24));
+        assert_eq!(allowed_cpus(&status("0,2,4-7")), Some(6));
+        assert_eq!(allowed_cpus("Name:\tavet\n"), None);
     }
 
     #[test]
@@ -471,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chunk_left_short_by_the_encoder_is_retried() {
+    fn a_chunk_left_short_is_retried_and_one_with_extra_frames_is_not() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("00001.ivf");
         std::fs::write(&path, b"").unwrap();
@@ -480,6 +536,16 @@ mod tests {
         let err = ensure_complete(&path, &scene).unwrap_err();
         assert!(err.downcast_ref::<crate::job::Transient>().is_some(), "got: {err:#}");
         assert!(format!("{err:#}").contains("0 of its 48 frames"), "got: {err:#}");
+
+        let mut ivf = b"DKIF\0\0\x20\0".to_vec();
+        ivf.resize(32, 0);
+        for pts in 0..49u64 {
+            ivf.extend_from_slice(&0u32.to_le_bytes());
+            ivf.extend_from_slice(&pts.to_le_bytes());
+        }
+        std::fs::write(&path, &ivf).unwrap();
+        let err = ensure_complete(&path, &scene).unwrap_err();
+        assert!(err.downcast_ref::<crate::job::Transient>().is_none(), "got: {err:#}");
     }
 
     #[test]

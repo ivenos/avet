@@ -27,7 +27,6 @@ env:
   RUST_VERSION: 1.98.1
   LINUXDEPLOY_VERSION: 1-alpha-20251107-1
 
-# Only the release job, which runs nothing but the upload, gets contents: write.
 permissions:
   contents: read
 
@@ -98,13 +97,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang cmake nasm yasm git curl ca-certificates \
+            build-essential clang cmake nasm git curl ca-certificates \
             pkg-config autoconf automake libtool meson ninja-build \
             zlib1g-dev libbz2-dev liblzma-dev \
             libopus-dev libmp3lame-dev libvorbis-dev libdav1d-dev \
             libvulkan-dev \
             mkvtoolnix \
-            file desktop-file-utils zsync \
+            file desktop-file-utils \
             fuse libfuse2
 
       - name: Install Rust ${{ env.RUST_VERSION }}
@@ -145,7 +144,7 @@ jobs:
 
       - name: Build FFmpeg
         # Ubuntu 24.04 ships 6.1, too old for Vship (AVCOL_SPC_YCGCO_RE), and the Docker
-        # image gets 8.1 from Alpine. Both artifacts run the same ffmpeg this way.
+        # image gets its FFmpeg from Alpine. Both artifacts run the same version this way.
         run: |
           git clone --depth 1 --branch "$FFMPEG_VERSION" \
             https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg
@@ -233,8 +232,6 @@ jobs:
           install -Dm644 /usr/share/doc/mkvtoolnix/copyright "$APPDIR/usr/share/doc/mkvtoolnix/copyright"
 
       - name: Build AppImage
-        # A release tag, not "continuous": the same avet tag has to keep producing the
-        # same artifact.
         run: |
           set -eux
           curl -fsSLO "https://github.com/linuxdeploy/linuxdeploy/releases/download/${LINUXDEPLOY_VERSION}/linuxdeploy-${{ matrix.arch }}.AppImage"

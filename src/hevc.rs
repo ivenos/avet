@@ -136,14 +136,21 @@ fn hdr10plus_by_access_unit(mut r: impl Read) -> Result<Vec<Option<Vec<u8>>>> {
     }
 }
 
-/// Carries each message on to the frames after it in display order, as a decoder that
-/// plays from the start would. FFmpeg's does so only until the next seek.
-fn in_display_order(pts: &[Option<i64>], units: Vec<Option<Vec<u8>>>) -> Result<Vec<Option<Arc<[u8]>>>> {
+#[derive(Deserialize)]
+struct Packet {
+    pts: Option<i64>,
+    #[serde(default)]
+    flags: String,
+}
+
+/// Carries each message on in display order, as a decoder playing from the start would; FFmpeg's
+/// does so only until the next seek. A picture an edit list discards is no frame in FFMS2.
+fn in_display_order(packets: &[Packet], units: Vec<Option<Vec<u8>>>) -> Result<Vec<Option<Arc<[u8]>>>> {
     ensure!(
-        pts.len() == units.len(),
-        "{} video packets but {} pictures in the bitstream", pts.len(), units.len()
+        packets.len() == units.len(),
+        "{} video packets but {} pictures in the bitstream", packets.len(), units.len()
     );
-    let pts = pts.iter().map(|p| p.context("a video packet has no timestamp")).collect::<Result<Vec<_>>>()?;
+    let pts = packets.iter().map(|p| p.pts.context("a video packet has no timestamp")).collect::<Result<Vec<_>>>()?;
     let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by_key(|&i| pts[i]);
 
@@ -151,29 +158,25 @@ fn in_display_order(pts: &[Option<i64>], units: Vec<Option<Vec<u8>>>) -> Result<
     let mut current = None;
     Ok(order
         .into_iter()
-        .map(|i| {
+        .filter_map(|i| {
             if let Some(m) = &units[i] {
                 current = Some(Arc::clone(m));
             }
-            current.clone()
+            (!packets[i].flags.contains('D')).then(|| current.clone())
         })
         .collect())
 }
 
-fn packet_pts(source: &Path) -> Result<Vec<Option<i64>>> {
+fn video_packets(source: &Path) -> Result<Vec<Packet>> {
     #[derive(Deserialize)]
     struct Probe { #[serde(default)] packets: Vec<Packet> }
-    #[derive(Deserialize)]
-    struct Packet { pts: Option<i64> }
 
-    // Demuxes the whole file.
-    const TIMEOUT_SECS: u64 = 3600;
     let probe: Probe = crate::ext::ffprobe_json_with_timeout(
-        &["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts", "-of", "json"],
+        &["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,flags", "-of", "json"],
         source,
-        TIMEOUT_SECS,
+        crate::ext::whole_file_timeout(source, 3600),
     )?;
-    Ok(probe.packets.into_iter().map(|p| p.pts).collect())
+    Ok(probe.packets)
 }
 
 fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
@@ -191,7 +194,7 @@ fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
     let err = crate::ext::drain_text(child.stderr.take());
 
     let (pts, units) = std::thread::scope(|s| {
-        let pts = s.spawn(|| packet_pts(source));
+        let pts = s.spawn(|| video_packets(source));
         let units = hdr10plus_by_access_unit(BufReader::new(stdout));
         (pts.join(), units)
     });
@@ -391,9 +394,8 @@ mod tests {
             order in Just((0..40).collect::<Vec<i64>>()).prop_shuffle(),
             messages in prop::collection::vec(prop::option::of(any::<u8>()), 40),
         ) {
-            let pts: Vec<Option<i64>> = order.iter().map(|&p| Some(p)).collect();
             let units: Vec<Option<Vec<u8>>> = messages.iter().map(|m| m.map(|b| vec![b])).collect();
-            let frames = in_display_order(&pts, units).unwrap();
+            let frames = in_display_order(&shown(&order), units).unwrap();
 
             let mut by_pts: Vec<(i64, Option<u8>)> = order.iter().copied().zip(messages.iter().copied()).collect();
             by_pts.sort();
@@ -438,14 +440,29 @@ mod tests {
     #[test]
     fn values_carry_on_in_display_order_not_decode_order() {
         // Decode order I0 P4 B2 B1 B3 I5, with a new message on P4 only.
-        let pts = [0, 4, 2, 1, 3, 5].map(Some);
         let units = vec![Some(vec![10]), Some(vec![40]), None, None, None, None];
-        let frames = in_display_order(&pts, units).unwrap();
+        let frames = in_display_order(&shown(&[0, 4, 2, 1, 3, 5]), units).unwrap();
         let values: Vec<Option<u8>> = frames.iter().map(|f| f.as_ref().map(|m| m[0])).collect();
         assert_eq!(values, [Some(10), Some(10), Some(10), Some(10), Some(40), Some(40)]);
 
-        assert!(in_display_order(&[Some(0)], vec![None, None]).is_err());
-        assert!(in_display_order(&[None], vec![None]).is_err());
+        assert!(in_display_order(&shown(&[0]), vec![None, None]).is_err());
+        assert!(in_display_order(&[Packet { pts: None, flags: String::new() }], vec![None]).is_err());
+    }
+
+    fn shown(pts: &[i64]) -> Vec<Packet> {
+        pts.iter().map(|&p| Packet { pts: Some(p), flags: "___".into() }).collect()
+    }
+
+    #[test]
+    fn a_picture_an_edit_list_discards_passes_its_message_on_but_is_no_frame() {
+        // Cut mid-GOP: I0 and B1 are decoded only to reach B2.
+        let mut packets = shown(&[0, 3, 1, 2, 4]);
+        packets[0].flags = "KD_".into();
+        packets[2].flags = "_D_".into();
+        let units = vec![Some(vec![10]), None, Some(vec![20]), None, Some(vec![40])];
+        let frames = in_display_order(&packets, units).unwrap();
+        let values: Vec<Option<u8>> = frames.iter().map(|f| f.as_ref().map(|m| m[0])).collect();
+        assert_eq!(values, [Some(20), Some(20), Some(40)]);
     }
 
     #[test]

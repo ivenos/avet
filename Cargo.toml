@@ -1,13 +1,9 @@
 [package]
 name = "avet"
-version = "0.0.0"          # placeholder - real version is the git tag (Docker/AppImage releases)
+version = "0.0.0"
 edition = "2024"
 license = "GPL-3.0-only"
-rust-version = "1.95"          # MSRV floor; the build toolchain (Docker/CI RUST_VERSION) can be newer
-
-[[bin]]
-name = "avet"
-path = "src/main.rs"
+rust-version = "1.95"
 
 [dependencies]
 serde              = { version = "1.0",   features = ["derive"] }
@@ -30,4 +26,3 @@ opt-level     = 3
 lto           = "fat"
 codegen-units = 1
 strip         = true
-panic         = "abort"

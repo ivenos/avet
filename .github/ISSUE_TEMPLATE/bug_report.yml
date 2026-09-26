@@ -35,7 +35,7 @@ body:
     id: logs
     attributes:
       label: Logs
-      description: Paste relevant output (run with `RUST_LOG=debug`).
+      description: The output of `docker logs` or of the AppImage in its terminal.
       render: text
 
   - type: input

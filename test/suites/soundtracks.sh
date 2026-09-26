@@ -15,7 +15,7 @@ run() { # NAME FIXTURE AUDIO_LINES
     run_avet "$I" "$O" "$O/test.mkv" 300 || fail "$1: no output"
 }
 
-# -- copy: every codec Matroska holds, the same samples at the same time ----------------------
+# copy: every codec Matroska holds, the same samples at the same time
 run copy audio_codecs.mkv
 assert_tracks_match "$O/test.mkv" "$SRC" a
 i=0
@@ -28,7 +28,7 @@ for codec in ac3 eac3 dts truehd mp2 mp3 aac alac flac wavpack tta vorbis opus p
     i=$((i + 1))
 done
 
-# -- decoded: Opus, or FLAC from a lossless source --------------------------------------------
+# decoded: Opus, or FLAC from a lossless source
 run encode audio_codecs.mkv "$OPUS"
 i=0
 for codec in opus opus opus flac opus opus opus flac flac flac flac opus opus flac; do
@@ -37,8 +37,11 @@ for codec in opus opus opus flac opus opus opus flac flac flac flac opus opus fl
     assert_av_sync "$O/test.mkv" "$SRC" "$i"
     i=$((i + 1))
 done
+run rate tone_32k.mkv "$OPUS"
+assert_audio_codec "$O/test.mkv" 0 opus
+assert_channel_frequencies "$O/test.mkv" 0 13000
 
-# -- Blu-ray and broadcast: LPCM and SMPTE 302M as PCM, a stream announced but never sent -----
+# Blu-ray and broadcast: LPCM and SMPTE 302M as PCM, a stream announced but never sent
 run m2ts audio_codecs.m2ts
 assert_log_contains "audio track 2 (ac3) has no sample rate or channel count - skipped"
 assert_audio_track_count "$O/test.mkv" 6
@@ -51,7 +54,7 @@ for track; do
     assert_av_sync "$O/test.mkv" "$SRC" "$1" "$2"
 done
 
-# -- MP4: AAC and MP3 lose their priming, which Matroska cannot mark, and stay in sync ---------
+# MP4: AAC and MP3 lose their priming, which Matroska cannot mark, and stay in sync
 run mp4 audio_codecs.mp4
 i=0
 for codec in aac aac alac mp3 ac3; do
@@ -67,7 +70,7 @@ for i in 0 1 2 3 4; do
     assert_av_sync "$O/test.mkv" "$SRC" "$i"
 done
 
-# -- Opus: each channel on its own speaker, with silence where the layout has more -------------
+# Opus: each channel on its own speaker, with silence where the layout has more
 run layouts tones_layouts.mov '[audio]\nmode = "encode"\ncodec = "libopus"\nbitrate = "256k"\n'
 set -- "0 300 500 0 90 0 0" \
        "1 300 500 700" \
@@ -79,20 +82,25 @@ set -- "0 300 500 0 90 0 0" \
        "7 300 500 700 90 1100 1300 1500" \
        "8 300 500 700 90 1500 1100 1300" \
        "9 300 500 700 0 1100 1300 1500 1700" \
-       "10 300 500 700 0 1500 1100 1300"
+       "10 300 500 700 0 1500 1100 1300" \
+       "13 300 500 0 90 700 0 0"
 for track; do
     assert_channel_frequencies "$O/test.mkv" "${track%% *}" "${track#* }"
 done
 # No Opus layout has front center pairs or a back center next to back left and right.
 assert_audio_channels "$O/test.mkv" 11 8
 assert_audio_channels "$O/test.mkv" 12 8
+for fixture in tones_714.mov tones_714_bed.mov; do
+    run "layouts_${fixture%.mov}" "$fixture" '[audio]\nmode = "encode"\ncodec = "libopus"\nbitrate = "256k"\n'
+    assert_channel_frequencies "$O/test.mkv" 0 "300 500 700 90 1100 1900 1300 1500"
+done
 
 run layouts_flac tones_layouts.mov '[audio]\nmode = "encode"\ncodec = "flac"\n'
 i=0
-while [ $i -lt 13 ]; do
+while [ $i -lt 14 ]; do
     assert_audio_samples_identical "$O/test.mkv" "$SRC" "$i"
     layout=$(stream_value "$SRC" "a:$i" stream=channel_layout)
-    [ -n "$layout" ] || fail "layouts: the source reports no layout for track $i"
+    [ "$layout" != - ] || fail "layouts: the source reports no layout for track $i"
     assert_stream_value "$O/test.mkv" "a:$i" stream=channel_layout "$layout"
     i=$((i + 1))
 done

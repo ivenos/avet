@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use dolby_vision::rpu::dovi_rpu::DoviRpu;
 use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlock;
 use dolby_vision::rpu::ConversionMode;
@@ -32,10 +32,6 @@ pub struct HdrInfo {
 }
 
 impl HdrInfo {
-    pub fn is_hdr(&self) -> bool {
-        !self.hdr_type.is_empty() && self.hdr_type != "SDR"
-    }
-
     pub fn encoder_args(&self) -> Vec<String> {
         let mut args = self.color_args();
         if let Some(ref cll) = self.content_light_level {
@@ -77,10 +73,10 @@ impl HdrInfo {
         self.dv_profile == Some(5) || self.dv_bl_compatibility == Some(0) || self.dv_rpu_profile == Some(0)
     }
 
-    /// HLG has no static metadata by design, also under Dolby Vision 8.4.
+    /// PQ only: HLG has no static metadata by design, and Dolby Vision 8.2 has an SDR base.
     pub fn missing_static_metadata(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-        if self.is_hdr() && self.transfer_characteristics != Some(18) {
+        if self.transfer_characteristics == Some(16) {
             if self.content_light_level.is_none() { missing.push("MaxCLL/MaxFALL"); }
             if self.mastering_display.is_none()   { missing.push("Mastering Display"); }
         }
@@ -267,9 +263,8 @@ pub struct Geometry {
     pub scale: Option<(u32, u32)>,
 }
 
-/// Country code, provider code and provider-oriented code of ST 2094-40. `hevc.rs` strips
-/// exactly these bytes on the way in, and FFMS2 hands out the payload from right after
-/// them, so the two sides only line up while there is one definition.
+/// ST 2094-40's T.35 header up to the application identifier. `hevc.rs` strips exactly these
+/// bytes, and FFMS2 hands out the payload from right after them.
 pub const HDR10PLUS_T35_HEADER: [u8; 6] = [0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
 
 /// ITU-T T.35 messages for one frame, country code first, in the order SVT-AV1 writes them.
@@ -288,12 +283,36 @@ pub fn t35_messages(frame: &FrameHdrMetadata, carry: DynamicHdr, geometry: Geome
     Ok(messages)
 }
 
+#[derive(Debug)]
+pub struct UnreadableRpu;
+
+impl std::fmt::Display for UnreadableRpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unreadable Dolby Vision RPU")
+    }
+}
+
+impl std::error::Error for UnreadableRpu {}
+
+thread_local! {
+    /// Keeps the panic hook quiet while a panic is caught on purpose, once per frame.
+    pub static EXPECTED_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn dovi_t35(nal_payload: &[u8], geometry: Geometry) -> Result<Vec<u8>> {
-    let mut rpu = DoviRpu::parse_unspec62_nalu(nal_payload).context("parse Dolby Vision RPU")?;
+    // dolby_vision 3.4 hits unreachable!() on extension block lengths FFmpeg accepts.
+    EXPECTED_PANIC.set(true);
+    let t35 = std::panic::catch_unwind(|| rpu_to_t35(nal_payload, geometry));
+    EXPECTED_PANIC.set(false);
+    t35.unwrap_or_else(|_| Err(anyhow::Error::new(UnreadableRpu)))
+}
+
+fn rpu_to_t35(nal_payload: &[u8], geometry: Geometry) -> Result<Vec<u8>> {
+    let mut rpu = DoviRpu::parse_unspec62_nalu(nal_payload).context(UnreadableRpu)?;
     match rpu.dovi_profile {
-        5 | 8 => {}
-        7 => rpu.convert_with_mode(ConversionMode::To81).context("convert Dolby Vision profile 7 to 8.1")?,
-        p => bail!("Dolby Vision profile {p} has no AV1 form"),
+        8 => {}
+        7 => rpu.convert_with_mode(ConversionMode::To81).context(UnreadableRpu)?,
+        p => return Err(anyhow::anyhow!("Dolby Vision profile {p} has no AV1 form").context(UnreadableRpu)),
     }
     let active_area = rpu.vdr_dm_data.as_ref().and_then(|dm| match dm.get_block(5) {
         Some(ExtMetadataBlock::Level5(l5)) => Some((
@@ -305,10 +324,10 @@ fn dovi_t35(nal_payload: &[u8], geometry: Geometry) -> Result<Vec<u8>> {
     if let Some(offsets) = active_area {
         let (left, right, top, bottom) = remap_active_area(offsets, geometry);
         if (left, right, top, bottom) != offsets {
-            rpu.set_active_area_offsets(left, right, top, bottom)?;
+            rpu.set_active_area_offsets(left, right, top, bottom).context(UnreadableRpu)?;
         }
     }
-    rpu.write_av1_rpu_metadata_obu_t35_complete().context("write Dolby Vision RPU for AV1")
+    rpu.write_av1_rpu_metadata_obu_t35_complete().context(UnreadableRpu)
 }
 
 fn remap_active_area((left, right, top, bottom): (u16, u16, u16, u16), g: Geometry) -> (u16, u16, u16, u16) {
@@ -353,10 +372,10 @@ pub fn mkvmerge_color_args(encoder_args: &[String], track: u32) -> Vec<String> {
     if let Some(v) = number("--color-primaries") {
         push("--color-primaries", v.to_string());
     }
-    if described {
-        // SVT-AV1: 0 studio, 1 full. Matroska: 1 broadcast, 2 full.
-        let range = if number("--color-range") == Some(1) { 2 } else { 1 };
-        push("--color-range", range.to_string());
+    // SVT-AV1: 0 studio, 1 full. Matroska: 1 broadcast, 2 full.
+    let full = number("--color-range") == Some(1);
+    if described || full {
+        push("--color-range", if full { "2" } else { "1" }.to_string());
     }
     // Horizontal, then vertical: 1 is co-sited, 2 is half a sample off.
     match number("--chroma-sample-position") {
@@ -525,13 +544,13 @@ mod tests {
     }
 
     #[test]
-    fn hdr_type_detection() {
-        let mut i = HdrInfo::default();
-        assert!(!i.is_hdr());
-        i.hdr_type = "SDR".into();
-        assert!(!i.is_hdr());
-        i.hdr_type = "HDR10".into();
-        assert!(i.is_hdr());
+    fn static_metadata_is_asked_for_pq_only() {
+        let pq = HdrInfo { hdr_type: "HDR10".into(), transfer_characteristics: Some(16), ..Default::default() };
+        assert_eq!(pq.missing_static_metadata(), ["MaxCLL/MaxFALL", "Mastering Display"]);
+        for tc in [Some(18), Some(1), None] {
+            let dv = HdrInfo { hdr_type: "Dolby Vision".into(), transfer_characteristics: tc, ..Default::default() };
+            assert!(dv.missing_static_metadata().is_empty(), "{tc:?}");
+        }
     }
 
     #[test]
@@ -601,6 +620,13 @@ mod tests {
         }}"#));
         assert!(rpu(0).ipt_base_layer());
         assert!(!rpu(1).ipt_base_layer());
+
+        let av1 = |compatibility: u32| info(&format!(r#"{{
+            "streams": [{{"color_transfer": "smpte2084", "side_data_list": [{{"side_data_type": "DOVI configuration record",
+                "dv_profile": 10, "dv_bl_signal_compatibility_id": {compatibility}}}]}}]
+        }}"#));
+        assert!(av1(0).ipt_base_layer());
+        assert!(!av1(1).ipt_base_layer());
         assert_eq!(rpu(1).hdr_type, "Dolby Vision");
 
         let rgb = info(r#"{"streams": [{"pix_fmt": "bgr0", "color_space": "gbr", "color_range": "pc"}]}"#);
@@ -705,6 +731,29 @@ mod tests {
     }
 
     #[test]
+    fn an_rpu_the_parser_rejects_or_panics_on_is_marked_unreadable() {
+        let dv = DynamicHdr { hdr10plus: false, dolby_vision: true };
+        let unreadable = |rpu: Vec<u8>| {
+            let frame = FrameHdrMetadata { dovi_rpu: Some(rpu), hdr10plus: None };
+            t35_messages(&frame, dv, geometry(None, None)).unwrap_err().downcast_ref::<UnreadableRpu>().is_some()
+        };
+
+        let mut bad_crc = ffms2_rpu((0, 0, 140, 140));
+        let mid = bad_crc.len() / 2;
+        bad_crc[mid] ^= 0x10;
+        assert!(unreadable(bad_crc));
+
+        let l10_len6: String = [
+            "19080908406136506f003ff801ffc00fffd0000008000006800000400000340000030200000301c95980000d7a8959be",
+            "7f3ac7095991328000004000000302000003000200000300070d8890c06182978c23814500000300698f96bfffc00000",
+            "0300000300000300180803e03854c0100a0000030000a0050024180fa000040fa00640c04120070a3c82103e02003851",
+            "ec1081f0100142c04400001ff00010193c823980",
+        ].concat();
+        let bytes = (0..l10_len6.len()).step_by(2).map(|i| u8::from_str_radix(&l10_len6[i..i + 2], 16).unwrap());
+        assert!(unreadable(bytes.collect()));
+    }
+
+    #[test]
     fn color_flags_become_mkvmerge_options() {
         let args: Vec<String> = [
             "--crf", "30",
@@ -731,6 +780,10 @@ mod tests {
         let full = ["--color-primaries", "1", "--color-range", "1"].map(String::from);
         assert!(mkvmerge_color_args(&full, 0).windows(2).any(|w| w == ["--color-range", "0:2"]));
         assert!(mkvmerge_color_args(&["--crf".to_string(), "30".to_string()], 0).is_empty());
+
+        let untagged_full = ["--color-range", "1"].map(String::from);
+        assert_eq!(mkvmerge_color_args(&untagged_full, 0), ["--color-range", "0:2"]);
+        assert!(mkvmerge_color_args(&["--color-range", "0"].map(String::from), 0).is_empty());
     }
 
     #[test]

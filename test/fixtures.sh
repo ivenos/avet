@@ -336,6 +336,20 @@ $FF -f lavfi -i "$(pattern 320x180 24000/1001 yuv420p)" \
     -frames:v 240 -map 0:v -map 1:a -shortest \
     -c:v libx264 -qp 0 -preset ultrafast -c:a flac pattern_ntsc.mkv
 
+echo "  pattern_interlaced.mkv, pattern_interlaced_bff.mkv, pattern_flagged.mkv, pattern_300fps.mkv"
+$FF -f lavfi -i "$(pattern 320x180 50 yuv420p)" -frames:v 120 -vf "tinterlace=mode=interleave_top,setfield=tff" \
+    -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 pattern_interlaced.mkv
+$FF -f lavfi -i "$(pattern 320x180 50 yuv420p)" -frames:v 120 -vf "tinterlace=mode=interleave_bottom,setfield=bff" \
+    -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts bff=1 pattern_interlaced_bff.mkv
+$FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -frames:v 120 \
+    -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 pattern_flagged.mkv
+$FF -f lavfi -i "$(pattern 320x180 300 yuv420p)" -frames:v 300 \
+    -c:v libx264 -qp 0 -preset ultrafast pattern_300fps.mkv
+
+echo "  pattern_119.mkv"
+$FF -f lavfi -i "$(pattern 160x90 120000/1001 yuv420p)" -frames:v 1199 \
+    -c:v libx264 -qp 0 -preset ultrafast pattern_119.mkv
+
 echo "  pattern_rot90.mp4, pattern_rot270.mp4"
 $FF -i pattern_av.mkv -map 0:v -c:v copy pattern_plain.mp4
 $FF -display_rotation 90 -i pattern_plain.mp4 -c copy pattern_rot90.mp4
@@ -503,8 +517,21 @@ quad(side) 300 500 1300 1500
 hexagonal 300 500 700 1100 1300 1500
 7.1(wide) 300 500 700 90 1100 1300 1500 1700
 octagonal 300 500 700 1100 1300 1500 1700 1900
+FL+FR+LFE+BC 300 500 90 700
 LAYOUTS
 $FF -i pattern.mkv $inputs -map 0:v -c:v copy $maps -c:a pcm_s16le -frames:v 48 tones_layouts.mov
+
+echo "  tones_714.mov, tones_714_bed.mov"
+for name in "714:0 0 700 90 0 0 1300 1500 300 500 1100 1900" "714_bed:300 500 700 90 1100 1900 1300 1500 0 0 0 0"; do
+    exprs=""
+    for f in ${name#*:}; do exprs="$exprs${exprs:+|}0.4*sin(2*PI*$f*t)"; done
+    $FF -i pattern.mkv -f lavfi -i "aevalsrc=exprs=$exprs:c=7.1.4:s=48000:d=2" \
+        -map 0:v -map 1:a -c:v copy -c:a pcm_s16le -frames:v 48 "tones_${name%%:*}.mov"
+done
+
+echo "  tone_32k.mkv"
+$FF -i pattern.mkv -f lavfi -i "aevalsrc=exprs=0.4*sin(2*PI*13000*t):c=mono:s=32000:d=2" \
+    -map 0:v -map 1:a -c:v copy -c:a aac -b:a 128k -cutoff 16000 -frames:v 48 tone_32k.mkv
 
 echo "  subs_bitmap.{mkv,m2ts}, subs_dvb.ts, subs_text.mp4, subs_ttml.mp4"
 $FF -copyts -i pattern.mkv -i eng.sup -i ger.sup -map 0:v -map 0:a:0 -map 1 -map 2 -map 1 -c:v copy -c:a copy \
@@ -529,13 +556,26 @@ $FF -f lavfi -i "$(pattern 320x180 24 yuv420p),setparams=range=pc:color_primarie
     -frames:v 48 -c:v libx264 -qp 0 -preset ultrafast color_full8.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuvj420p)" -frames:v 48 -c:v mjpeg -q:v 1 color_center.avi
 
+# Joined mid-GOP like a recording: FFMS2 counts the frames before the first keyframe, ffmpeg drops them.
+echo "  cut_gop.ts"
+$FF -f lavfi -i "smptebars=size=320x180:rate=25" -f lavfi -i "rgbtestsrc=size=320x180:rate=25" \
+    -f lavfi -i "testsrc2=size=320x180:rate=25" -f lavfi -i "yuvtestsrc=size=320x180:rate=25" \
+    -filter_complex "[0]trim=end_frame=75[a];[1]trim=end_frame=75[b];[2]trim=end_frame=75[c];[3]trim=end_frame=75[d];[a][b][c][d]concat=n=4,format=yuv420p" \
+    -c:v libx264 -preset veryfast -g 50 -bf 3 -sc_threshold 0 -f mpegts gop.ts
+pos=$(ffprobe -v error -select_streams v:0 -show_entries packet=pos -of default=nw=1:nk=1 gop.ts | sed -n 80p)
+tail -c +$((pos / 188 * 188 + 1)) gop.ts > cut_gop.ts
+
+echo "  lang_multi.ts, lang_video.mkv"
+$FF -i subs_dvb.ts -map 0 -c copy -metadata:s:a:0 language=ger,eng -metadata:s:s:0 language=ger,ger lang_multi.ts
+$FF -i pattern.mkv -map 0 -c copy -metadata:s:v:0 language=english lang_video.mkv
+
 echo "  one_frame.mkv, audio_only.mkv"
 $FF -f lavfi -i "$(pattern 320x180 24 yuv420p)" -frames:v 1 -c:v libx264 -qp 0 -preset ultrafast one_picture.mkv
 $FF -i one_picture.mkv -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=3" \
     -map 0:v -map 1:a -c:v copy -c:a flac one_frame.mkv
 $FF -i pattern.mkv -map 0:a:0 -c:a copy audio_only.mkv
 
-rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv
+rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts
 GEN
 
 GEN_RC=$?

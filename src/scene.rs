@@ -99,7 +99,7 @@ pub fn detect(
         return Err(crate::ext::tool_error("ffmpeg during scene detection", status, &ffmpeg_stderr));
     }
     if !ffmpeg_stderr.is_empty() {
-        tracing::warn!("ffmpeg scene detection: {}", ffmpeg_stderr.trim());
+        tracing::warn!("ffmpeg scene detection: {}", crate::ext::tail(&ffmpeg_stderr, 20));
     }
 
     let scenes = build_scene_entries(&results.scene_changes, results.frame_count.max(1));

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -65,7 +65,7 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
         .into_iter()
         .filter(|job| match failed_marker(&job.output_dir(output_dir), &job.source_file) {
             Some(marker) => {
-                tracing::warn!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display());
+                report(format!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display()));
                 false
             }
             None => true,
@@ -95,18 +95,27 @@ fn drop_name_collisions(jobs: Vec<Job>) -> Vec<Job> {
             .filter(|j| name(j) == *c)
             .map(|j| j.source_file.display().to_string())
             .collect();
-        tracing::error!(
+        report(format!(
             "[{}] skipping {} files that share this name - they would overwrite each \
              other's output: {}",
             c.display(),
             paths.len(),
             paths.join(", ")
-        );
+        ));
     }
 
     jobs.into_iter()
         .filter(|j| !colliding.contains(&name(j)))
         .collect()
+}
+
+fn report(message: String) {
+    static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    if SEEN.lock().map_or(true, |mut seen| seen.insert(message.clone())) {
+        tracing::warn!("{message}");
+    } else {
+        tracing::debug!("{message}");
+    }
 }
 
 fn find_video_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {

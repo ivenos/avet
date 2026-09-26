@@ -28,7 +28,7 @@ cargo test --locked           # unit tests
 ```
 
 - The integration suites test the binary inside the image. Rebuild it after a change.
-- `run.sh` builds the avet image and `test/tools.Dockerfile`, which adds `dovi-tool` and `hdr10plus-tool` for the fixtures in `test/fixtures.sh`.
+- `run.sh` builds the avet image and `test/tools.Dockerfile`, which adds `dovi-tool`, `hdr10plus-tool` and `mkvtoolnix` for the fixtures in `test/fixtures.sh`.
 - Assertions use the image's own ffmpeg and mkvtoolnix. `test/suites/selftest.sh` checks that every assertion fails on a broken file.
 - A suite takes its scratch directory from `test_workdir`, ends with `test_done` and sets no EXIT trap of its own.
 - `test/local/` is gitignored for trying the image on your own samples.
@@ -38,16 +38,16 @@ cargo test --locked           # unit tests
 - Errors are `anyhow::Result` with a `.context()` naming the failed step. A failed job must never stop the scan loop.
 - Failures that clear on their own carry `job::Transient` and are retried. Everything else writes a `.failed` marker.
 - Run external tools through `ext::output_with_timeout` and report a non-zero exit with `ext::tool_error`, which classifies a tool stopped from outside and a full disk as transient.
-- Tools fed through a pipe (the encoders, the scaler, scene detection, the HDR10+ scan and CAMBI) drain their stderr with `ext::drain_text`.
+- Tools fed through a pipe (the encoders, the ffmpeg filter stage, scene detection, the HDR10+ scan and CAMBI) drain their stderr with `ext::drain_text`.
 - ffmpeg calls on the source name their stream: `-map 0:v:0`, `-map 0:a:<n>`.
 - Write output and state files under a scratch name, then rename them into place.
-- Comments only for what the code cannot say, in one or two lines.
+- A comment only earns its place when it records something the code cannot. One or two lines.
 - Rust 2024, no formatter in CI: match the file you edit.
 
 ## External tools
 
 - `ext::external_bin` looks for a tool next to the avet binary first, then on `PATH`.
-- A new tool needs the call site, the runtime stage of the `Dockerfile`, the AppDir step in `.github/workflows/appimage.yml`, the "every bundled tool starts" step in both workflows, and its license texts in both artifacts.
+- A new tool needs the call site, the runtime stage of the `Dockerfile`, the AppDir step in `.github/workflows/appimage.yml`, the "every bundled tool starts" step in both workflows, its license texts in both artifacts, and its entry in the tool list under Build and in the README's license section.
 
 ## Configuration keys
 

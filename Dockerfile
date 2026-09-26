@@ -12,7 +12,7 @@ FROM alpine:3.24 AS base
 
 ARG TARGETARCH
 
-# clang + vulkan build FFVship; nasm/yasm are x86-only, arm64 uses NEON.
+# clang + vulkan build FFVship; nasm is x86-only, arm64 uses NEON.
 RUN apk add --no-cache \
         build-base \
         clang \
@@ -30,7 +30,7 @@ RUN apk add --no-cache \
         vulkan-loader-dev \
         zlib-dev \
         ca-certificates && \
-    [ "$TARGETARCH" != "amd64" ] || apk add --no-cache nasm yasm
+    if [ "$TARGETARCH" = "amd64" ]; then apk add --no-cache nasm; fi
 
 FROM base AS svt-av1
 
@@ -105,7 +105,7 @@ FROM base AS vmaf
 
 ARG VMAF_VERSION
 
-# Without the VMAF models busybox xxd suffices; v3.2.0's tests break on vcs_version.h.
+# Without the VMAF models busybox xxd suffices.
 RUN git clone --depth 1 --branch ${VMAF_VERSION} \
         https://github.com/Netflix/vmaf.git /vmaf && \
     meson setup /vmaf/libvmaf/build /vmaf/libvmaf \
@@ -157,7 +157,7 @@ RUN apk add --no-cache \
         libgcc \
         vulkan-loader \
         mesa-vulkan-swrast && \
-    [ "$TARGETARCH" != "amd64" ] || apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati
+    if [ "$TARGETARCH" = "amd64" ]; then apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati; fi
 
 # Alpine's packages carry only an SPDX identifier, so the texts come from the same release.
 RUN version() { apk list -I "$1" | sed -n "s/^$1-\([0-9.]*\)-r[0-9]* .*/\1/p"; } && \
@@ -172,7 +172,6 @@ COPY --from=svt-av1     /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1Enc
 COPY --from=svt-av1-hdr /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=ffms2       /usr/local/bin/ffmsindex        /usr/local/bin/ffmsindex
 COPY --from=builder     /avet                           /usr/local/bin/avet
-# Not in Alpine's package manager.
 COPY --from=ffms2       /usr/local/lib/libffms2.so*     /usr/local/lib/
 COPY --from=vship       /usr/local/bin/FFVship          /usr/local/bin/FFVship
 COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/

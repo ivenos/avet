@@ -25,7 +25,7 @@ avet is an AV1 encoding service that watches a folder, splits each video at its 
 - [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) per profile
 - Resumes from the last finished chunk after a restart
 - Target quality: a CRF per chunk from a [CVVDP](https://codeberg.org/Line-fr/Vship) score, with optional [CAMBI](https://github.com/Netflix/vmaf/blob/master/resource/doc/cambi.md) banding limits (GPU required)
-- HDR10, HLG, HDR10+ and Dolby Vision profiles 5, 7 and 8
+- HDR10, HLG, HDR10+ and Dolby Vision profiles 7 and 8
 - Automatic crop, downscale and keyframe interval
 - Per-track audio and subtitle rules with language filters
 
@@ -55,7 +55,7 @@ The arm64 image has no hardware Vulkan driver.
 
 ### AppImage
 
-Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest) and run it. It watches `input/` and `output/` in the working directory. It needs glibc 2.39 or newer and FUSE; without FUSE, run it with `--appimage-extract-and-run`.
+Download the AppImage for your architecture from the [latest release](https://github.com/ivenos/avet/releases/latest), make it executable with `chmod +x` and run it. It watches `input/` and `output/` in the working directory. It needs glibc 2.39 or newer and FUSE; without FUSE, run it with `--appimage-extract-and-run`.
 
 ## Usage
 
@@ -81,7 +81,7 @@ output/
 ```
 
 - Supported extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. Only the first video track is encoded.
-- Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Aspect ratio, rotation, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
+- Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Interlaced video is deinterlaced with bwdif at its frame rate, when the stream is flagged interlaced and ffmpeg's idet finds its frames combed. Aspect ratio, rotation, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
 - A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
 - Output files keep the source's name with `.mkv`, so queued files that would end up at the same output path, such as `film.mkv` and `film.mp4`, wait until one is renamed.
@@ -135,7 +135,7 @@ language_whitelist = ["eng", "jpn"]
 
 ### `[encoder_params]`
 
-Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `tbr` or an `rc` other than `0`.
+Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `tbr`, an `rc` other than `0`, `color-primaries`, `transfer-characteristics`, `matrix-coefficients` or `color-range`.
 
 ### `[target_quality]`
 
@@ -169,10 +169,10 @@ jod = 9.5
 | Key | Default | Description |
 |---|---|---|
 | `video` | `"encode"` | `"copy"` passes the video through and only processes audio and subtitles |
-| `dv` | `false` | Carry Dolby Vision from an HEVC source into the output as AV1 profile 10, converting profile 7 to 8.1 first. Not with `bit_depth = 8`. Without it, Dolby Vision 7 and 8 keep only their base layer, and Dolby Vision without one, such as profile 5, is refused |
+| `dv` | `false` | Carry Dolby Vision from an HEVC source into the output as AV1 profile 10, converting profile 7 to 8.1 first. Not with `bit_depth = 8`. Without it, and for other profiles, only the base layer is kept. Dolby Vision whose base layer is no picture on its own, such as profile 5, is refused either way |
 | `crop` | `false` | Remove black bars |
 | `keyint` | `false` | Keyframe every ~5 s from the frame rate, unless `keyint` is in `[encoder_params]` |
-| `scale` | - | Maximum output height, at least `64`. Taller sources are scaled down with Lanczos |
+| `scale` | - | Maximum output height before rotation, at least `64`. Taller sources are scaled down with Lanczos |
 | `bit_depth` | - | Encoder input bit depth, `8` or `10`. Unset keeps the source depth, capped at 10 |
 | `keep_temp` | `false` | Keep `.avet_<name>/` after a finished encode |
 
@@ -187,9 +187,10 @@ jod = 9.5
 | `language_whitelist` | `[]` | Keep only these ISO 639-2 languages. Empty keeps all |
 
 - The whitelist matches both spellings (`deu` and `ger`). Tracks without a language or tagged `und` are always kept.
+- Language tags keep their region and script, such as `pt-BR` or `zh-Hant`.
 - Re-encoded tracks get the codec added to their title, e.g. `English 5.1 (Opus)`.
 - Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM. A track ffmpeg can neither copy into Matroska nor decode, such as AC-4, is left out with a warning.
-- Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1. A layout none of them holds, such as 7.1(wide) or 7.1.4, is mixed to the one with its channel count, at most 7.1.
+- Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1, and the bitrate of that layout. A layout none of them holds, such as 7.1(wide) or 7.1.4, is mixed to the one with its channel count, at most 7.1.
 
 `[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.
 
@@ -233,4 +234,4 @@ The Docker image and the AppImage bundle third-party software, each under its ow
 
 The license texts are in `/usr/share/licenses/` in the image and in `usr/share/licenses/` and `usr/share/doc/` inside the AppImage. The image's other Alpine packages name their licenses in the apk database.
 
-avet is not affiliated with or endorsed by any of them. "Dolby Vision" is a trademark of Dolby Laboratories Licensing Corporation, "HDR10+" is a trademark of HDR10+ Technologies, LLC.
+avet is not affiliated with or endorsed by any of them, Dolby Laboratories or HDR10+ Technologies. "Dolby Vision" is a trademark of Dolby Laboratories Licensing Corporation, "HDR10+" is a trademark of HDR10+ Technologies, LLC.

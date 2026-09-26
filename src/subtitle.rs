@@ -76,7 +76,7 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
 
     // Filtering every track away is a plausible profile, but rarely the intent: a
     // whitelist in ISO 639-1 ("en") never matches a three-letter tag.
-    if total > 0 && plan.extract.is_empty() && plan.from_source.is_empty() {
+    if !config.language_whitelist.is_empty() && total > 0 && plan.extract.is_empty() && plan.from_source.is_empty() {
         tracing::warn!(
             "subtitles: the language whitelist {:?} matched none of the {total} subtitle track(s) - the output has none",
             config.language_whitelist

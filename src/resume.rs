@@ -171,6 +171,7 @@ pub struct TempDir {
     pub failed_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
+    pub interlace_cache: PathBuf,
     pub tracks_path: PathBuf,
     pub remux_path: PathBuf,
     pub video_path: PathBuf,
@@ -191,6 +192,7 @@ impl TempDir {
         let failed_path      = path.join(".failed");
         let chunks_dir       = path.join("chunks");
         let crop_cache       = path.join("crop.cache");
+        let interlace_cache  = path.join("interlace.cache");
         let tracks_path      = path.join("tracks.mkv");
         let remux_path       = path.join("source.mkv");
         let video_path       = path.join("video.ivf");
@@ -199,7 +201,7 @@ impl TempDir {
         let hdr10plus_path   = path.join("hdr10plus.json");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
-            fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache,
+            fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache, interlace_cache,
             tracks_path, remux_path, video_path, mux_path, timestamps_path, hdr10plus_path,
         }
     }

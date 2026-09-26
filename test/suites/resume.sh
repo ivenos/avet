@@ -26,10 +26,15 @@ assert_intact() {
 }
 
 killed_after() { # LOG_PATTERN
+    TEST_CPUS=0.5
     run_avet_timed "$I" "$O" 180 "$1"
+    TEST_CPUS=
     assert_log_contains "$1"
     assert_file_not_exists "$O/test.mkv"
     [ -s "$O/.avet_test/done.json" ] || fail "no chunk was finished before the kill"
+    total=$(printf '%s\n' "$RUN_LOGS" | sed -n 's/.*\] \([0-9]*\) chunks$/\1/p' | tail -n 1)
+    finished=$(grep -o '"[0-9]\{5\}"' "$O/.avet_test/done.json" | wc -l)
+    [ "$finished" -lt "${total:-0}" ] || fail "the kill came after $finished of ${total:-?} chunks, not mid-encode"
 }
 
 # SVT-AV1 is deterministic, so a resumed encode has to match an uninterrupted one bit for bit.
@@ -37,7 +42,7 @@ setup clean 40
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "clean: no output"
 CLEAN="$O/test.mkv"
 
-# -- killed mid-encode: the next run keeps what was done and finishes the rest ---------
+# killed mid-encode: the next run keeps what was done and finishes the rest
 setup plain 40
 killed_after "chunk 2/"
 TEST_RUST_LOG=debug run_avet "$I" "$O" "$O/test.mkv" 300 || fail "plain: no output after the restart"
@@ -45,7 +50,7 @@ assert_log_contains "already done"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
-# -- a finished chunk cut short and half-written leftovers do not reach the output ------
+# a finished chunk cut short and half-written leftovers do not reach the output
 setup damaged 40
 killed_after "chunk 3/"
 chunk=$(grep -o '"[0-9]\{5\}"' "$O/.avet_test/done.json" | head -n 1 | tr -d '"')
@@ -59,7 +64,7 @@ assert_log_contains "indexing again"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
-# -- a profile change between the runs throws the old chunks away ----------------------
+# a profile change between the runs throws the old chunks away
 setup changed 45
 killed_after "chunk 2/"
 write_profile 40

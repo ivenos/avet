@@ -7,6 +7,7 @@ mod ext;
 mod ffms2;
 mod hdr;
 mod hevc;
+mod interlace;
 mod job;
 mod mkv;
 mod resume;
@@ -27,6 +28,12 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
     init_logging();
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !hdr::EXPECTED_PANIC.get() {
+            default_hook(info);
+        }
+    }));
 
     let input_dir = env_path("INPUT_DIR", "./input");
     let output_dir = env_path("OUTPUT_DIR", "./output");
@@ -63,7 +70,9 @@ fn main() -> Result<()> {
                     }
                     let stem = j.stem();
 
-                    if let Err(e) = job::run(j, &ctx) {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run(j, &ctx)))
+                        .unwrap_or_else(|panic| Err(anyhow::anyhow!("avet panicked: {}", panic_message(&*panic))));
+                    if let Err(e) = result {
                         job::handle_failure(j, &ctx, stem, &e, shutdown.load(Ordering::Relaxed));
                     }
                     if shutdown.load(Ordering::Relaxed) {
@@ -111,13 +120,24 @@ fn shutdown_signal() -> Arc<AtomicBool> {
     flag
 }
 
+pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
+}
+
 fn init_logging() {
+    use std::io::IsTerminal;
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
 }
 

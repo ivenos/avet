@@ -89,6 +89,10 @@ pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<O
     }
 }
 
+pub fn whole_file_timeout(path: &Path, base: u64) -> u64 {
+    base + std::fs::metadata(path).map_or(0, |m| m.len() / 10_000_000)
+}
+
 /// What the tool said before it wedged, as a suffix for the timeout error. Polled rather
 /// than joined: a grandchild holding the pipe open would block the join forever.
 fn last_output(handle: JoinHandle<Vec<u8>>) -> String {
@@ -107,8 +111,14 @@ fn last_output(handle: JoinHandle<Vec<u8>>) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let tail: Vec<&str> = text.lines().rev().take(LINES).collect();
-    format!(":\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    format!(":\n{}", tail(text, LINES))
+}
+
+pub fn tail(text: &str, lines: usize) -> String {
+    let all: Vec<&str> = text.trim().lines().collect();
+    let skipped = all.len().saturating_sub(lines);
+    let kept = all[skipped..].join("\n");
+    if skipped == 0 { kept } else { format!("[{skipped} earlier lines]\n{kept}") }
 }
 
 fn wait_briefly(child: &mut std::process::Child) -> bool {
@@ -125,7 +135,7 @@ fn wait_briefly(child: &mut std::process::Child) -> bool {
 /// The error for a tool that ran and failed. A tool stopped from outside (the OOM killer,
 /// Ctrl-C) and a full disk both clear on their own; a tool that crashed does not.
 pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -> anyhow::Error {
-    let err = anyhow::anyhow!("{what} failed:\n{}", message.trim());
+    let err = anyhow::anyhow!("{what} failed:\n{}", tail(message, 40));
     if stopped_from_outside(status) || out_of_space(message) {
         err.context(crate::job::Transient)
     } else {
@@ -142,8 +152,9 @@ fn stopped_from_outside(status: std::process::ExitStatus) -> bool {
     matches!(status.signal(), Some(SIGHUP | SIGINT | SIGKILL | SIGTERM))
 }
 
+/// mkvmerge words it "No space left to write to".
 fn out_of_space(message: &str) -> bool {
-    ["No space left on device", "ENOSPC", "Disk quota exceeded", "EDQUOT"]
+    ["No space left", "ENOSPC", "Disk quota exceeded", "EDQUOT"]
         .iter()
         .any(|m| message.contains(m))
 }
@@ -253,9 +264,23 @@ mod tests {
         assert!(full.downcast_ref::<crate::job::Transient>().is_some(), "got: {full:#}");
         let quota = tool_error("mkvmerge", out.status, "Error: Disk quota exceeded");
         assert!(quota.downcast_ref::<crate::job::Transient>().is_some(), "got: {quota:#}");
+        let mkvmerge = tool_error("mkvmerge", out.status, "Error: An exception occurred when writing the \
+            destination file. The drive may be full. Exception details: reading from/writing to the file \
+            error; No space left to write to");
+        assert!(mkvmerge.downcast_ref::<crate::job::Transient>().is_some(), "got: {mkvmerge:#}");
 
         let broken = tool_error("ffmpeg", out.status, "Invalid data found when processing input");
         assert!(broken.downcast_ref::<crate::job::Transient>().is_none(), "got: {broken:#}");
+    }
+
+    #[test]
+    fn a_tool_that_complains_about_every_packet_is_cut_to_its_last_lines() {
+        let out = output_with_timeout(Command::new("sh").args(["-c", "exit 1"]), 30, "sh").unwrap();
+        let noise: String = (1..=5000).map(|i| format!("corrupt packet {i}\n")).collect();
+        let err = format!("{:#}", tool_error("ffmpeg", out.status, &noise));
+        assert!(err.contains("[4960 earlier lines]") && err.ends_with("corrupt packet 5000"), "got: {err}");
+        assert_eq!(err.lines().count(), 42);
+        assert_eq!(tail("one\ntwo\n", 40), "one\ntwo");
     }
 
     #[test]

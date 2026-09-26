@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -32,7 +32,33 @@ const NAMED_LAYOUTS: &[(&str, &str)] = &[
     ("7.1", "FL+FR+FC+LFE+BL+BR+SL+SR"), ("7.1(wide)", "FL+FR+FC+LFE+BL+BR+FLC+FRC"),
     ("7.1(wide-side)", "FL+FR+FC+LFE+FLC+FRC+SL+SR"), ("5.1.2", "FL+FR+FC+LFE+SL+SR+TFL+TFR"),
     ("5.1.2(back)", "FL+FR+FC+LFE+BL+BR+TFL+TFR"), ("octagonal", "FL+FR+FC+BL+BR+BC+SL+SR"),
-    ("cube", "FL+FR+BL+BR+TFL+TFR+TBL+TBR"), ("downmix", "DL+DR"),
+    ("cube", "FL+FR+BL+BR+TFL+TFR+TBL+TBR"), ("5.1.4", "FL+FR+FC+LFE+SL+SR+TFL+TFR+TBL+TBR"),
+    ("7.1.2", "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR"), ("7.1.4", "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR"),
+    ("7.2.3", "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBC+LFE2"),
+    ("9.1.4", "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR"),
+    ("9.1.6", "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR+TSL+TSR"),
+    ("hexadecagonal", "FL+FR+FC+BL+BR+BC+SL+SR+TFL+TFC+TFR+TBL+TBC+TBR+WL+WR"),
+    ("binaural", "BIL+BIR"), ("downmix", "DL+DR"),
+    ("22.2", "FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR+LFE2+TSL+TSR+BFC+BFL+BFR"),
+];
+
+/// Channels swresample drops from a downmix, and where each goes instead, by preference.
+const FOLDS: &[(&str, &[&[&str]])] = &[
+    ("TBL", &[&["BL"], &["SL"], &["FL"]]),
+    ("TBR", &[&["BR"], &["SR"], &["FR"]]),
+    ("TBC", &[&["BC"], &["BL", "BR"], &["SL", "SR"], &["FL", "FR"]]),
+    ("TSL", &[&["SL"], &["BL"], &["FL"]]),
+    ("TSR", &[&["SR"], &["BR"], &["FR"]]),
+    ("TC", &[&["FC"], &["FL", "FR"]]),
+    ("TFC", &[&["FC"], &["FL", "FR"]]),
+    ("LFE2", &[&["LFE"]]),
+    ("WL", &[&["FL"]]),
+    ("WR", &[&["FR"]]),
+    ("SDL", &[&["SL"], &["BL"], &["FL"]]),
+    ("SDR", &[&["SR"], &["BR"], &["FR"]]),
+    ("BFC", &[&["FC"], &["FL", "FR"]]),
+    ("BFL", &[&["FL"]]),
+    ("BFR", &[&["FR"]]),
 ];
 
 #[derive(Deserialize)]
@@ -91,13 +117,17 @@ struct AudioCodecs {
 static AUDIO_CODECS: OnceLock<AudioCodecs> = OnceLock::new();
 
 fn audio_codecs() -> &'static AudioCodecs {
-    AUDIO_CODECS.get_or_init(|| match probe_audio_codecs() {
-        Ok(codecs) => codecs,
+    static FALLBACK: OnceLock<AudioCodecs> = OnceLock::new();
+    if let Some(codecs) = AUDIO_CODECS.get() {
+        return codecs;
+    }
+    match probe_audio_codecs() {
+        Ok(codecs) => AUDIO_CODECS.get_or_init(|| codecs),
         Err(e) => {
             tracing::warn!("ffmpeg -codecs query failed ({e:#}); using built-in lossless list");
-            AudioCodecs { lossless: fallback_lossless_codecs(), decodable: None }
+            FALLBACK.get_or_init(|| AudioCodecs { lossless: fallback_lossless_codecs(), decodable: None })
         }
-    })
+    }
 }
 
 fn probe_audio_codecs() -> Result<AudioCodecs> {
@@ -105,7 +135,7 @@ fn probe_audio_codecs() -> Result<AudioCodecs> {
     cmd.args(["-hide_banner", "-codecs"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -codecs")?;
     if !out.status.success() {
-        bail!("ffmpeg -codecs exited with failure");
+        return Err(crate::ext::tool_error("ffmpeg -codecs", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
     Ok(parse_audio_codecs(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -130,19 +160,20 @@ fn parse_audio_codecs(stdout: &str) -> AudioCodecs {
     AudioCodecs { lossless, decodable: Some(decodable) }
 }
 
-/// Audio encoder names ffmpeg offers, queried once from `ffmpeg -encoders`.
-static AUDIO_ENCODERS: OnceLock<Option<HashSet<String>>> = OnceLock::new();
+/// Audio encoder names ffmpeg offers, from the first successful `ffmpeg -encoders`.
+static AUDIO_ENCODERS: OnceLock<HashSet<String>> = OnceLock::new();
 
 fn audio_encoders() -> Option<&'static HashSet<String>> {
-    AUDIO_ENCODERS
-        .get_or_init(|| match probe_audio_encoders() {
-            Ok(set) => Some(set),
-            Err(e) => {
-                tracing::warn!("ffmpeg -encoders query failed ({e:#}); codec names go unchecked");
-                None
-            }
-        })
-        .as_ref()
+    if let Some(set) = AUDIO_ENCODERS.get() {
+        return Some(set);
+    }
+    match probe_audio_encoders() {
+        Ok(set) => Some(AUDIO_ENCODERS.get_or_init(|| set)),
+        Err(e) => {
+            tracing::warn!("ffmpeg -encoders query failed ({e:#}); codec names go unchecked");
+            None
+        }
+    }
 }
 
 fn probe_audio_encoders() -> Result<HashSet<String>> {
@@ -150,7 +181,7 @@ fn probe_audio_encoders() -> Result<HashSet<String>> {
     cmd.args(["-hide_banner", "-encoders"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 60, "ffmpeg -encoders")?;
     if !out.status.success() {
-        bail!("ffmpeg -encoders exited with failure");
+        return Err(crate::ext::tool_error("ffmpeg -encoders", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
     Ok(parse_audio_encoders(&String::from_utf8_lossy(&out.stdout)))
 }
@@ -240,8 +271,6 @@ impl FfprobeDisposition {
 struct FfprobeDispStream {
     #[serde(default)]
     disposition: FfprobeDisposition,
-    #[serde(default)]
-    tags: FfprobeTags,
 }
 
 #[derive(Deserialize)]
@@ -254,7 +283,7 @@ struct FfprobeDispOutput {
 fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispStream> {
     match crate::ext::ffprobe_json::<FfprobeDispOutput>(
         &["-v", "error", "-select_streams", stream_spec,
-          "-show_entries", "stream_disposition:stream_tags=language", "-of", "json"],
+          "-show_entries", "stream_disposition", "-of", "json"],
         path,
     ) {
         Ok(p) => p.streams,
@@ -367,6 +396,10 @@ fn whole_packets_within(skip: f64, samples: impl Iterator<Item = Option<f64>>) -
 }
 
 fn channel_names(layout: &str) -> Option<Vec<&str>> {
+    let layout = layout
+        .split_once(" channels (")
+        .and_then(|(_, names)| names.strip_suffix(')'))
+        .unwrap_or(layout);
     let decomposition = NAMED_LAYOUTS.iter().find(|(name, _)| *name == layout).map_or(layout, |(_, d)| d);
     let names: Vec<&str> = decomposition.split('+').collect();
     names
@@ -379,7 +412,7 @@ fn channel_names(layout: &str) -> Option<Vec<&str>> {
 fn opus_layout(layout: Option<&str>, channels: Option<u32>) -> (&'static str, String) {
     let substitute = |c: &str| match c {
         "SL" => Some("BL"), "SR" => Some("BR"), "BL" => Some("SL"), "BR" => Some("SR"),
-        "DL" => Some("FL"), "DR" => Some("FR"),
+        "DL" | "BIL" => Some("FL"), "DR" | "BIR" => Some("FR"),
         _ => None,
     };
     let source = layout.and_then(channel_names);
@@ -401,9 +434,41 @@ fn opus_layout(layout: Option<&str>, channels: Option<u32>) -> (&'static str, St
             return (name, format!("channelmap=map={map},{upmix}"));
         }
     }
-    let count = source.map_or(channels.unwrap_or(2), |s| s.len() as u32).clamp(1, 8);
+    let count = source.as_ref().map_or(channels.unwrap_or(2), |s| s.len() as u32).clamp(1, 8);
     let name = OPUS_LAYOUTS[count as usize - 1].0;
-    (name, format!("aformat=channel_layouts={name}"))
+    let fold = source.as_deref().and_then(fold_unplaced).map(|f| f + ",").unwrap_or_default();
+    (name, format!("{fold}aformat=channel_layouts={name}"))
+}
+
+/// In float, so the sums cannot clip before aformat's normalized downmix.
+fn fold_unplaced(source: &[&str]) -> Option<String> {
+    let folds = |c: &str| FOLDS.iter().find(|(f, _)| *f == c).map(|(_, places)| *places);
+    let mut rows: Vec<(&str, Vec<&str>)> = source.iter().filter(|c| folds(c).is_none()).map(|c| (*c, Vec::new())).collect();
+    let mut folded = false;
+    for &c in source {
+        let Some(places) = folds(c) else { continue };
+        match places.iter().find(|p| p.iter().all(|d| rows.iter().any(|(k, _)| k == d))) {
+            Some(place) => {
+                for d in *place {
+                    if let Some(row) = rows.iter_mut().find(|(k, _)| k == d) {
+                        row.1.push(c);
+                    }
+                }
+                folded = true;
+            }
+            None => rows.push((c, Vec::new())),
+        }
+    }
+    if !folded {
+        return None;
+    }
+    let layout = rows.iter().map(|(k, _)| *k).collect::<Vec<_>>().join("+");
+    let gains = rows
+        .iter()
+        .map(|(k, extra)| format!("{k}={k}{}", extra.iter().map(|x| format!("+0.7071*{x}")).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("|");
+    Some(format!("aformat=sample_fmts=fltp,pan={layout}|{gains}"))
 }
 
 /// Drops a trailing "(Marker)" this function added on an earlier run.
@@ -413,10 +478,6 @@ fn strip_codec_marker<'a>(title: &'a str, marker: &str) -> &'a str {
         .and_then(|t| t.strip_suffix(marker))
         .and_then(|t| t.strip_suffix('('))
         .map_or(title, str::trim_end)
-}
-
-fn track_passes_whitelist(track: &AudioTrack, whitelist: &[String]) -> bool {
-    crate::config::language_selected(whitelist, track.language.as_deref())
 }
 
 enum Action {
@@ -449,22 +510,16 @@ pub struct AudioPlan {
     tracks: Vec<PlannedTrack>,
 }
 
-/// A rule keyed by a name ffprobe never reports, such as `ac-3` or `dts-hd`, silently
-/// leaves its tracks on the `[audio]` default.
-fn warn_about_unused_codec_rules(config: &AudioConfig, tracks: &[AudioTrack]) {
-    for key in config.codec_rules.keys() {
-        if tracks.iter().any(|t| &t.codec_name == key) {
-            continue;
-        }
-        let present: Vec<&str> = tracks.iter().map(|t| t.codec_name.as_str()).collect();
-        tracing::warn!(
-            "audio.codec_rules.{key} matches no track of this file, which has {present:?}"
-        );
+/// A rule keyed by a name ffprobe never reports, such as `ac-3`, leaves its tracks on the default.
+fn warn_about_unknown_codec_rules(config: &AudioConfig, decodable: Option<&HashSet<String>>) {
+    let Some(decodable) = decodable else { return };
+    for key in config.codec_rules.keys().filter(|k| !decodable.contains(*k)) {
+        tracing::warn!("audio.codec_rules.{key} is not a codec name ffmpeg knows, so it matches no track");
     }
 }
 
 pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
-    let tracks = probe_audio_tracks(source_file)?;
+    let tracks = probe_audio_tracks(source_file).context("probe audio tracks")?;
     if tracks.is_empty() {
         return Ok(AudioPlan { tracks: vec![] });
     }
@@ -480,22 +535,24 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
         );
     }
 
+    let carried = tracks.len();
     let kept: Vec<AudioTrack> = tracks
         .into_iter()
-        .filter(|t| track_passes_whitelist(t, &config.language_whitelist))
+        .filter(|t| crate::config::language_selected(&config.language_whitelist, t.language.as_deref()))
         .collect();
 
     if kept.is_empty() {
-        tracing::warn!(
-            "no audio tracks match language whitelist {:?} - audio omitted",
-            config.language_whitelist
-        );
+        if carried > 0 {
+            tracing::warn!(
+                "no audio tracks match language whitelist {:?} - audio omitted",
+                config.language_whitelist
+            );
+        }
         return Ok(AudioPlan { tracks: vec![] });
     }
 
-    warn_about_unused_codec_rules(config, &kept);
-
     let codecs = audio_codecs();
+    warn_about_unknown_codec_rules(config, codecs.decodable.as_ref());
     let mut planned = Vec::with_capacity(kept.len());
     for track in kept {
         let lossless = is_lossless(&track.codec_name, track.profile.as_deref(), &codecs.lossless);
@@ -506,7 +563,9 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                 if r.mode == AudioMode::Encode {
                     tracing::warn!("audio track {} ({}): ffmpeg cannot decode it - copied instead", track.audio_index, track.codec_name);
                 }
-                Action::Copy { preroll: preroll_packets(source_file, &track)? }
+                let preroll = preroll_packets(source_file, &track)
+                    .with_context(|| format!("probe the priming of audio track {}", track.audio_index))?;
+                Action::Copy { preroll }
             } else if decodable {
                 Action::Pcm { codec: pcm_codec(&track) }
             } else {
@@ -637,36 +696,7 @@ pub fn extract(
             Action::Pcm { codec } => {
                 cmd.args([format!("-c:a:{out_idx}"), (*codec).to_string()]);
             }
-            Action::Encode { codec, bitrate, options, layout } => {
-                if let Some((name, filter)) = layout {
-                    cmd.args([format!("-filter:a:{out_idx}"), filter.clone()]);
-                    // libopusenc's default channel order swaps channels of 5.0 and 6.1.
-                    if OPUS_LAYOUTS.iter().any(|(n, c)| n == name && c.len() > 2) {
-                        cmd.args([format!("-mapping_family:a:{out_idx}"), "1".into()]);
-                    }
-                }
-                cmd.args([format!("-c:a:{out_idx}"), codec.clone()]);
-                // ffmpeg's FLAC encoder cuts deeper samples to 24 bits unless allowed experimental ones.
-                if codec == "flac" && t.bits_per_raw_sample > 24 {
-                    cmd.args([format!("-strict:a:{out_idx}"), "experimental".into()]);
-                }
-                if let Some(b) = bitrate {
-                    cmd.args([format!("-b:a:{out_idx}"), b.clone()]);
-                }
-                for (k, v) in options {
-                    cmd.args([format!("-{k}:a:{out_idx}"), v.clone()]);
-                }
-                let marker = codec_display(codec);
-                let name = match t.title.as_deref().map(str::trim) {
-                    // Or re-encoding stacks markers: "Deutsch (Opus) (Opus)".
-                    Some(title) if !title.is_empty() => {
-                        let base = strip_codec_marker(title, marker);
-                        if base.is_empty() { marker.to_string() } else { format!("{base} ({marker})") }
-                    }
-                    _ => marker.to_string(),
-                };
-                cmd.args([format!("-metadata:s:a:{out_idx}"), format!("title={name}")]);
-            }
+            Action::Encode { .. } => encode_args(&mut cmd, out_idx, t),
         }
     }
 
@@ -674,8 +704,9 @@ pub fn extract(
     cmd.args(["-disposition:0", "-attached_pic", "-default_mode", "passthrough"]);
     cmd.arg(tracks_path);
 
-    // Transcoding every kept track, so it scales with the runtime of the file.
-    let out = crate::ext::output_with_timeout(&mut cmd, 7200, "ffmpeg track extraction")?;
+    let out = crate::ext::output_with_timeout(
+        &mut cmd, crate::ext::whole_file_timeout(source_file, 7200), "ffmpeg track extraction",
+    )?;
     if !out.status.success() {
         return Err(extraction_error(out.status, &String::from_utf8_lossy(&out.stderr)));
     }
@@ -683,13 +714,173 @@ pub fn extract(
     Ok(())
 }
 
+fn encode_args(cmd: &mut Command, out_idx: usize, t: &PlannedTrack) {
+    let Action::Encode { codec, bitrate, options, layout } = &t.action else { return };
+    if let Some((name, filter)) = layout {
+        cmd.args([format!("-filter:a:{out_idx}"), filter.clone()]);
+        // libopusenc's default channel order swaps channels of 5.0 and 6.1.
+        if OPUS_LAYOUTS.iter().any(|(n, c)| n == name && c.len() > 2) {
+            cmd.args([format!("-mapping_family:a:{out_idx}"), "1".into()]);
+        }
+    }
+    cmd.args([format!("-c:a:{out_idx}"), codec.clone()]);
+    // libopus takes 8 to 48 kHz, and ffmpeg picks the nearest: 32 kHz would become 24.
+    if codec.contains("opus") {
+        cmd.args([format!("-ar:a:{out_idx}"), "48000".into()]);
+    }
+    // ffmpeg's FLAC encoder cuts deeper samples to 24 bits unless allowed experimental ones.
+    if codec == "flac" && t.bits_per_raw_sample > 24 {
+        cmd.args([format!("-strict:a:{out_idx}"), "experimental".into()]);
+    }
+    if let Some(b) = bitrate {
+        cmd.args([format!("-b:a:{out_idx}"), b.clone()]);
+    }
+    for (k, v) in options {
+        cmd.args([format!("-{k}:a:{out_idx}"), v.clone()]);
+    }
+    let marker = codec_display(codec);
+    let name = match t.title.as_deref().map(str::trim) {
+        // Or re-encoding stacks markers: "Deutsch (Opus) (Opus)".
+        Some(title) if !title.is_empty() => {
+            let base = strip_codec_marker(title, marker);
+            if base.is_empty() { marker.to_string() } else { format!("{base} ({marker})") }
+        }
+        _ => marker.to_string(),
+    };
+    cmd.args([format!("-metadata:s:a:{out_idx}"), format!("title={name}")]);
+}
+
+/// Opens every encoder on the first second: a refused codec or option fails before the video encode.
+pub fn check_encoders(source_file: &Path, plan: &AudioPlan) -> Result<()> {
+    let tracks: Vec<&PlannedTrack> = plan.tracks.iter().filter(|t| matches!(t.action, Action::Encode { .. })).collect();
+    if tracks.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-t", "1", "-i"]).arg(source_file);
+    for t in &tracks {
+        cmd.args(["-map", &format!("0:a:{}", t.audio_index)]);
+    }
+    for (out_idx, t) in tracks.iter().enumerate() {
+        encode_args(&mut cmd, out_idx, t);
+    }
+    cmd.args(["-f", "null", "-"]);
+    let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg audio encoder check")?;
+    if !out.status.success() {
+        return Err(extraction_error(out.status, &String::from_utf8_lossy(&out.stderr))
+            .context("try the audio encoders on the first second"));
+    }
+    Ok(())
+}
+
 fn extraction_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
     let err = crate::ext::tool_error("ffmpeg track extraction", status, stderr);
-    if ["Option not found", "Error applying encoder options"].iter().any(|m| stderr.contains(m)) {
+    let profile_errors = ["Option not found", "Error applying encoder options", "experimental codecs are not enabled"];
+    if profile_errors.iter().any(|m| stderr.contains(m)) {
         err.context(crate::job::Transient)
     } else {
         err
     }
+}
+
+/// BCP 47 tags by kind and ffprobe index; ffmpeg keeps ISO 639-2 only, pt-BR becomes por.
+#[derive(Default)]
+pub struct Languages {
+    /// As mkvmerge read it: `--language` refuses codes it does not know, such as `english`.
+    video: Option<String>,
+    audio: Vec<Option<String>>,
+    subtitles: Vec<Option<String>>,
+}
+
+impl Languages {
+    pub fn probe(source: &Path) -> Result<Self> {
+        match Self::read(source) {
+            Err(e) if crate::job::is_transient(&e) => Err(e),
+            Err(e) => {
+                tracing::warn!("could not read the BCP 47 language tags of {}: {e:#}", source.display());
+                Ok(Self::default())
+            }
+            ok => ok,
+        }
+    }
+
+    fn read(source: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Identify { #[serde(default)] tracks: Vec<Track> }
+        #[derive(Deserialize)]
+        struct Track { #[serde(rename = "type")] kind: String, #[serde(default)] properties: Props }
+        #[derive(Deserialize, Default)]
+        struct Props { language: Option<String>, language_ietf: Option<String> }
+        #[derive(Deserialize)]
+        struct Probe { #[serde(default)] streams: Vec<Stream> }
+        #[derive(Deserialize)]
+        struct Stream { #[serde(default)] codec_type: String, #[serde(default)] tags: Tags }
+        #[derive(Deserialize, Default)]
+        struct Tags { language: Option<String> }
+
+        let mut cmd = Command::new(external_bin("mkvmerge"));
+        cmd.args(["--identify", "--identification-format", "json"]).arg(source);
+        let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
+        if out.status.code().unwrap_or(2) >= 2 {
+            return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
+        }
+        let identify: Identify = serde_json::from_slice(&out.stdout).context("parse mkvmerge identify output")?;
+        let probe: Probe = crate::ext::ffprobe_json(
+            &["-v", "error", "-show_entries", "stream=codec_type:stream_tags=language", "-of", "json"],
+            source,
+        )?;
+
+        let tags = |ffprobe_kind: &str, mkvmerge_kind: &str| {
+            let ours: Vec<Option<&str>> = probe.streams.iter()
+                .filter(|s| s.codec_type == ffprobe_kind)
+                .map(|s| s.tags.language.as_deref())
+                .collect();
+            let theirs: Vec<&Props> = identify.tracks.iter()
+                .filter(|t| t.kind == mkvmerge_kind)
+                .map(|t| &t.properties)
+                .collect();
+            matched_tags(&ours, &theirs.iter().map(|p| (p.language.as_deref(), p.language_ietf.as_deref())).collect::<Vec<_>>())
+        };
+        Ok(Self {
+            video: identify.tracks.iter()
+                .find(|t| t.kind == "video")
+                .and_then(|t| t.properties.language_ietf.clone().or_else(|| t.properties.language.clone()))
+                .filter(|l| !l.is_empty() && l != "und"),
+            audio: tags("audio", "audio"),
+            subtitles: tags("subtitle", "subtitles"),
+        })
+    }
+
+    pub fn video(&self) -> Option<&str> {
+        self.video.as_deref()
+    }
+
+    /// One per track of tracks.mkv, in the order `extract` writes them.
+    pub fn of_tracks(&self, plan: &AudioPlan, subtitles: &[(usize, Option<&'static str>)]) -> Vec<Option<String>> {
+        plan.tracks.iter()
+            .map(|t| self.audio.get(t.audio_index).cloned().flatten())
+            .chain(subtitles.iter().map(|(i, _)| self.subtitles.get(*i).cloned().flatten()))
+            .collect()
+    }
+}
+
+/// By position, where both tools read the same ISO 639-2 code; a TS descriptor's `ger,eng` as `ger`.
+fn matched_tags(ffprobe: &[Option<&str>], mkvmerge: &[(Option<&str>, Option<&str>)]) -> Vec<Option<String>> {
+    if ffprobe.len() != mkvmerge.len() {
+        return vec![None; ffprobe.len()];
+    }
+    ffprobe.iter().zip(mkvmerge)
+        .map(|(ours, (theirs, tag))| {
+            let ours = (*ours)?;
+            let first = ours.split(',').next()?.trim();
+            if Some(first) != *theirs {
+                return None;
+            }
+            (*tag).filter(|t| t.contains('-'))
+                .or((first != ours).then_some(first))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 pub fn has_chapters(path: &Path) -> Result<bool> {
@@ -704,7 +895,9 @@ pub fn mux_final(
     video_args: &[String],
     timestamps: Option<&Path>,
     tracks_path: &Path,
+    tracks_languages: &[Option<String>],
     source_file: &Path,
+    video_language: Option<&str>,
     source_shift_ms: i64,
     source_subtitles: &[u64],
     output_path: &Path,
@@ -720,7 +913,7 @@ pub fn mux_final(
 
     if let Some(v) = source_video.first() {
         cmd.args(v.disposition.to_mkvmerge_flags(0));
-        if let Some(lang) = v.tags.language.as_deref().filter(|l| !l.is_empty()) {
+        if let Some(lang) = video_language {
             cmd.args(["--language".to_string(), format!("0:{lang}")]);
         }
     }
@@ -737,6 +930,11 @@ pub fn mux_final(
 
     if has_tracks {
         cmd.args(["--no-video", "--no-chapters", "--no-global-tags", "--no-track-tags"]);
+        for (tid, lang) in tracks_languages.iter().enumerate() {
+            if let Some(lang) = lang {
+                cmd.arg("--language").arg(format!("{tid}:{lang}"));
+            }
+        }
         cmd.arg(tracks_path);
     }
 
@@ -747,18 +945,19 @@ pub fn mux_final(
         let ids = source_subtitles.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
         cmd.args(["--subtitle-tracks", &ids]);
     }
-    if source_shift_ms != 0 {
-        // A copied video keeps mkvmerge's timeline, and realign_copied_video moves these with it.
-        if !source_subtitles.is_empty() && encoded {
-            cmd.arg("--sync").arg(format!("-1:{source_shift_ms}"));
+    // A copied video keeps mkvmerge's timeline, and realign_copied_video moves these with it.
+    if !source_subtitles.is_empty() && encoded {
+        let shift = source_shift_ms + wrapped_ts_shift_ms(source_file, source_subtitles, output_path)?;
+        if shift != 0 {
+            cmd.arg("--sync").arg(format!("-1:{shift}"));
         }
-        if has_chapters(source_file)? {
-            cmd.arg("--chapter-sync").arg(source_shift_ms.to_string());
-        }
+    }
+    if source_shift_ms != 0 && has_chapters(source_file)? {
+        cmd.arg("--chapter-sync").arg(source_shift_ms.to_string());
     }
     cmd.arg(source_file);
 
-    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
+    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source_file, 3600), "mkvmerge")?;
     // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
         return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
@@ -775,10 +974,86 @@ pub fn mux_final(
     Ok(())
 }
 
+/// mkvmerge keeps the absolute time of a wrapping MPEG-TS, and its subtitles land past the end.
+fn wrapped_ts_shift_ms(source: &Path, subtitle_ids: &[u64], scratch: &Path) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Probe { format: Format }
+    #[derive(Deserialize)]
+    struct Format { #[serde(default)] format_name: String, start_time: Option<String>, duration: Option<String> }
+    #[derive(Deserialize)]
+    struct Packets { #[serde(default)] packets: Vec<Packet> }
+    #[derive(Deserialize)]
+    struct Packet { pts_time: Option<String> }
+
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-show_entries", "format=format_name,start_time,duration", "-of", "json"],
+        source,
+    )?;
+    let secs = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok());
+    let (Some(start), Some(duration)) = (secs(probe.format.start_time.as_deref()), secs(probe.format.duration.as_deref())) else {
+        return Ok(0);
+    };
+    if probe.format.format_name != "mpegts" {
+        return Ok(0);
+    }
+
+    let subtitles = scratch.with_file_name("subtitles.mkv");
+    let ids = subtitle_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let mut cmd = Command::new(external_bin("mkvmerge"));
+    cmd.arg("-o").arg(&subtitles)
+        .args(["--no-video", "--no-audio", "--no-attachments", "--no-chapters", "--no-global-tags",
+               "--no-track-tags", "--subtitle-tracks", &ids])
+        .arg(source);
+    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source, 3600), "mkvmerge")?;
+    if out.status.code().unwrap_or(2) >= 2 {
+        let _ = std::fs::remove_file(&subtitles);
+        return Err(crate::ext::tool_error("mkvmerge subtitle probe", out.status, &String::from_utf8_lossy(&out.stdout)));
+    }
+    let packets: Result<Packets> = crate::ext::ffprobe_json(
+        &["-v", "error", "-read_intervals", "%+#8", "-show_entries", "packet=pts_time", "-of", "json"],
+        &subtitles,
+    );
+    let _ = std::fs::remove_file(&subtitles);
+    let first = packets?.packets.iter().filter_map(|p| secs(p.pts_time.as_deref())).reduce(f64::min);
+    Ok(absolute_time_shift_ms(first, start, duration))
+}
+
+fn absolute_time_shift_ms(first_subtitle: Option<f64>, start: f64, duration: f64) -> i64 {
+    match first_subtitle {
+        Some(t) if t > duration + 1.0 => -(start * 1000.0).round() as i64,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn a_subtitle_past_the_end_of_the_file_is_moved_back_by_the_start() {
+        assert_eq!(absolute_time_shift_ms(Some(95389.385), 95379.39, 70.0), -95379390);
+        assert_eq!(absolute_time_shift_ms(Some(10.01), 95379.39, 70.0), 0);
+        assert_eq!(absolute_time_shift_ms(None, 95379.39, 70.0), 0);
+    }
+
+    #[test]
+    fn a_bcp_47_tag_is_kept_only_where_both_tools_agree_on_the_track() {
+        let theirs = [(Some("por"), Some("pt-BR")), (Some("por"), Some("pt-PT")), (Some("eng"), Some("en"))];
+        assert_eq!(
+            matched_tags(&[Some("por"), Some("por"), Some("eng")], &theirs),
+            [Some("pt-BR".to_string()), Some("pt-PT".to_string()), None]
+        );
+        assert_eq!(matched_tags(&[Some("ger"), Some("por"), Some("eng")], &theirs), [None, Some("pt-PT".to_string()), None]);
+        assert_eq!(matched_tags(&[None, Some("por"), Some("eng")], &theirs)[0], None);
+        assert_eq!(matched_tags(&[Some("por"), Some("por")], &theirs), [None, None]);
+
+        let ts = [(Some("ger"), Some("de")), (Some("ger"), Some("de")), (Some("eng"), Some("en"))];
+        assert_eq!(
+            matched_tags(&[Some("ger,eng"), Some("ger"), Some("fre,eng")], &ts),
+            [Some("ger".to_string()), None, None]
+        );
+    }
 
     fn sample_set() -> HashSet<String> {
         ["truehd", "flac", "alac", "dts", "wavpack"]
@@ -861,7 +1136,9 @@ mod tests {
         assert_eq!(target("quad(side)", 4).1, "channelmap=map=FL-FL|FR-FR|SL-BL|SR-BR,aformat=channel_layouts=quad");
         assert_eq!(target("hexagonal", 6).1, "channelmap=map=FL-FL|FR-FR|FC-FC|BL-SL|BR-SR|BC-BC,aformat=channel_layouts=6.1");
         assert_eq!(target("6.1(back)", 7).0, "6.1");
-        assert_eq!(target("FL+FR+LFE", 3).0, "5.1");
+        assert_eq!(target("4 channels (FL+FR+LFE+BC)", 4), ("6.1", "aformat=channel_layouts=6.1".to_string()));
+        assert_eq!(target("2 channels (FC+LFE)", 2).0, "5.1");
+        assert_eq!(target("5 channels (FL+FR+LFE+SL+SR)", 5).1, "channelmap=map=FL-FL|FR-FR|LFE-LFE|SL-BL|SR-BR,aformat=channel_layouts=5.1");
         assert_eq!(target("downmix", 2).1, "channelmap=map=DL-FL|DR-FR,aformat=channel_layouts=stereo");
     }
 
@@ -873,6 +1150,22 @@ mod tests {
         assert_eq!(opus_layout(Some("6 channels"), Some(6)).0, "5.1");
         assert_eq!(opus_layout(None, Some(1)).0, "mono");
         assert_eq!(opus_layout(Some("7.1.4"), Some(12)).0, "7.1");
+    }
+
+    #[test]
+    fn channels_swresample_would_drop_are_mixed_into_their_place_first() {
+        assert_eq!(
+            opus_layout(Some("7.1.4"), Some(12)).1,
+            "aformat=sample_fmts=fltp,pan=FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR|FL=FL|FR=FR|FC=FC|LFE=LFE\
+             |BL=BL+0.7071*TBL|BR=BR+0.7071*TBR|SL=SL|SR=SR|TFL=TFL|TFR=TFR,aformat=channel_layouts=7.1"
+        );
+        let seven_two_three = opus_layout(Some("7.2.3"), Some(12)).1;
+        assert!(seven_two_three.contains("|LFE=LFE+0.7071*LFE2|"), "{seven_two_three}");
+        assert!(seven_two_three.contains("|BL=BL+0.7071*TBC|BR=BR+0.7071*TBC|"), "{seven_two_three}");
+        assert!(opus_layout(Some("5.1.4"), Some(10)).1.contains("|SL=SL+0.7071*TBL|SR=SR+0.7071*TBR|"));
+
+        assert_eq!(opus_layout(Some("7.1(wide)"), Some(8)).1, "aformat=channel_layouts=7.1");
+        assert_eq!(opus_layout(Some("binaural"), Some(2)).1, "channelmap=map=BIL-FL|BIR-FR,aformat=channel_layouts=stereo");
     }
 
     #[test]

@@ -23,7 +23,7 @@ assert_everything_but_video_kept() {
 }
 
 for encoder in svt-av1 svt-av1-hdr; do
-    # -- ten chunks or more: nothing lost, doubled, reordered or shifted anywhere ----
+    # ten chunks or more: nothing lost, doubled, reordered or shifted anywhere
     I="$WORKDIR/$encoder/in"; O="$WORKDIR/$encoder/out"; mkdir -p "$I/p" "$O"
     cp "$SRC" "$I/p/test.mkv"
     cat > "$I/p/encode.toml" << EOF
@@ -53,7 +53,7 @@ done
     != "$(packet_hashes "$WORKDIR/svt-av1-hdr/out/test.mkv" v:0)" ] || \
     fail "svt-av1 and svt-av1-hdr produced the same bitstream - both ran the same binary"
 
-# -- video = copy: the video stream comes through bit for bit ------------------------
+# video = copy: the video stream comes through bit for bit
 I="$WORKDIR/copy/in"; O="$WORKDIR/copy/out"; mkdir -p "$I/p" "$O"
 cp "$SRC" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -64,7 +64,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "copy: no output"
 assert_packets_identical "$O/test.mkv" v:0 "$SRC" v:0
 assert_everything_but_video_kept "$O/test.mkv"
 
-# -- re-encoded audio keeps its sync, and a lossless target keeps every sample -------
+# re-encoded audio keeps its sync, and a lossless target keeps every sample
 I="$WORKDIR/audio/in"; O="$WORKDIR/audio/out"; mkdir -p "$I/p" "$O"
 cp "$SRC" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -91,7 +91,7 @@ assert_av_sync "$O/test.mkv" "$SRC" 0
 assert_av_sync "$O/test.mkv" "$SRC" 1
 assert_frames_match "$O/test.mkv" "$SRC"
 
-# -- every channel stays on its own channel through Opus ------------------------------
+# every channel stays on its own channel through Opus
 for layout in 71 51side; do
     I="$WORKDIR/tones$layout/in"; O="$WORKDIR/tones$layout/out"; mkdir -p "$I/p" "$O"
     cp "$FIXTURES_DIR/tones_$layout.mkv" "$I/p/test.mkv"

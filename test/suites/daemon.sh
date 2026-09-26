@@ -15,7 +15,7 @@ setup() { # NAME [PROFILE]
     printf '%b' "${2:-$PROFILE}" > "$I/p/encode.toml"
 }
 
-# -- a file dropped in after the first scan is encoded on a later one ---------------------
+# a file dropped in after the first scan is encoded on a later one
 setup rescan
 start_avet "$I" "$O" 2
 wait_for_log "no jobs" 30 || fail "rescan: avet never reported an idle scan"
@@ -30,7 +30,7 @@ assert_video_codec "$O/second.mkv" av1
 assert_file_exists "$I/processed/first.mkv"
 assert_file_exists "$I/processed/second.mkv"
 
-# -- a job that fails does not take the rest of the scan with it -------------------------
+# a job that fails does not take the rest of the scan with it
 setup failing
 cp "$FIXTURES_DIR/audio_only.mkv" "$I/p/alpha.mkv"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/beta.mkv"
@@ -44,7 +44,7 @@ assert_file_exists      "$O/.avet_alpha/.failed"
 assert_file_exists      "$I/processed/beta.mkv"
 assert_file_exists      "$I/p/alpha.mkv"
 
-# -- a copy still running is waited out, and the whole file is encoded -------------------
+# a copy still running is waited out, and the whole file is encoded
 setup growing 'encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 40\n'
 start_avet "$I" "$O" 2
 wait_for_log "no jobs" 30 || fail "growing: avet never reported an idle scan"
@@ -68,14 +68,18 @@ kill_avet
 assert_video_frames "$O/test.mkv" 240
 assert_frames_match "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 
-# -- SIGTERM mid-encode: the job is finished, then the loop ends -------------------------
+# SIGTERM mid-encode: the job is finished, then the loop ends
 setup sigterm 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+TEST_CPUS=0.5
 start_avet "$I" "$O" 2
+TEST_CPUS=
 wait_for_log "chunk 1/" 240 || fail "sigterm: no chunk was encoded before the signal"
 stop_avet 300
 [ "$AVET_RC" = 0 ] || fail "sigterm: avet exited with $AVET_RC, expected 0"
-assert_log_contains     "signal received"
+signal_line=$(printf '%s\n' "$RUN_LOGS" | grep -n "signal received" | head -n 1 | cut -d: -f1)
+merge_line=$(printf '%s\n' "$RUN_LOGS" | grep -n "merging chunks" | head -n 1 | cut -d: -f1)
+[ "${signal_line:-999999}" -lt "${merge_line:-0}" ] || fail "sigterm: the signal came after the last chunk, not mid-encode"
 assert_log_contains     "stopping after test"
 # A marker here would lock out a file nothing is wrong with.
 assert_log_not_contains "job failed"
@@ -83,10 +87,12 @@ assert_dir_not_exists   "$O/.avet_test"
 assert_frames_match     "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 assert_decodes_cleanly  "$O/test.mkv"
 
-# -- a second signal stops it there and then ---------------------------------------------
+# a second signal stops it there and then
 setup twice 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+TEST_CPUS=0.5
 start_avet "$I" "$O" 2
+TEST_CPUS=
 wait_for_log "chunk 1/" 240 || fail "twice: no chunk was encoded before the signal"
 docker kill --signal=TERM "$AVET_CID" >/dev/null 2>&1
 wait_for_log "signal received" 30 || fail "twice: the first signal was not logged"
@@ -95,7 +101,7 @@ stop_avet 60
 assert_log_contains    "second signal"
 assert_file_not_exists "$O/test.mkv"
 
-# -- SIGTERM while idle: the poll sleep ends with it, it is not slept out -----------------
+# SIGTERM while idle: the poll sleep ends with it, it is not slept out
 setup idle
 start_avet "$I" "$O" 120
 wait_for_log "no jobs" 30 || fail "idle: avet never reported an idle scan"

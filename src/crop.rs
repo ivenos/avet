@@ -41,16 +41,25 @@ pub fn detect(
 
     let mut samples: Vec<Crop> = Vec::new();
     let mut failed = 0usize;
+    let mut transient = false;
     for result in results {
         match result {
             Ok(Ok(Some(c))) => samples.push(c),
             Ok(Ok(None))    => {}
-            Ok(Err(e))      => { failed += 1; tracing::warn!("[{stem}] cropdetect sample failed: {e:#}"); }
+            Ok(Err(e))      => {
+                failed += 1;
+                transient |= e.downcast_ref::<crate::job::Transient>().is_some();
+                tracing::warn!("[{stem}] cropdetect sample failed: {e:#}");
+            }
             Err(_)          => { failed += 1; tracing::warn!("[{stem}] cropdetect sample panicked"); }
         }
     }
 
-    // A failure is not evidence of "no black bars", and the cache survives resumes.
+    // A failure is not evidence of "no black bars", and the crop is in the fingerprint.
+    if transient {
+        return Err(anyhow::Error::new(crate::job::Transient)
+            .context(format!("auto-crop: {failed} cropdetect sample(s) failed")));
+    }
     if samples.is_empty() {
         if failed > 0 {
             bail!("auto-crop: all {failed} cropdetect samples failed");
@@ -105,9 +114,8 @@ fn classify(union: Option<Crop>, src_w: u32, src_h: u32) -> (Option<Crop>, bool)
     }
 }
 
-/// Bars sit roughly opposite each other. A box offset to one side is the lit part of a
-/// dark scene, and cutting to it would take real picture off the other side. The margin
-/// is wide: a transfer's bars are often a few lines apart, deliberately so in the fixtures.
+/// Bars sit roughly opposite each other; a box offset to one side is the lit part of a dark
+/// scene. The margin is wide because a transfer's bars are often a few lines apart.
 fn is_bars(c: &Crop, src_w: u32, src_h: u32) -> bool {
     let centered = |near: u32, far: u32, total: u32| {
         let slack = (total / 20).max(8);

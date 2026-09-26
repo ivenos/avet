@@ -26,7 +26,7 @@ for fixture in gop_h264.mkv gop_h264.mp4 gop_h264.ts gop_h264.flv gop_h264.mov g
     [ "$fixture" != gop_mpeg4.avi ] || assert_log_contains "AVI with B-frames: working from a Matroska copy of the video"
 done
 
-# -- an MP4 cut behind a keyframe: what the edit list hides stays hidden --------------------
+# an MP4 cut behind a keyframe: what the edit list hides stays hidden
 # The cut starts the sound at 3.3 s and the picture at frame 80, 33 ms apart, as in the source.
 run cut gop_cut.mp4 "$ENCODE"
 assert_frames_match      "$O/test.mkv" "$FIXTURES_DIR/pattern_from80.mkv"
@@ -34,7 +34,7 @@ assert_frame_times_match "$O/test.mkv" "$FIXTURES_DIR/pattern_from80.mkv"
 assert_av_sync           "$O/test.mkv" "$SRC" 0
 assert_subtitle_events_match "$O/test.mkv" s:0 "$SRC" s:0
 
-# -- an MPEG-TS whose timestamps wrap a minute in ----------------------------------------------
+# an MPEG-TS whose timestamps wrap a minute in
 run wrap gop_wrap.m2ts "$ENCODE"
 assert_frames_match      "$O/test.mkv" "$FIXTURES_DIR/long.mkv"
 assert_frame_times_match "$O/test.mkv" "$FIXTURES_DIR/long.mkv"

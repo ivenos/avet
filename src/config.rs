@@ -202,19 +202,18 @@ pub fn language_matches(entry: &str, tag: &str) -> bool {
         && (entry == tag || iso639_alias(&entry).is_some_and(|a| a == tag))
 }
 
-/// Empty whitelist or untagged track keeps everything; MP4 spells untagged `und`.
+/// Empty whitelist or untagged track keeps everything; MP4 spells untagged `und`, and
+/// ffmpeg joins the languages of one MPEG-TS descriptor with commas (`ger,eng`).
 pub fn language_selected(whitelist: &[String], tag: Option<&str>) -> bool {
-    if whitelist.is_empty() {
-        return true;
-    }
-    let tagged = tag
+    let languages: Vec<&str> = tag
+        .unwrap_or_default()
+        .split(',')
         .map(str::trim)
-        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("und"));
-
-    match tagged {
-        None => true,
-        Some(lang) => whitelist.iter().any(|w| language_matches(w, lang)),
-    }
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case("und"))
+        .collect();
+    whitelist.is_empty()
+        || languages.is_empty()
+        || languages.iter().any(|lang| whitelist.iter().any(|w| language_matches(w, lang)))
 }
 
 /// True if the output codec is lossless (bitrate then irrelevant). ffmpeg's lossless
@@ -392,7 +391,7 @@ impl Config {
             .with_context(|| format!("read encode.toml: {}", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("parse encode.toml: {}", path.display()))?;
-        cfg.validate()?;
+        cfg.validate().with_context(|| format!("check encode.toml: {}", path.display()))?;
         Ok(cfg)
     }
 
@@ -414,13 +413,23 @@ impl Config {
         {
             bail!("avet.scale must be at least 64 (got {h}); remove it to disable scaling");
         }
+        // SvtAv1EncApp takes `--crf nan` and encodes at CRF 0.
+        if let Some(crf) = self.encoder_params.get("crf") {
+            let value = match crf {
+                toml::Value::Integer(i) => Some(*i as f64),
+                toml::Value::Float(f) => Some(*f),
+                toml::Value::String(s) => s.parse::<f64>().ok(),
+                _ => None,
+            };
+            if !value.is_some_and(f64::is_finite) {
+                bail!("encoder_params.crf must be a number (got {crf})");
+            }
+        }
         if let Some(tq) = &self.target_quality {
             if self.avet.video == VideoMode::Copy {
                 bail!("target_quality requires avet.video = \"encode\"");
             }
-            // FFVship scores the encode against the source at source resolution, so a
-            // downscale reads as loss: 1080p to 540p alone measures 0.8 JOD below the
-            // untouched encode, and every chunk burns its whole probe budget for nothing.
+            // FFVship scores at source resolution: 1080p to 540p alone measures 0.8 JOD lower.
             if self.avet.scale.is_some() {
                 bail!(
                     "target_quality cannot be combined with avet.scale: the quality score \
@@ -432,6 +441,15 @@ impl Config {
                 || self.encoder_params.get("rc").is_some_and(|v| toml_value_to_arg(v) != "0")
             {
                 bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc or tbr");
+            }
+            if let Some(key) = ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range"]
+                .into_iter()
+                .find(|k| self.encoder_params.contains_key(*k))
+            {
+                bail!(
+                    "target_quality cannot be combined with encoder_params.{key}: the quality score reads \
+                     the source by its own color description, so a retagged encode never matches it"
+                );
             }
             if tq.jod.is_nan() {
                 bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
@@ -927,6 +945,16 @@ mod tests {
     }
 
     #[test]
+    fn a_ts_track_announcing_several_languages_is_kept_for_any_of_them() {
+        let deu = vec!["deu".to_string()];
+        assert!(language_selected(&deu, Some("ger,eng")));
+        assert!(language_selected(&deu, Some("eng, ger")));
+        assert!(language_selected(&deu, Some("ger,ger")));
+        assert!(!language_selected(&deu, Some("eng,fre")));
+        assert!(language_selected(&deu, Some(",")));
+    }
+
+    #[test]
     fn scale_below_the_minimum_is_rejected() {
         for bad in [0u32, 1, 63] {
             let c: Config = toml::from_str(&format!(
@@ -964,6 +992,63 @@ mod tests {
             let err = Config::from_str_for_test(&tq(bad)).unwrap_err().to_string();
             assert!(err.contains("rc or tbr"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn target_quality_refuses_a_color_description_the_source_does_not_have() {
+        let tq = |params: &str| format!("encoder = \"svt-av1\"\n[encoder_params]\n{params}\n[target_quality]\njod = 9.5\n");
+        Config::from_str_for_test(&tq("chroma-sample-position = 1")).unwrap();
+        for key in ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range"] {
+            let err = Config::from_str_for_test(&tq(&format!("{key} = 1"))).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+            Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\n{key} = 1\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_crf_has_to_be_a_number() {
+        let crf = |value: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\ncrf = {value}\n"));
+        for good in ["30", "27.5", "\"30\""] {
+            crf(good).unwrap();
+        }
+        for bad in ["nan", "inf", "\"thirty\"", "true"] {
+            let err = crf(bad).unwrap_err().to_string();
+            assert!(err.contains("encoder_params.crf"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn every_documented_value_of_an_enum_key_is_accepted() {
+        for t in [
+            "encoder = \"svt-av1-hdr\"",
+            "[avet]\nvideo = \"copy\"",
+            "encoder = \"svt-av1\"\n[subtitles]\nmode = \"strip\"",
+            "encoder = \"svt-av1\"\n[scene_detection]\nspeed = \"fast\"",
+            "encoder = \"svt-av1\"\n[audio]\nmode = \"encode\"\ncodec = \"flac\"",
+        ] {
+            Config::from_str_for_test(t).unwrap_or_else(|e| panic!("should accept:\n{t}\n{e:#}"));
+        }
+    }
+
+    #[test]
+    fn switches_and_tables_take_only_their_own_type() {
+        let avet = |body: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[avet]\n{body}\n"));
+        for key in ["crop", "keyint", "keep_temp"] {
+            avet(&format!("{key} = true")).unwrap();
+            assert!(avet(&format!("{key} = \"yes\"")).is_err(), "{key}");
+        }
+
+        let audio = |body: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[audio]\n{body}\n"));
+        audio("options = { compression_level = 12 }").unwrap();
+        assert!(audio("options = \"compression_level=12\"").is_err());
+
+        let subtitles = |body: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[subtitles]\n{body}\n"));
+        subtitles("language_whitelist = [\"eng\", \"ger\"]").unwrap();
+        assert!(subtitles("language_whitelist = [\"en\"]").is_err());
+
+        let sd = |body: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[scene_detection]\n{body}\n"));
+        sd("extra_split_sec = 0").unwrap();
+        assert!(sd("extra_split_sec = -1").is_err());
     }
 
     #[test]

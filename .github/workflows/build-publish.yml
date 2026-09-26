@@ -11,14 +11,11 @@ on:
 env:
   GITHUB_IMAGE: ghcr.io/ivenos/avet
   DOCKERHUB_IMAGE: ivenos/avet
-  # Kept in lockstep with the Dockerfile and appimage.yml by Renovate.
   RUST_VERSION: "1.98.1"
 
-# Jobs that publish opt into more below.
 permissions:
   contents: read
 
-# Two pushes to main would otherwise race to move the same :dev tag.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -45,12 +42,57 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked
 
-  # Built once here, then shared: every suite below runs on its own runner in parallel.
-  image:
+  msrv:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Read rust-version
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.msrv.outputs.version }}
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffms2-dev nasm
+
+      - name: Check
+        run: cargo check --locked --all-targets
+
+  suites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
-      suites: ${{ steps.suites.outputs.list }}
+      list: ${{ steps.suites.outputs.list }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: List suites
+        id: suites
+        run: |
+          list=$(find test/suites -name '*.sh' -printf '%f\n' | sed 's/\.sh$//' | sort | jq -Rsc 'split("\n")[:-1]')
+          # An empty matrix skips the job, and a skipped job counts as passed below.
+          [ "$list" != "[]" ] || { echo "::error::no test suites found"; exit 1; }
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: image (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -65,94 +107,21 @@ jobs:
           context: .
           tags: avet:test
           outputs: type=docker,dest=${{ runner.temp }}/avet-test.tar
-          cache-from: type=gha,scope=amd64
-          cache-to: type=gha,mode=max,scope=amd64
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
 
-      # Built here too: otherwise every suite apk-installs the same three packages.
       - name: Build fixture tools image
         uses: docker/build-push-action@v7
         with:
-          # Not test/: the context would carry test/local/ with it.
           context: .
           file: test/tools.Dockerfile
           tags: avet:fixture-tools
           outputs: type=docker,dest=${{ runner.temp }}/avet-fixture-tools.tar
 
-      - name: Upload test images
-        uses: actions/upload-artifact@v7
-        with:
-          name: avet-test-image
-          path: |
-            ${{ runner.temp }}/avet-test.tar
-            ${{ runner.temp }}/avet-fixture-tools.tar
-          if-no-files-found: error
-          retention-days: 1
-
-      # From the directory, so a new suite gets its runner without touching this file.
-      - name: List suites
-        id: suites
-        run: |
-          list=$(find test/suites -name '*.sh' -printf '%f\n' | sed 's/\.sh$//' | sort | jq -Rsc 'split("\n")[:-1]')
-          # An empty matrix skips the job, and a skipped job counts as passed below.
-          [ "$list" != "[]" ] || { echo "::error::no test suites found"; exit 1; }
-          echo "list=$list" >> "$GITHUB_OUTPUT"
-
-  integration:
-    name: integration (${{ matrix.suite }})
-    runs-on: ubuntu-latest
-    needs: image
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: ${{ fromJSON(needs.image.outputs.suites) }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Download test images
-        uses: actions/download-artifact@v8
-        with:
-          name: avet-test-image
-          path: ${{ runner.temp }}
-
-      - name: Load test images
-        run: |
-          docker load -i "$RUNNER_TEMP/avet-test.tar"
-          docker load -i "$RUNNER_TEMP/avet-fixture-tools.tar"
-
-      - name: Run integration tests
-        env:
-          SUITE: ${{ matrix.suite }}
-        run: ./test/run.sh --no-build "$SUITE"
-
-  # The arm64 side of what the integration job proves for amd64. On pushes too: changes
-  # land as direct pushes to main, and a PR-only job would miss them.
-  build-arm64:
-    name: Build arm64 (no push)
-    needs: test
-    runs-on: ubuntu-26.04-arm
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm64
-          load: true
-          tags: avet:arm64
-          cache-from: type=gha,scope=arm64
-          cache-to: type=gha,mode=max,scope=arm64
-
-      # Compiling proves nothing about a binary that aborts under aarch64 musl, or a
-      # library missing from the runtime stage.
       - name: Every bundled tool starts
         run: |
-          docker run --rm --entrypoint sh avet:arm64 -c '
+          docker load -i "$RUNNER_TEMP/avet-test.tar"
+          docker run --rm --entrypoint sh avet:test -c '
             set -e
             ffmpeg   -hide_banner -version >/dev/null
             ffprobe  -hide_banner -version >/dev/null
@@ -167,9 +136,56 @@ jobs:
             timeout -s KILL 10 avet >/tmp/start.log 2>&1 || true
             grep -q "avet started" /tmp/start.log
           '
+          want=$(sed -n 's/^  FFMPEG_VERSION: n//p' .github/workflows/appimage.yml)
+          have=$(docker run --rm --entrypoint ffmpeg avet:test -version | sed -n 's/^ffmpeg version \([0-9.]*\).*/\1/p')
+          [ "$want" = "$have" ] || echo "::warning::the image has FFmpeg $have, appimage.yml builds $want"
+
+      - name: Upload test images
+        uses: actions/upload-artifact@v7
+        with:
+          name: avet-test-image-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/avet-test.tar
+            ${{ runner.temp }}/avet-fixture-tools.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  integration:
+    name: integration (${{ matrix.suite }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [suites, image]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(needs.suites.outputs.list) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download test images
+        uses: actions/download-artifact@v8
+        with:
+          name: avet-test-image-${{ matrix.arch }}
+          path: ${{ runner.temp }}
+
+      - name: Load test images
+        run: |
+          docker load -i "$RUNNER_TEMP/avet-test.tar"
+          docker load -i "$RUNNER_TEMP/avet-fixture-tools.tar"
+
+      - name: Run integration tests
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: ./test/run.sh --no-build "$SUITE"
 
   build:
-    needs: [test, integration, build-arm64]
+    needs: [test, msrv, integration]
     if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
@@ -211,6 +227,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.GITHUB_IMAGE }}
+          labels: org.opencontainers.image.licenses=GPL-3.0-only
 
       - name: Build and push by digest
         id: build
@@ -241,8 +258,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     timeout-minutes: 20
-    # The tag rules below produce nothing off main or a tag, leaving imagetools no -t.
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       packages: write
@@ -285,8 +300,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            # Stable only: a `v1.2.0-rc1` would otherwise move :latest.
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-') }}
 
       - name: Create and push multi-arch manifest to GHCR
         working-directory: /tmp/digests
@@ -296,6 +309,7 @@ jobs:
             $(printf '${{ env.GITHUB_IMAGE }}@sha256:%s ' *)
 
       - name: Prepare Docker Hub README
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           printf '**Note:** This description is automatically generated from the [GitHub repository README](https://github.com/ivenos/avet).\n\n---\n\n' \
             | cat - README.md > /tmp/dockerhub-readme.md

@@ -24,11 +24,12 @@ const CAMBI_PERCENTILE: f64 = 95.0;
 pub struct DisplayModel {
     width: u32,
     height: u32,
+    diagonal_inches: f64,
     hdr: bool,
 }
 
 /// 30 inches at twice the display height, the geometry of Vship's own standard models.
-const DISPLAY_INCHES: &str = "30";
+const DISPLAY_INCHES: f64 = 30.0;
 const DISPLAY_DISTANCE_M: &str = "0.7472";
 
 impl DisplayModel {
@@ -42,10 +43,10 @@ impl DisplayModel {
         };
         format!(
             "{{\"{}\":{{\"name\":\"avet\",\"resolution\":[{},{}],\"colorspace\":\"{colorspace}\",\
-             \"viewing_distance_meters\":{DISPLAY_DISTANCE_M},\"diagonal_size_inches\":{DISPLAY_INCHES},\
+             \"viewing_distance_meters\":{DISPLAY_DISTANCE_M},\"diagonal_size_inches\":{:.3},\
              \"max_luminance\":{max_luminance},\"contrast\":{contrast},\"E_ambient\":{ambient},\
              \"k_refl\":0.005}}}}",
-            Self::KEY, self.width, self.height
+            Self::KEY, self.width, self.height, self.diagonal_inches
         )
     }
 
@@ -58,10 +59,13 @@ impl DisplayModel {
     }
 }
 
-/// HDR by the signalled transfer, at the resolution the two files are compared at.
-pub fn display_model_for(width: u32, height: u32, hdr_args: &[String]) -> DisplayModel {
+/// HDR by the signalled transfer, at the resolution the two files are compared at. A crop
+/// of `frame` shrinks the display with it, so the pixels keep their size.
+pub fn display_model_for(width: u32, height: u32, frame: (u32, u32), hdr_args: &[String]) -> DisplayModel {
     let hdr = matches!(signalled_transfer(hdr_args), Some("16" | "18"));
-    DisplayModel { width, height, hdr }
+    let diagonal = |w: u32, h: u32| f64::from(w).hypot(f64::from(h));
+    let diagonal_inches = DISPLAY_INCHES * diagonal(width, height) / diagonal(frame.0, frame.1);
+    DisplayModel { width, height, diagonal_inches, hdr }
 }
 
 fn signalled_transfer(hdr_args: &[String]) -> Option<&str> {
@@ -362,7 +366,14 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
 fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
-    let opts = EncodeOptions { dynamic_hdr: Default::default(), hdr10plus_frames: None, ..ctx.opts.clone() };
+    let mut opts = EncodeOptions {
+        dynamic_hdr: Default::default(), hdr10plus_frames: None, deinterlace: None, ..ctx.opts.clone()
+    };
+    // FFVship guesses an untagged matrix from the height, the source's uncropped one included.
+    if !opts.hdr_args.iter().any(|a| a == "--matrix-coefficients") {
+        let guess = if ctx.source_height > 650 { "1" } else { "5" };
+        opts.hdr_args.extend(["--matrix-coefficients".to_string(), guess.to_string()]);
+    }
     let size_bytes = encode::encode_chunk(
         ctx.source,
         ctx.index,
@@ -386,9 +397,9 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
         crop: ctx.opts.crop,
         source_width: ctx.source_width,
         source_height: ctx.source_height,
+        frames: scene.frame_count(),
         display_model: ctx.display_model,
         gpu_id: ctx.gpu_id,
-        n_threads: ctx.n_threads,
         tag: &tag,
     });
     drop(gpu);
@@ -399,7 +410,7 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
         Ok((jod, cambi))
     });
     let _ = std::fs::remove_file(&probe);
-    let (jod, cambi) = result?;
+    let (jod, cambi) = result.with_context(|| format!("measure chunk {:05} at crf {crf}", scene.index + 1))?;
     let size_pct = chunk_size_pct(size_bytes, ctx.source_byte_index, scene.start_frame, scene.end_frame);
     Ok(Probe { crf, jod, cambi, size_pct })
 }
@@ -535,12 +546,12 @@ struct MeasureOpts<'a> {
     work_dir: &'a Path,
     /// First source frame of the chunk; the probe holds those frames from 0.
     start: u64,
+    frames: u64,
     crop: Option<Crop>,
     source_width: u32,
     source_height: u32,
     display_model: DisplayModel,
     gpu_id: u32,
-    n_threads: usize,
     /// Unique suffix for the per-measurement json file.
     tag: &'a str,
 }
@@ -558,6 +569,7 @@ impl Drop for Cleanup {
 /// A driver reset, a GPU in use by something else or a lost device all come back on their
 /// own; anything else FFVship reports is a verdict on the file.
 fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
+    // Vship throws these as C++ exceptions, so they arrive with an abort.
     const RECOVERABLE: &[&str] = &[
         "VK_ERROR_DEVICE_LOST",
         "VK_ERROR_OUT_OF_DEVICE_MEMORY",
@@ -565,6 +577,15 @@ fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyh
         "out of device memory",
         "no Vulkan device",
         "OutOfVRAM",
+        "BadDeviceArgument",
+        "failed to create vulkan instance",
+        "failed to find GPUs with Vulkan support",
+        "failed to create logical device",
+        "Failed to initialize VmaAllocator",
+        "Failed to Allocate Memory",
+        "device lost",
+        "Failed to synchronize to Fence",
+        "Failed to Submit commandBuffer",
     ];
     let err = crate::ext::tool_error(what, status, stderr);
     if err.downcast_ref::<crate::job::Transient>().is_none()
@@ -589,9 +610,7 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
         .arg("--json").arg(&json);
 
     // A wedged GPU takes the worker with it, and nothing above would notice.
-    const TIMEOUT_SECS: u64 = 1800;
-
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "FFVship")?;
+    let out = crate::ext::output_with_timeout(&mut cmd, 1800 + m.frames, "FFVship")?;
     if !out.status.success() {
         return Err(gpu_error("FFVship", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
@@ -611,10 +630,6 @@ fn measure_args(m: &MeasureOpts) -> Vec<String> {
         "--displayModel".into(), DisplayModel::KEY.to_string(),
         "--displayConfig".into(), m.display_model.config_json(),
         "--gpu-id".into(), m.gpu_id.to_string(),
-        // FFVship's own help calls this the number of decoder processes and recommends 2;
-        // it is not the encoder's thread count, and each one holds decoded frames.
-        "-t".into(), m.n_threads.clamp(1, 4).to_string(),
-        "-g".into(), "3".into(),
     ]);
     if let Some(c) = m.crop {
         args.extend([
@@ -639,7 +654,7 @@ fn parse_cvvdp(raw: &str) -> Result<f64> {
 /// libvmaf's full-reference CAMBI clamps the per-frame diff at 0, so banding the source
 /// already had costs nothing there.
 fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str) -> Result<Cambi> {
-    const TIMEOUT_SECS: u64 = 1800;
+    let timeout_secs = 1800 + scene.frame_count();
 
     let fifo = ctx.temp_dir.join(format!("cambi_{tag}.y4m"));
     let json = ctx.temp_dir.join(format!("cambi_{tag}.json"));
@@ -663,7 +678,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let mut decoder = match std::process::Command::new(external_bin("ffmpeg"))
         // CAMBI only scores flat areas, and synthesized grain leaves none: it would read 0.
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-export_side_data", "film_grain", "-i"]).arg(probe)
-        .args(["-map", "0:v:0", "-strict", "-1", "-f", "yuv4mpegpipe"]).arg(&fifo)
+        .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-strict", "-1", "-f", "yuv4mpegpipe"]).arg(&fifo)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -680,7 +695,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let (source, index, opts) = (ctx.source.to_path_buf(), ctx.index.to_path_buf(), ctx.opts.clone());
     let (start, end) = (scene.start_frame, scene.end_frame);
     let writer = std::thread::spawn(move || -> Result<()> {
-        let mut vs = VideoSource::open(&source, &index, OpenOpts { target_bit_depth: opts.target_bit_depth })
+        let mut vs = VideoSource::open(&source, &index, OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: false })
             .context("open FFMS2 VideoSource")?;
         vs.info.fps_num = opts.fps_num;
         vs.info.fps_den = opts.fps_den;
@@ -691,7 +706,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let vmaf_err = crate::ext::drain_text(vmaf.stderr.take());
     let dec_err = crate::ext::drain_text(decoder.stderr.take());
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut hold = Some(hold);
     let (mut vmaf_status, mut dec_status) = (None, None);
     while vmaf_status.is_none() || dec_status.is_none() {
@@ -709,7 +724,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
                 reap(&mut vmaf);
                 reap(&mut decoder);
                 return Err(anyhow::Error::new(crate::job::Transient)
-                    .context(format!("vmaf did not finish within {TIMEOUT_SECS}s - killed")));
+                    .context(format!("vmaf did not finish within {timeout_secs}s - killed")));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
@@ -831,13 +846,13 @@ mod tests {
     fn display_model_follows_the_signalled_transfer() {
         let args = |t: &str| vec!["--transfer-characteristics".to_string(), t.to_string()];
 
-        assert_eq!(display_model_for(3840, 2160, &args("16")).describe(), "3840x2160 HDR");
-        assert_eq!(display_model_for(3840, 2160, &args("18")).describe(), "3840x2160 HDR");
-        assert_eq!(display_model_for(1280, 720, &args("18")).describe(), "1280x720 HDR");
+        assert_eq!(display_model_for(3840, 2160, (3840, 2160), &args("16")).describe(), "3840x2160 HDR");
+        assert_eq!(display_model_for(3840, 2160, (3840, 2160), &args("18")).describe(), "3840x2160 HDR");
+        assert_eq!(display_model_for(1280, 720, (1280, 720), &args("18")).describe(), "1280x720 HDR");
 
         // An SDR source signals bt709; an HDR display costs it ~2.5 JOD.
-        assert_eq!(display_model_for(1920, 1080, &args("1")).describe(), "1920x1080 SDR");
-        assert_eq!(display_model_for(3840, 2160, &[]).describe(), "3840x2160 SDR");
+        assert_eq!(display_model_for(1920, 1080, (1920, 1080), &args("1")).describe(), "1920x1080 SDR");
+        assert_eq!(display_model_for(3840, 2160, (3840, 2160), &[]).describe(), "3840x2160 SDR");
     }
 
     #[test]
@@ -845,13 +860,13 @@ mod tests {
         let pq = vec!["--transfer-characteristics".to_string(), "16".to_string()];
 
         // Vship reads pixels-per-degree off the model, so this is what fixes the reading.
-        let hdr = display_model_for(1920, 1080, &pq).config_json();
+        let hdr = display_model_for(1920, 1080, (1920, 1080), &pq).config_json();
         assert!(hdr.contains("\"resolution\":[1920,1080]"), "{hdr}");
         assert!(hdr.contains("\"colorspace\":\"HDR\""), "{hdr}");
         assert!(hdr.contains("\"max_luminance\":1500"), "{hdr}");
         assert!(hdr.starts_with(&format!("{{\"{}\":", DisplayModel::KEY)), "{hdr}");
 
-        let sdr = display_model_for(3840, 2160, &[]).config_json();
+        let sdr = display_model_for(3840, 2160, (3840, 2160), &[]).config_json();
         assert!(sdr.contains("\"resolution\":[3840,2160]"), "{sdr}");
         assert!(sdr.contains("\"colorspace\":\"sRGB\""), "{sdr}");
         assert!(sdr.contains("\"max_luminance\":200"), "{sdr}");
@@ -861,6 +876,19 @@ mod tests {
             assert!(sdr.contains(key), "{key} missing from {sdr}");
         }
         assert!(!sdr.contains('\n'), "the config goes through argv as one token");
+    }
+
+    #[test]
+    fn a_crop_keeps_the_pixels_of_the_uncropped_frame() {
+        let pitch = |m: DisplayModel| m.diagonal_inches / f64::from(m.width).hypot(f64::from(m.height));
+        let full = display_model_for(1920, 1080, (1920, 1080), &[]);
+        assert_eq!(full.diagonal_inches, 30.0);
+        assert!(full.config_json().contains("\"diagonal_size_inches\":30.000"), "{}", full.config_json());
+
+        for (w, h) in [(1920, 800), (1440, 1080), (1440, 800)] {
+            let cropped = display_model_for(w, h, (1920, 1080), &[]);
+            assert!((pitch(cropped) - pitch(full)).abs() < 1e-12, "{w}x{h}");
+        }
     }
 
     #[test]
@@ -1190,12 +1218,12 @@ mod tests {
             index: Path::new("film.ffindex"),
             work_dir: Path::new("."),
             start: 720,
+            frames: 48,
             crop,
             source_width: 1920,
             source_height: 1080,
-            display_model: display_model_for(1920, 940, &[]),
+            display_model: display_model_for(1920, 940, (1920, 940), &[]),
             gpu_id: 1,
-            n_threads: 6,
             tag: "00003_28",
         };
         let pair = |args: &[String], flag: &str| {

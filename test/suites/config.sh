@@ -4,7 +4,7 @@
 
 WORKDIR=$(test_workdir)
 
-# -- unknown encoder value: TOML deserialization fails ------------------------
+# unknown encoder value: TOML deserialization fails
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -17,7 +17,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "parse encode.toml"
 
-# -- invalid TOML syntax: parse error -----------------------------------------
+# invalid TOML syntax: parse error
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf 'this is not valid toml !!!\n' > "$I/p/encode.toml"
@@ -25,7 +25,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "parse encode.toml"
 
-# -- audio.mode=encode without codec: validation error ------------------------
+# audio.mode=encode without codec: validation error
 I="$WORKDIR/3/in"; O="$WORKDIR/3/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -41,7 +41,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio: codec required when mode = encode"
 
-# -- codec_rule encode without bitrate: validation error ----------------------
+# codec_rule encode without bitrate: validation error
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -56,7 +56,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio.codec_rules.ac3: bitrate required when mode = encode"
 
-# -- TOML bool param serialized as 1/0, not true/false ------------------------
+# TOML bool param serialized as 1/0, not true/false
 I="$WORKDIR/5/in"; O="$WORKDIR/5/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -70,7 +70,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bool param: no output"
 assert_log_contains     "fast-decode=1"
 assert_log_not_contains "fast-decode=true"
 
-# -- all encoder param types appear in "encoder args:" log --------------------
+# all encoder param types appear in "encoder args:" log
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -89,7 +89,7 @@ assert_log_contains "film-grain-denoise=0"
 assert_log_contains "tune=0"
 assert_log_contains "fast-decode=1"
 
-# -- audio.mode=encode without bitrate: validation error ----------------------
+# audio.mode=encode without bitrate: validation error
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -105,7 +105,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "audio: bitrate required when mode = encode"
 
-# -- no encoder without video=copy: validation error --------------------------
+# no encoder without video=copy: validation error
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -117,7 +117,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "encoder is required"
 
-# -- avet.bit_depth = 12: validation error ------------------------------------
+# avet.bit_depth = 12: validation error
 I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -132,7 +132,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "bit_depth"
 
-# -- misspelled key is rejected, not silently ignored -------------------------
+# misspelled key is rejected, not silently ignored
 I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -147,7 +147,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "unknown field"
 
-# -- misspelled section is rejected too ---------------------------------------
+# misspelled section is rejected too
 # Otherwise it parses as "no target quality configured" and the job runs on silently.
 I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
@@ -163,7 +163,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "unknown field"
 
-# -- avet.scale = 0 is rejected instead of becoming a no-op -------------------
+# avet.scale = 0 is rejected instead of becoming a no-op
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -178,7 +178,7 @@ run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "avet.scale must be at least 64"
 
-# -- a key or value only the encoder checks is retried, not marked failed ------
+# a key or value only the encoder checks is retried, not marked failed
 I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\nprest = 6\n' > "$I/p/encode.toml"
@@ -214,7 +214,7 @@ assert_log_contains    "Option not found"
 assert_log_contains    "retrying on the next scan"
 assert_file_not_exists "$O/.avet_test/.failed"
 
-# -- a transient failure leaves no .failed marker -----------------------------
+# a transient failure leaves no .failed marker
 # The profile is broken, not the file, so the next scan has to pick it up after the fix.
 assert_dir_not_exists "$WORKDIR/12/out/.avet_test"
 

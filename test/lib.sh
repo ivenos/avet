@@ -9,6 +9,7 @@
 #
 # Environment:
 #   TEST_IMAGE      Docker image to use (default: avet:test)
+#   TEST_CPUS       CPU share for the avet container, e.g. 0.5 to slow a job down
 #   FIXTURES_DIR    Path to the fixtures run.sh generates
 #   VERBOSE=1       Print Docker logs on failure
 
@@ -26,8 +27,6 @@ _DONE=0
 _SCRATCH=$(mktemp -d)
 RUN_LOGS=""
 _ESC=$(printf '\033')
-
-# -- Tools ---------------------------------------------------------------------
 
 # Every probe runs the image's ffmpeg and mkvtoolnix: a host build of another version
 # reads side data, timestamps and dispositions differently, or not at all.
@@ -47,8 +46,6 @@ ffprobe()    { tool ffprobe "$@"; }
 mkvmerge()   { tool mkvmerge "$@"; }
 mkvextract() { tool mkvextract "$@"; }
 
-# -- Failure tracking --------------------------------------------------------
-
 fail() {
     _FAIL=1
     _ERRORS="${_ERRORS}  > $1
@@ -58,8 +55,6 @@ fail() {
 test_workdir() {
     mktemp -d -p "$_SCRATCH"
 }
-
-# -- Docker helpers ----------------------------------------------------------
 
 # Run avet and wait until EXPECTED_FILE appears (or TIMEOUT_S elapses).
 # Sets RUN_LOGS with container stdout+stderr.
@@ -71,6 +66,7 @@ run_avet() {
     local cid
     cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
+        ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
@@ -121,6 +117,7 @@ run_avet_timed() {
     local cid
     cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
+        ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
@@ -144,13 +141,12 @@ run_avet_timed() {
     return 0
 }
 
-# -- Daemon helpers ------------------------------------------------------------
-
 # Leaves avet running under AVET_CID, for a test that acts on a live daemon.
 start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
     RUN_LOGS=""
     AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
+        ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
         -v "${1}:/input:z" \
         -v "${2}:/output:z" \
         -e POLL_INTERVAL="${3:-2}" \
@@ -207,8 +203,6 @@ kill_avet() {
     avet_logs
     docker rm -f "$AVET_CID" >/dev/null 2>&1 || true
 }
-
-# -- Assertions ---------------------------------------------------------------
 
 assert_file_exists() {
     [ -f "$1" ] || fail "expected file to exist: $1"
@@ -277,6 +271,15 @@ assert_subtitle_track_count() {
         fail "subtitle track count: expected $expected, got $actual ($file)"
 }
 
+# The BCP 47 language of every track of FILE, in track order, "-" for none.
+assert_bcp47_languages() {
+    local file="$1" expected="$2" actual
+    assert_probeable "$file" || return
+    actual=$(tool mkvinfo "$file" | awk '/^\| \+ Track$/ { n++ } /Language \(IETF BCP 47\):/ { lang[n] = $NF }
+        END { for (i = 1; i <= n; i++) printf "%s%s", (i in lang ? lang[i] : "-"), (i < n ? " " : "") }')
+    [ "$actual" = "$expected" ] || fail "BCP 47 languages: expected '$expected', got '$actual' ($file)"
+}
+
 assert_subtitle_language() {
     local file="$1" idx="$2" expected="$3"
     local actual
@@ -302,19 +305,6 @@ assert_video_height() {
         -show_entries stream=height -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
     [ "$actual" = "$expected" ] || \
         fail "video height: expected $expected, got $actual ($file)"
-}
-
-assert_video_height_le() {
-    local file="$1" max="$2"
-    local actual
-    actual=$(ffprobe -v quiet -select_streams v:0 \
-        -show_entries stream=height -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
-    # Defaulting to 0 would turn "there is no output file" into a passing assertion.
-    case "$actual" in
-        ''|*[!0-9]*) fail "video height: could not read a height from $file"; return ;;
-    esac
-    [ "$actual" -le "$max" ] || \
-        fail "video height: expected <= $max, got $actual ($file)"
 }
 
 assert_video_codec() {
@@ -433,16 +423,14 @@ log_capture() {
 }
 
 assert_log_contains() {
-    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" || \
+    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF -e "$1" || \
         fail "log does not contain: $1"
 }
 
 assert_log_not_contains() {
-    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" && \
+    printf '%s\n' "$RUN_LOGS" | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF -e "$1" && \
         fail "log should NOT contain: $1" || true
 }
-
-# -- Content ---------------------------------------------------------------------
 
 # MPEG-TS lists the stream a second time under its program.
 packet_count() {
@@ -776,25 +764,43 @@ assert_keyframes_at_chunks() {
     [ -z "$missing" ] || fail "keyframes: chunks of $1 start without one at frame(s)$missing"
 }
 
-# A player that seeks lands on the same picture a straight decode shows at that time.
+# A player that seeks lands on the picture a straight decode shows at that time, or the
+# one right after it, and shows it the same.
 assert_seeks_land_on_frames() {
-    local full t got want
+    local full start t got verdict
     full=$(mktemp -p "$_SCRATCH")
-    ffmpeg -hide_banner -v error -copyts -i "$1" -map 0:v:0 -f framemd5 - | awk -F', *' '!/^#/ { print $3, $6 }' > "$full"
+    ffmpeg -hide_banner -v error -copyts -i "$1" -map 0:v:0 -f framemd5 - > "$full"
+    start=$(ffprobe -v error -show_entries format=start_time -of csv=p=0 "$1")
+    case "$start" in ""|N/A) start=0 ;; esac
     for t in 1.3 2.05 4.9 7.7 9.5; do
         got=$(ffmpeg -hide_banner -v error -ss "$t" -i "$1" -map 0:v:0 -frames:v 1 -copyts -f framemd5 - \
             | awk -F', *' '!/^#/ { print $3, $6 }')
-        want=$(awk -v pts="${got%% *}" '$1 == pts { print $2 }' "$full")
-        [ -n "$got" ] && [ "${got##* }" = "$want" ] || fail "seek: $1 at $t s shows '${got##* }', a straight decode '$want'"
+        verdict=$(awk -F', *' -v got="$got" -v t="$t" -v start="$start" '
+            /^#tb 0:/ { split($0, tb, "[ /]+"); target = (t + start) * tb[4] / tb[3] }
+            !/^#/ {
+                pts = $3 + 0; hash[pts] = $6
+                if (pts <= target && (shown == "" || pts > shown)) shown = pts
+                if (pts >= target && (next_ == "" || pts < next_)) next_ = pts
+            }
+            END {
+                if (got == "") { print "no frame"; exit }
+                split(got, g, " "); p = g[1] + 0
+                if (p != shown && p != next_) printf "pts %d instead of %s or %s", p, shown, next_
+                else if (hash[p] != g[2]) printf "pts %d decodes differently", p
+                else print "ok"
+            }' "$full")
+        [ "$verdict" = ok ] || fail "seek: $1 at $t s landed on $verdict"
     done
 }
 
 # The dominant frequency of each channel of audio track INDEX, in Hz, in channel order.
 channel_frequencies() {
     ffmpeg -hide_banner -v error -i "$1" -map "0:a:${2:-0}" \
-        -af "aspectralstats=measure=centroid,ametadata=mode=print:file=-" -f null - \
+        -af "astats=metadata=1:measure_perchannel=RMS_level:measure_overall=none,aspectralstats=measure=centroid,ametadata=mode=print:file=-" \
+        -f null - \
         | awk -F= '/centroid=/ { n = split($1, k, "."); ch = k[n - 1] + 0; sum[ch] += $2; cnt[ch]++; if (ch > max) max = ch }
-                   END { for (c = 1; c <= max; c++) printf "%d\n", sum[c] / cnt[c] }'
+                   /RMS_level=/ { n = split($1, k, "."); rms[k[n - 1] + 0] = ($2 ~ /inf/ ? -999 : $2 + 0) }
+                   END { for (c = 1; c <= max; c++) printf "%d\n", (c in rms && rms[c] < -60) ? 0 : sum[c] / cnt[c] }'
 }
 
 # EXPECTED lists one frequency per channel; each has to come out on its own channel. The
@@ -845,6 +851,22 @@ assert_frames_with_side_data() {
         fail "frames with '$pattern': expected $expected, got $actual ($file)"
 }
 
+# The HDR10+ AverageRGB of every frame of OUT, in display order, is that of REFERENCE
+# decoded from its start.
+assert_hdr10plus_matches() {
+    local out="$1" ref="$2" got want
+    assert_probeable "$out" || return
+    got=$(hdr10plus_average_rgb "$out")
+    want=$(hdr10plus_average_rgb "$ref")
+    [ -n "$want" ] || { fail "HDR10+ per frame: $ref carries none"; return; }
+    [ "$got" = "$want" ] || fail "HDR10+ per frame: $out has AverageRGB '$got', $ref '$want'"
+}
+
+hdr10plus_average_rgb() {
+    ffprobe -v error -select_streams v:0 -show_entries frame_side_data=average_maxrgb -of csv=p=0 "$1" \
+        | grep -o '[0-9]*/100000' | cut -d/ -f1 | paste -sd' ' -
+}
+
 assert_dovi_record() {
     local file="$1" expected="$2" actual
     assert_probeable "$file" || return
@@ -872,8 +894,6 @@ assert_hdr_static_match() {
           if (d > tol) { printf "%s is %s, the source %s", $1, $2, $4; exit } }')
     [ -z "$diff" ] && [ -n "$(hdr_static "$2")" ] || fail "HDR static metadata of $1: ${diff:-source has none}"
 }
-
-# -- Test lifecycle ------------------------------------------------------------
 
 test_done() {
     [ "$_DONE" -eq 0 ] || return 0

@@ -394,9 +394,11 @@ fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
         ("yuv420p12le", 12, Yuv420),
         ("yuv420p16le", 16, Yuv420),
         ("yuv422p",      8, Yuv422),
+        ("yuvj422p",     8, Yuv422),
         ("yuv422p10le", 10, Yuv422),
         ("yuv422p12le", 12, Yuv422),
         ("yuv444p",      8, Yuv444),
+        ("yuvj444p",     8, Yuv444),
         ("yuv444p10le", 10, Yuv444),
         ("yuv444p12le", 12, Yuv444),
     ];
@@ -407,14 +409,19 @@ fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
         }
     }
 
+    const EIGHT_BIT: &[&str] = &[
+        "yuv411p", "yuv410p", "yuv440p", "yuvj440p", "nv12", "nv21", "yuyv422", "uyvy422",
+        "gray", "pal8", "gbrp", "rgb24", "bgr24", "rgba", "bgra", "argb", "abgr", "rgb0", "bgr0",
+    ];
+    let bit_depth = if EIGHT_BIT.iter().any(|n| pix_fmt == get_pixel_format(n)) { 8 } else { 10 };
     // A real format, not the source's own: FFMS2 skips the conversion for a target it
     // already has, and the Y4M header would describe a layout the data does not have.
     tracing::warn!(
-        "unrecognized FFMS pixel format {pix_fmt} - converting it to 10-bit 4:2:0"
+        "unrecognized FFMS pixel format {pix_fmt} - converting it to {bit_depth}-bit 4:2:0"
     );
     PixelFormat {
-        pix_fmt: get_pixel_format("yuv420p10le"),
-        bit_depth: 10,
+        pix_fmt: get_pixel_format(if bit_depth == 8 { "yuv420p" } else { "yuv420p10le" }),
+        bit_depth,
         subsampling: PixelSubsampling::Yuv420,
     }
 }
@@ -488,6 +495,8 @@ impl Drop for VideoSource {
 pub struct OpenOpts {
     /// Force input bit depth (8 or 10); None = match source.
     pub target_bit_depth: Option<u8>,
+    /// Leaves 4:2:2 and 4:4:4 as they are, for a deinterlacer that needs the fields apart.
+    pub keep_subsampling: bool,
 }
 
 impl VideoSource {
@@ -526,8 +535,9 @@ impl VideoSource {
             .or((pixel_format.bit_depth > 10).then_some(10u8));
         let depth = target_depth.unwrap_or(pixel_format.bit_depth.min(10) as u8);
 
-        if depth as u32 != pixel_format.bit_depth || pixel_format.subsampling != PixelSubsampling::Yuv420 {
-            match pixfmt_for(PixelSubsampling::Yuv420, depth) {
+        let subsampling = if opts.keep_subsampling { pixel_format.subsampling } else { PixelSubsampling::Yuv420 };
+        if depth as u32 != pixel_format.bit_depth || pixel_format.subsampling != subsampling {
+            match pixfmt_for(subsampling, depth) {
                 Some(pf) => {
                     if depth as u32 != pixel_format.bit_depth {
                         tracing::info!(
@@ -535,14 +545,14 @@ impl VideoSource {
                             pixel_format.bit_depth, depth
                         );
                     }
-                    if pixel_format.subsampling != PixelSubsampling::Yuv420 {
-                        tracing::info!("chroma conversion: {:?} to Yuv420", pixel_format.subsampling);
+                    if pixel_format.subsampling != subsampling {
+                        tracing::info!("chroma conversion: {:?} to {subsampling:?}", pixel_format.subsampling);
                     }
-                    pixel_format = PixelFormat { pix_fmt: pf, bit_depth: depth as u32, subsampling: PixelSubsampling::Yuv420 };
+                    pixel_format = PixelFormat { pix_fmt: pf, bit_depth: depth as u32, subsampling };
                 }
                 None => {
                     unsafe { FFMS_DestroyVideoSource(ptr) }
-                    bail!("no pixfmt available for 4:2:0 at {depth}-bit");
+                    bail!("no pixfmt available for {subsampling:?} at {depth}-bit");
                 }
             }
         }
@@ -684,10 +694,6 @@ impl VideoSource {
                 let plane_data = frame_ref.data[plane_idx];
                 let linesize   = frame_ref.linesize[plane_idx];
 
-                if plane_data.is_null() {
-                    break;
-                }
-
                 let (plane_w, plane_h, px, py) = if plane_idx == 0 {
                     (out_w, out_h, crop_x, crop_y)
                 } else {
@@ -695,8 +701,13 @@ impl VideoSource {
                 };
 
                 let row_bytes = plane_w * bps;
-                let stride    = linesize as usize;
                 let col_off   = px * bps;
+                let stride = usize::try_from(linesize).unwrap_or(0);
+                if plane_data.is_null() || stride < col_off + row_bytes {
+                    bail!(
+                        "FFMS_GetFrame({frame_n}): plane {plane_idx} has no data or a line size of {linesize}"
+                    );
+                }
 
                 for row in 0..plane_h {
                     let src_row = py + row;
@@ -712,15 +723,14 @@ impl VideoSource {
 }
 
 pub fn run_ffmsindex(source_file: &Path, index_file: &Path) -> Result<()> {
-    const TIMEOUT_SECS: u64 = 3600;
-
     // Scratch name: the next run would read a partial file as "reusing existing index".
     let tmp = index_file.with_extension("ffindex.part");
     let _ = std::fs::remove_file(&tmp);
 
     let mut cmd = std::process::Command::new(external_bin("ffmsindex"));
     cmd.arg("-f").arg(source_file).arg(&tmp);
-    let out = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmsindex")?;
+    let timeout = crate::ext::whole_file_timeout(source_file, 3600);
+    let out = crate::ext::output_with_timeout(&mut cmd, timeout, "ffmsindex")?;
 
     if !out.status.success() {
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -750,17 +760,22 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_pixel_format_is_converted_and_not_passed_through() {
+    fn an_unknown_pixel_format_is_converted_at_its_own_depth_and_not_passed_through() {
         // Passed through, FFMS2 skips swscale and the Y4M header describes the wrong layout.
-        for name in ["yuvj422p", "yuv411p", "nv12", "gray", "bgr24"] {
+        for (name, target, depth) in [
+            ("yuv411p", "yuv420p", 8), ("nv12", "yuv420p", 8), ("gray", "yuv420p", 8), ("bgr24", "yuv420p", 8),
+            ("gbrp10le", "yuv420p10le", 10), ("gray16le", "yuv420p10le", 10),
+        ] {
             let raw = get_pixel_format(name);
             let detected = detect_pixel_format(raw);
             assert_ne!(detected.pix_fmt, raw, "{name} reaches the encoder unconverted");
-            assert_eq!(detected.pix_fmt, get_pixel_format("yuv420p10le"), "{name}");
-            assert_eq!((detected.bit_depth, detected.subsampling), (10, PixelSubsampling::Yuv420));
+            assert_eq!(detected.pix_fmt, get_pixel_format(target), "{name}");
+            assert_eq!((detected.bit_depth, detected.subsampling), (depth, PixelSubsampling::Yuv420), "{name}");
         }
 
-        let known = get_pixel_format("yuv422p10le");
-        assert_eq!(detect_pixel_format(known).pix_fmt, known);
+        for known in ["yuv422p10le", "yuvj422p"] {
+            let raw = get_pixel_format(known);
+            assert_eq!(detect_pixel_format(raw).pix_fmt, raw, "{known}");
+        }
     }
 }

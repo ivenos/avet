@@ -5,7 +5,7 @@
 
 WORKDIR=$(test_workdir)
 
-# -- No GPU: target_quality fails with a clear error, no output, no crash --------
+# No GPU: target_quality fails with a clear error, no output, no crash
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'

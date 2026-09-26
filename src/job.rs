@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::audio;
-use crate::config::{Config, TargetQualityConfig, VideoMode};
+use crate::config::{Config, Encoder, TargetQualityConfig, VideoMode};
 use crate::encode::{self, EncodeOptions};
 use crate::ffms2::{self, Crop};
 use crate::hdr::DynamicHdr;
@@ -32,7 +32,7 @@ impl std::fmt::Display for Transient {
 impl std::error::Error for Transient {}
 
 /// `downcast_ref`, not `chain()`: a `.context()` value is not a link there. ENOSPC too.
-fn is_transient(err: &anyhow::Error) -> bool {
+pub fn is_transient(err: &anyhow::Error) -> bool {
     if err.downcast_ref::<Transient>().is_some() {
         return true;
     }
@@ -70,6 +70,11 @@ struct WorkerCtx<'a> {
 pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     // Marking every video in the folder would keep them all skipped after the fix.
     let config = Config::from_file(&job.encode_toml).context(Transient)?;
+    // Before indexing and scene detection, which a setup without a GPU would pay every scan.
+    let gpu = match &config.target_quality {
+        Some(_) => Some(target_quality::ensure_available().context(Transient)?),
+        None => None,
+    };
 
     let stem = job.stem();
 
@@ -81,6 +86,12 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     if config.avet.video == VideoMode::Copy {
         return run_copy(job, ctx, &config, stem, &temp);
     }
+
+    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
+    for line in audio_plan.summary_lines() {
+        tracing::info!("[{stem}] audio {line}");
+    }
+    audio::check_encoders(&job.source_file, &audio_plan)?;
 
     let video_file = frame_accurate_source(&job.source_file, &temp, stem)?;
     let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
@@ -103,9 +114,18 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let (fps_num, fps_den) = (source_video.fps_num, source_video.fps_den);
     let fps = fps_num as f64 / fps_den as f64;
 
+    // SvtAv1EncApp refuses more than 240 fps, so it gets a fraction and the timestamps the rest.
+    let fps_divisor = if config.encoder == Some(Encoder::SvtAv1) && fps > 240.0 { (fps / 240.0).ceil() as u32 } else { 1 };
     let timestamps = match vfr_timestamps(&source_timestamps, fps_num, fps_den, stem) {
         Some(ts) => {
             tracing::info!("[{stem}] variable frame rate: keeping the source timestamps");
+            write_timestamps(&temp.timestamps_path, &ts, source_video.offset_ms)?;
+            Some(temp.timestamps_path.as_path())
+        }
+        None if fps_divisor > 1 => {
+            tracing::info!("[{stem}] {fps:.3} fps: encoding at a 1/{fps_divisor} rate, the source timestamps keep the real one");
+            let first = source_timestamps.first().copied().unwrap_or(0.0);
+            let ts: Vec<f64> = source_timestamps.iter().map(|t| t - first).collect();
             write_timestamps(&temp.timestamps_path, &ts, source_video.offset_ms)?;
             Some(temp.timestamps_path.as_path())
         }
@@ -115,17 +135,17 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let hdr = crate::hdr::detect(&job.source_file)?;
     let chroma_center = hdr.chroma_center;
     let hevc_source = hdr.codec_name == "hevc";
-    // FFMS2 hands out the RPU of HEVC only.
-    let dv = config.avet.dv && hevc_source;
+    // FFMS2 hands out the RPU of HEVC only, and AV1 has a form for profiles 7 and 8 only.
+    let dv = config.avet.dv && hevc_source && hdr.dv_profile.is_none_or(|p| matches!(p, 7 | 8));
     if config.avet.dv && !hevc_source && hdr.hdr_type == "Dolby Vision" {
         tracing::warn!("[{stem}] HDR: Dolby Vision is only carried from HEVC, not from {}", hdr.codec_name);
     }
     // Profile 5's base layer is IPT-PQ-C2, an image only once the RPU is applied.
-    if hdr.ipt_base_layer() && !dv {
+    if hdr.ipt_base_layer() {
         bail!(
-            "this Dolby Vision stream (profile {}) has no HDR10 base layer, so avet cannot \
-             encode it without its RPU. Set avet.dv = true for an HEVC source, or convert \
-             the source to profile 8 or to plain HDR10 first.",
+            "this Dolby Vision stream (profile {}) has an IPT base layer: its picture exists \
+             only with the RPU applied, which avet does not do. Convert the source to HDR10 \
+             first, for example with ffmpeg's libplacebo filter.",
             hdr.dv_profile.map_or("unknown".into(), |p| p.to_string())
         );
     }
@@ -184,18 +204,20 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         None
     };
 
+    let duration_secs = video_info.num_frames as f64 / fps;
     let crop_str: Option<String> = if config.avet.crop {
-        let duration_secs = video_info.num_frames as f64 / fps;
         crate::crop::detect(&video_file, duration_secs, &temp.crop_cache, stem)?
     } else {
         None
     };
+    let deinterlace = crate::interlace::detect(&video_file, duration_secs, &temp.interlace_cache, stem)?;
 
     let (scale_target, crop, scene_vf) = compute_output_params(
         video_info.width,
         video_info.height,
         crop_str.as_deref(),
         config.avet.scale,
+        deinterlace,
         stem,
     );
 
@@ -212,8 +234,9 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         keyint: auto_keyint,
         scale: scale_target,
         crop,
+        deinterlace,
         fps_num,
-        fps_den,
+        fps_den: fps_den * fps_divisor,
         target_bit_depth: config.avet.bit_depth,
         dynamic_hdr,
         hdr10plus_frames,
@@ -241,12 +264,18 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         crate::resume::read_scenes(&temp.scenes_path)?
     } else {
         tracing::info!("[{stem}] scene detection");
-        let scenes = scene::detect(
+        let mut scenes = scene::detect(
             &video_file,
             &config.scene_detection,
             scene_vf.as_deref(),
             fps,
         )?;
+        let detected = scenes.last().map_or(0, |s| s.end_frame + 1);
+        let gap = (video_info.num_frames as u64).saturating_sub(detected);
+        if gap > 0 && leading_frames(&video_file, &source_timestamps, gap)? == gap {
+            tracing::info!("[{stem}] the first {gap} frames do not decode on their own: scene cuts move by as many");
+            shift_scenes(&mut scenes, gap);
+        }
         crate::resume::write_scenes(&temp.scenes_path, &scenes)?;
         tracing::info!("[{stem}] {} chunks", scenes.len());
         scenes
@@ -301,22 +330,15 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .collect();
     tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
-    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
-    for line in audio_plan.summary_lines() {
-        tracing::info!("[{stem}] audio {line}");
-    }
-
     // FFVship compares at source resolution, so the model follows the crop, not the scale.
     let (reference_width, reference_height) = encode_opts
         .crop
         .map(|c| (c.w, c.h))
         .unwrap_or((video_info.width, video_info.height));
     let (tq_display_model, tq_gpu_id, crf_cache): (Option<target_quality::DisplayModel>, Option<u32>, Option<CrfCache>) =
-        if let Some(tq) = &config.target_quality {
-            // A driver upgrade or a GPU in reset clears on its own.
-            let gpu = target_quality::ensure_available().context(Transient)?;
+        if let (Some(tq), Some(gpu)) = (&config.target_quality, &gpu) {
             let display_model = target_quality::display_model_for(
-                reference_width, reference_height, &encode_opts.hdr_args,
+                reference_width, reference_height, (video_info.width, video_info.height), &encode_opts.hdr_args,
             );
             tracing::info!(
                 "[{stem}] target quality: JOD {} floor (display {}, {}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
@@ -389,7 +411,11 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
                     break;
                 }
                 let Some(scene) = queue.lock().unwrap().next() else { break };
-                if let Err(e) = encode_one(&wctx, scene) {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_one(&wctx, scene)))
+                    .unwrap_or_else(|panic| Err(anyhow::anyhow!(
+                        "chunk {:05} panicked: {}", scene.index + 1, crate::panic_message(&*panic)
+                    )));
+                if let Err(e) = result {
                     wctx.cancel.store(true, Ordering::Relaxed);
                     first_err.lock().unwrap().get_or_insert(e);
                 }
@@ -435,6 +461,40 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         expected_frames: Some(total_frames),
     };
     finalize(job, ctx, &config, &temp, &audio_plan, video)
+}
+
+/// Frames FFMS2 counts before the first one ffmpeg decodes, such as the open-GOP leftovers at
+/// the start of a recording. The scene detector numbers its frames from after them.
+fn leading_frames(source: &Path, timestamps_ms: &[f64], gap: u64) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct Probe { #[serde(default)] frames: Vec<Frame> }
+    #[derive(serde::Deserialize)]
+    struct Frame { best_effort_timestamp_time: Option<String> }
+
+    let packets = format!("%+#{}", gap + 100);
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "quiet", "-select_streams", "v:0", "-read_intervals", &packets,
+          "-show_entries", "frame=best_effort_timestamp_time", "-of", "json"],
+        source,
+    )
+    .context("probe the first decoded frame")?;
+    let Some(first_ms) = probe.frames.first()
+        .and_then(|f| f.best_effort_timestamp_time.as_deref()?.parse::<f64>().ok())
+        .map(|s| s * 1000.0)
+    else {
+        return Ok(0);
+    };
+    Ok(timestamps_ms.iter().take_while(|&&t| t < first_ms - 0.5).count() as u64)
+}
+
+/// The first chunk takes the leading frames, every later cut moves by as many.
+fn shift_scenes(scenes: &mut [SceneEntry], by: u64) {
+    for (i, s) in scenes.iter_mut().enumerate() {
+        if i > 0 {
+            s.start_frame += by;
+        }
+        s.end_frame += by;
+    }
 }
 
 /// `total_frames` is summed from this list and `validate_output` checks the finished file
@@ -489,6 +549,7 @@ fn finalize(
     let stem = job.stem();
     let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
     audio::extract(&job.source_file, &temp.tracks_path, audio_plan, &subtitles.extract)?;
+    let languages = audio::Languages::probe(&job.source_file)?;
 
     let final_output = job.output_dir(&ctx.output_dir).join(format!("{stem}.mkv"));
     // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
@@ -501,7 +562,9 @@ fn finalize(
     // Into the temp dir first: the next scan reads a half-written output as "already done".
     tracing::info!("[{stem}] muxing to {}", final_output.display());
     audio::mux_final(
-        video.path, &video.args, video.timestamps, &temp.tracks_path, &job.source_file,
+        video.path, &video.args, video.timestamps,
+        &temp.tracks_path, &languages.of_tracks(audio_plan, &subtitles.extract),
+        &job.source_file, languages.video(),
         video.source_shift_ms, &subtitles.from_source, &temp.mux_path,
     )?;
     if video.expected_frames.is_none() {
@@ -522,19 +585,24 @@ fn finalize(
         return Err(anyhow::Error::new(Transient)
             .context(format!("{} changed during the encode", job.source_file.display())));
     }
+    // mkvmerge does not fsync, and the source is archived right after the rename.
+    std::fs::File::open(&temp.mux_path)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("flush {}", temp.mux_path.display()))?;
     std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
         format!("move {} to {}", temp.mux_path.display(), final_output.display())
     })?;
 
-    // Delivered: the scanner short-circuits on "output exists", so nothing below retries.
-    if let Err(e) = archive_source(job, ctx) {
-        tracing::error!("[{stem}] output is in place, but archiving the source failed: {e:#}");
-    }
-
+    // Delivered: the scanner short-circuits on "output exists", so nothing below retries. The
+    // temp dir goes first, before a copy to another disk that a stop could cut short.
     if !config.avet.keep_temp
         && let Err(e) = std::fs::remove_dir_all(&temp.path)
     {
         tracing::error!("[{stem}] could not remove temp dir {}: {e:#}", temp.path.display());
+    }
+
+    if let Err(e) = archive_source(job, ctx) {
+        tracing::error!("[{stem}] output is in place, but archiving the source failed: {e:#}");
     }
 
     tracing::info!("[{stem}] done");
@@ -570,7 +638,8 @@ fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<Pa
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "stream=has_b_frames:format=format_name", "-of", "json"],
         source,
-    )?;
+    )
+    .context("probe the container for B-frames")?;
     let Some(video) = probe.streams.first() else { return Ok(source.to_path_buf()) };
     if probe.format.format_name != "avi" || video.has_b_frames == 0 {
         return Ok(source.to_path_buf());
@@ -587,11 +656,13 @@ fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<Pa
         .arg(source)
         .args(["-map", "0:v:0", "-c", "copy", "-f", "matroska"])
         .arg(&part);
-    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "ffmpeg remux")?;
+    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source, 3600), "ffmpeg remux")?;
     if !out.status.success() {
         return Err(crate::ext::tool_error("ffmpeg remux", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
-    std::fs::rename(&part, &temp.remux_path)
+    std::fs::File::open(&part)
+        .and_then(|f| f.sync_all())
+        .and_then(|()| std::fs::rename(&part, &temp.remux_path))
         .with_context(|| format!("move {} to {}", part.display(), temp.remux_path.display()))?;
     Ok(temp.remux_path.clone())
 }
@@ -607,7 +678,8 @@ fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str) -> Result<()>
     let format: Format = crate::ext::ffprobe_json(
         &["-v", "error", "-show_entries", "format=start_time", "-of", "json"],
         source,
-    )?;
+    )
+    .context("probe the source start time")?;
     let source_start = format.format.start_time.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
     let (Some(first), Some(actual)) = (first_video_pts(source)?, first_video_pts(&temp.mux_path)?) else {
         return Ok(());
@@ -637,7 +709,7 @@ fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str) -> Result<()>
         cmd.arg("--chapter-sync").arg(others_ms.to_string());
     }
     cmd.arg(&temp.mux_path);
-    let out = crate::ext::output_with_timeout(&mut cmd, 3600, "mkvmerge")?;
+    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(&temp.mux_path, 3600), "mkvmerge")?;
     if out.status.code().unwrap_or(2) >= 2 {
         return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
     }
@@ -656,7 +728,8 @@ fn first_video_pts(path: &Path) -> Result<Option<f64>> {
         &["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#32",
           "-show_entries", "packet=pts_time,dts_time", "-of", "json"],
         path,
-    )?;
+    )
+    .with_context(|| format!("probe the first video timestamps of {}", path.display()))?;
     let earliest = |time: fn(&Packet) -> Option<&String>| {
         probe.packets.iter().filter_map(|p| time(p)?.parse::<f64>().ok()).reduce(f64::min)
     };
@@ -834,7 +907,7 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
     {
         tracing::warn!("[{stem}] could not record source path: {e:#}");
     }
-    if let Err(e) = std::fs::write(&temp.failed_path, format!("{err:#}")) {
+    if let Err(e) = crate::resume::write_atomic(&temp.failed_path, format!("{err:#}").as_bytes()) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
     }
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
@@ -878,6 +951,7 @@ fn compute_output_params(
     src_h: u32,
     crop_str: Option<&str>,
     target_height: Option<u32>,
+    deinterlace: Option<crate::interlace::FieldOrder>,
     stem: &str,
 ) -> (Option<(u32, u32)>, Option<Crop>, Option<String>) {
     // Once, here: Y4M writer, detection filter and FFVship all read this rectangle.
@@ -900,37 +974,45 @@ fn compute_output_params(
         })
     });
 
+    // Interlaced 4:2:0 alternates fields by chroma row, so a crop from row 2 would swap them.
+    let src_crop = match (src_crop, deinterlace) {
+        (Some(c), Some(_)) if c.y % 4 != 0 => Some(Crop { y: c.y - c.y % 4, h: c.h + c.y % 4, ..c }),
+        (c, _) => c,
+    };
+
     let (eff_w, eff_h) = match src_crop {
         Some(c) => (c.w, c.h),
         None    => (src_w, src_h),
     };
 
-    let scale_factor: f64 = match target_height {
-        Some(th) if eff_h > th => th as f64 / eff_h as f64,
-        _ => 1.0,
-    };
-
-    let scale_target: Option<(u32, u32)> = (scale_factor < 1.0).then(|| {
-        let tw = round_down_even((eff_w as f64 * scale_factor) as u32);
-        let th = round_down_even((eff_h as f64 * scale_factor) as u32);
-        tracing::info!("[{stem}] auto-scale: {eff_w}x{eff_h} to {tw}x{th} (factor {scale_factor:.4})");
+    let scale_target: Option<(u32, u32)> = target_height.filter(|&th| eff_h > th).map(|th| {
+        let th = round_down_even(th);
+        let tw = (u64::from(eff_w) * u64::from(th) + u64::from(eff_h) / 2) / u64::from(eff_h);
+        let tw = round_down_even(tw as u32);
+        tracing::info!("[{stem}] auto-scale: {eff_w}x{eff_h} to {tw}x{th}");
         (tw, th)
     });
 
-    let scene_vf = build_scene_vf(src_crop, scale_target);
+    let scene_vf = build_scene_vf(src_crop, deinterlace, scale_target);
 
     (scale_target, src_crop, scene_vf)
 }
 
-/// ffmpeg -vf filter for scene detection (source-space crop + optional scale).
-fn build_scene_vf(crop: Option<Crop>, scale_target: Option<(u32, u32)>) -> Option<String> {
-    let crop = crop.map(|c| c.to_filter());
-    match (crop, scale_target) {
-        (None,    None)         => None,
-        (Some(c), None)         => Some(c),
-        (None,    Some((w, h))) => Some(format!("scale={w}:{h}")),
-        (Some(c), Some((w, h))) => Some(format!("{c},scale={w}:{h}")),
-    }
+/// ffmpeg -vf filter for scene detection, in the order the encode pipe applies them.
+fn build_scene_vf(
+    crop: Option<Crop>,
+    deinterlace: Option<crate::interlace::FieldOrder>,
+    scale_target: Option<(u32, u32)>,
+) -> Option<String> {
+    let filters: Vec<String> = [
+        crop.map(|c| c.to_filter()),
+        deinterlace.map(|d| d.filter().to_string()),
+        scale_target.map(|(w, h)| format!("scale={w}:{h}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!filters.is_empty()).then(|| filters.join(","))
 }
 
 fn round_down_even(v: u32) -> u32 {
@@ -972,6 +1054,9 @@ fn profile_fingerprint(
         format!("{scene_cfg:?}"),
         format!("{tq:?}"),
     ];
+    if let Some(order) = opts.deinterlace {
+        parts.push(format!("deinterlace={order:?}"));
+    }
     if opts.dynamic_hdr.any() {
         parts.push(format!("{:?}", opts.dynamic_hdr));
         // The bitstream values and the decoder's fallback are not the same metadata.
@@ -1081,14 +1166,11 @@ fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
 /// Cumulative source bytes by frame; empty when it cannot be trusted, which disables the
 /// size cap for the whole job rather than silently for its tail.
 fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Result<Vec<u64>> {
-    // Demuxes the whole file.
-    const TIMEOUT_SECS: u64 = 3600;
-
     let parsed: Packets = match crate::ext::ffprobe_json_with_timeout(
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "packet=size,pts", "-of", "json"],
         source,
-        TIMEOUT_SECS,
+        crate::ext::whole_file_timeout(source, 3600),
     ) {
         Ok(p) => p,
         Err(e) if is_transient(&e) => return Err(e).context("probe the source's packet sizes"),
@@ -1120,9 +1202,8 @@ struct Packets { #[serde(default)] packets: Vec<Pkt> }
 #[derive(serde::Deserialize)]
 struct Pkt { #[serde(default)] size: Option<String>, #[serde(default)] pts: Option<i64> }
 
-/// ffprobe emits packets in decode order; the chunks index this by presentation order.
-/// None where only part of the stream is timestamped: sorting would put those few packets
-/// in front of everything and the chunk ranges would address the wrong bytes.
+/// Decode order in, presentation order out. None where only part of the stream is
+/// timestamped: sorting would move those few packets in front of everything.
 fn cumulative_packet_bytes(packets: &[Pkt]) -> Option<Vec<u64>> {
     let timestamped = packets.iter().filter(|p| p.pts.is_some()).count();
     if timestamped != 0 && timestamped != packets.len() {
@@ -1175,7 +1256,7 @@ fn write_timestamps(path: &Path, ts: &[f64], offset_ms: i64) -> Result<()> {
     for t in ts {
         let _ = writeln!(text, "{:.3}", t + offset_ms as f64);
     }
-    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+    crate::resume::write_atomic(path, text.as_bytes())
 }
 
 /// What the video stream needs beyond its frames to play back where and how it did.
@@ -1231,7 +1312,8 @@ fn probe_source_video(source: &Path) -> Result<SourceVideo> {
           "-show_entries", "format=format_name,start_time",
           "-of", "json"],
         source,
-    )?;
+    )
+    .context("probe the source video stream")?;
     SourceVideo::from_probe(probe)
 }
 
@@ -1393,7 +1475,7 @@ mod output_param_tests {
     #[test]
     fn crop_is_normalized_before_anything_downstream_sees_it() {
         // Unrounded, the metric tool and the encoder compared frames a line apart.
-        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:801:0:141"), None, "t");
+        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:801:0:141"), None, None, "t");
         let crop = crop.expect("crop should survive normalization");
         assert_eq!((crop.w, crop.h, crop.x, crop.y), (1920, 800, 0, 140));
         assert_eq!(vf.as_deref(), Some("crop=1920:800:0:140"));
@@ -1441,34 +1523,68 @@ mod output_param_tests {
 
     #[test]
     fn an_odd_frame_size_loses_its_last_column_and_row_up_front() {
-        let (scale, crop, vf) = compute_output_params(321, 181, None, None, "t");
+        let (scale, crop, vf) = compute_output_params(321, 181, None, None, None, "t");
         assert_eq!(crop, Some(Crop { w: 320, h: 180, x: 0, y: 0 }));
         assert_eq!(vf.as_deref(), Some("crop=320:180:0:0"));
         assert_eq!(scale, None);
 
-        assert_eq!(compute_output_params(320, 180, None, None, "t").1, None);
+        assert_eq!(compute_output_params(320, 180, None, None, None, "t").1, None);
     }
 
     #[test]
     fn crop_larger_than_the_source_is_dropped() {
-        let (_, crop, vf) = compute_output_params(1280, 720, Some("crop=1920:800:0:140"), None, "t");
+        let (_, crop, vf) = compute_output_params(1280, 720, Some("crop=1920:800:0:140"), None, None, "t");
         assert_eq!(crop, None);
         assert_eq!(vf, None);
     }
 
     #[test]
     fn scale_applies_to_the_cropped_size_and_keeps_even_edges() {
-        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:800:0:140"), Some(400), "t");
+        let (scale, crop, vf) = compute_output_params(1920, 1080, Some("crop=1920:800:0:140"), Some(400), None, "t");
         assert_eq!(crop.map(|c| (c.w, c.h)), Some((1920, 800)));
         assert_eq!(scale, Some((960, 400)));
         assert_eq!(vf.as_deref(), Some("crop=1920:800:0:140,scale=960:400"));
+
+        let tff = Some(crate::interlace::FieldOrder::Tff);
+        let (_, _, vf) = compute_output_params(720, 576, Some("crop=704:576:8:0"), Some(288), tff, "t");
+        assert_eq!(vf.as_deref(), Some("crop=704:576:8:0,bwdif=mode=send_frame:parity=tff:deint=all,scale=352:288"));
+    }
+
+    #[test]
+    fn an_interlaced_crop_starts_on_a_whole_pair_of_chroma_rows() {
+        let tff = Some(crate::interlace::FieldOrder::Tff);
+        let crop = |y, h, deinterlace| {
+            compute_output_params(720, 576, Some(&format!("crop=720:{h}:0:{y}")), None, deinterlace, "t").1.map(|c| (c.y, c.h))
+        };
+        assert_eq!(crop(70, 436, tff), Some((68, 438)));
+        assert_eq!(crop(72, 432, tff), Some((72, 432)));
+        assert_eq!(crop(70, 436, None), Some((70, 436)));
+    }
+
+    #[test]
+    fn leading_frames_join_the_first_chunk_and_every_cut_moves() {
+        let mut scenes = vec![scene(0, 0, 24), scene(1, 25, 99), scene(2, 100, 324)];
+        shift_scenes(&mut scenes, 6);
+        let bounds: Vec<(u64, u64)> = scenes.iter().map(|s| (s.start_frame, s.end_frame)).collect();
+        assert_eq!(bounds, [(0, 30), (31, 105), (106, 330)]);
     }
 
     #[test]
     fn scale_above_the_source_height_is_not_an_upscale() {
-        let (scale, _, vf) = compute_output_params(1280, 720, None, Some(1080), "t");
+        let (scale, _, vf) = compute_output_params(1280, 720, None, Some(1080), None, "t");
         assert_eq!(scale, None);
         assert_eq!(vf, None);
+    }
+
+    #[test]
+    fn a_scale_reaches_the_target_height_exactly() {
+        assert_eq!(compute_output_params(3840, 2140, None, Some(1080), None, "t").0, Some((1938, 1080)));
+        assert_eq!(compute_output_params(1920, 804, None, Some(480), None, "t").0, Some((1146, 480)));
+        assert_eq!(compute_output_params(320, 138, None, Some(88), None, "t").0, Some((204, 88)));
+        assert_eq!(compute_output_params(1920, 1080, None, Some(721), None, "t").0, Some((1280, 720)));
+        for h in (66..=4320).step_by(2) {
+            assert_eq!(compute_output_params(3840, h, None, Some(64), None, "t").0.map(|s| s.1), Some(64), "height {h}");
+        }
     }
 
     fn scene(index: usize, start: u64, end: u64) -> SceneEntry {
