@@ -440,6 +440,18 @@ fn opus_layout(layout: Option<&str>, channels: Option<u32>) -> (&'static str, St
     (name, format!("{fold}aformat=channel_layouts={name}"))
 }
 
+fn opus_bitrate(bitrate: String, layout: &str, audio_index: usize) -> String {
+    let channels = OPUS_LAYOUTS.iter().find(|(n, _)| *n == layout).map_or(1, |(_, c)| c.len()) as u64;
+    let max = 256_000 * channels;
+    match crate::config::parse_bitrate(&bitrate) {
+        Ok(bits) if bits > max => {
+            tracing::warn!("audio track {audio_index}: libopus takes at most {}k for {layout} - using that instead of {bitrate}", max / 1000);
+            format!("{}k", max / 1000)
+        }
+        _ => bitrate,
+    }
+}
+
 /// In float, so the sums cannot clip before aformat's normalized downmix.
 fn fold_unplaced(source: &[&str]) -> Option<String> {
     let folds = |c: &str| FOLDS.iter().find(|(f, _)| *f == c).map(|(_, places)| *places);
@@ -602,6 +614,10 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                     );
                 }
                 b
+            };
+            let bitrate = match (&layout, bitrate) {
+                (Some((name, _)), Some(b)) if codec == "libopus" => Some(opus_bitrate(b, name, track.audio_index)),
+                (_, b) => b,
             };
             let mut options: Vec<(String, String)> = r.options
                 .iter()
@@ -864,21 +880,17 @@ impl Languages {
     }
 }
 
-/// By position, where both tools read the same ISO 639-2 code; a TS descriptor's `ger,eng` as `ger`.
+/// A BCP 47 tag where both tools read the same code at the same place; a TS descriptor's `ger,eng` as `ger`.
 fn matched_tags(ffprobe: &[Option<&str>], mkvmerge: &[(Option<&str>, Option<&str>)]) -> Vec<Option<String>> {
-    if ffprobe.len() != mkvmerge.len() {
-        return vec![None; ffprobe.len()];
-    }
-    ffprobe.iter().zip(mkvmerge)
-        .map(|(ours, (theirs, tag))| {
+    let same_tracks = ffprobe.len() == mkvmerge.len();
+    ffprobe.iter().enumerate()
+        .map(|(i, ours)| {
             let ours = (*ours)?;
             let first = ours.split(',').next()?.trim();
-            if Some(first) != *theirs {
-                return None;
-            }
-            (*tag).filter(|t| t.contains('-'))
-                .or((first != ours).then_some(first))
-                .map(str::to_owned)
+            let bcp47 = mkvmerge.get(i)
+                .filter(|(theirs, _)| same_tracks && *theirs == Some(first))
+                .and_then(|(_, tag)| tag.filter(|t| t.contains('-')));
+            bcp47.or((first != ours).then_some(first)).map(str::to_owned)
         })
         .collect()
 }
@@ -1038,6 +1050,14 @@ mod tests {
     }
 
     #[test]
+    fn an_opus_bitrate_libopus_would_refuse_is_lowered_to_its_limit() {
+        assert_eq!(opus_bitrate("320k".into(), "mono", 0), "256k");
+        assert_eq!(opus_bitrate("600k".into(), "stereo", 0), "512k");
+        assert_eq!(opus_bitrate("320k".into(), "stereo", 0), "320k");
+        assert_eq!(opus_bitrate("1M".into(), "5.1", 0), "1M");
+    }
+
+    #[test]
     fn a_bcp_47_tag_is_kept_only_where_both_tools_agree_on_the_track() {
         let theirs = [(Some("por"), Some("pt-BR")), (Some("por"), Some("pt-PT")), (Some("eng"), Some("en"))];
         assert_eq!(
@@ -1051,8 +1071,9 @@ mod tests {
         let ts = [(Some("ger"), Some("de")), (Some("ger"), Some("de")), (Some("eng"), Some("en"))];
         assert_eq!(
             matched_tags(&[Some("ger,eng"), Some("ger"), Some("fre,eng")], &ts),
-            [Some("ger".to_string()), None, None]
+            [Some("ger".to_string()), None, Some("fre".to_string())]
         );
+        assert_eq!(matched_tags(&[Some("ger,eng"), Some("eng")], &ts[..1]), [Some("ger".to_string()), None]);
     }
 
     fn sample_set() -> HashSet<String> {

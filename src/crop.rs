@@ -1,15 +1,16 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use std::path::Path;
 
 use crate::ext::external_bin;
 use crate::ffms2::Crop;
 
-/// "crop=W:H:X:Y", or None if there is nothing to cut. Cached in the job's temp dir.
+/// "crop=W:H:X:Y" in FFMS2's frame, or None if `visible` has nothing to cut. Cached in the job's temp dir.
 pub fn detect(
     source_file: &Path,
     duration_secs: f64,
     cache_path: &Path,
     stem: &str,
+    visible: Crop,
 ) -> Result<Option<String>> {
     if cache_path.exists() {
         let cached = std::fs::read_to_string(cache_path)
@@ -24,7 +25,7 @@ pub fn detect(
         return Ok(if cached.is_empty() { None } else { Some(cached) });
     }
 
-    let (orig_w, orig_h) = probe_dimensions(source_file)?;
+    let (orig_w, orig_h) = (visible.w, visible.h);
 
     tracing::info!("[{stem}] auto-crop: running cropdetect...");
 
@@ -88,7 +89,7 @@ pub fn detect(
         cacheable = false;
     }
 
-    let result = detected.map(|c| c.to_filter());
+    let result = detected.map(|c| Crop { x: c.x + visible.x, y: c.y + visible.y, ..c }.to_filter());
     if cacheable {
         cache_result(cache_path, result.as_deref().unwrap_or(""));
     }
@@ -125,27 +126,6 @@ fn is_bars(c: &Crop, src_w: u32, src_h: u32) -> bool {
         && centered(c.y, src_h.saturating_sub(c.y + c.h), src_h)
 }
 
-fn probe_dimensions(source_file: &Path) -> Result<(u32, u32)> {
-    #[derive(serde::Deserialize)]
-    struct Root { streams: Vec<Stream> }
-    #[derive(serde::Deserialize)]
-    struct Stream { width: u32, height: u32 }
-
-    let root: Root = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", "v:0",
-          "-show_entries", "stream=width,height", "-of", "json"],
-        source_file,
-    )
-    .context("auto-crop: probe source dimensions")?;
-
-    root.streams
-        .into_iter()
-        .next()
-        .map(|s| (s.width, s.height))
-        .filter(|&(w, h)| w > 0 && h > 0)
-        .context("auto-crop: source has no video stream with a size")
-}
-
 /// The last cropdetect box of one sample, which is its cumulative bounding box.
 fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
     const TIMEOUT_SECS: u64 = 300;
@@ -154,7 +134,7 @@ fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
     // FFMS2 decodes in storage orientation; autorotate would box the displayed image.
     cmd.args(["-noautorotate", "-ss", &seek_secs.to_string()])
         .arg("-i").arg(source_file)
-        // Same track as probe_dimensions; ffmpeg's own pick is by resolution.
+        // The track FFMS2 indexes; ffmpeg's own pick is by resolution.
         .args(["-map", "0:v:0"])
         // Below 1.0 ffmpeg scales the limit by the bit depth; round=16 would report
         // 640x352 for a clean 640x360 source.

@@ -17,6 +17,14 @@ encode crop pattern_bars.mkv 'crop = true'
 assert_log_contains "auto-crop: detected crop=640:276:0:44"
 assert_frames_match "$O/test.mkv" "$SRC" "crop=640:276:0:44"
 
+# a container's crop is the picture, and auto-crop looks inside it
+encode pixcrop pattern_pixcrop.mkv
+assert_log_contains "the container crops the picture to 640x276 at 0,8"
+assert_frames_match "$O/test.mkv" "$SRC"
+encode pixcrop_crop pattern_pixcrop.mkv 'crop = true'
+assert_log_contains "auto-crop: detected crop=480:276:72:8"
+assert_frames_match "$O/test.mkv" "$SRC" "crop=480:276:72:0"
+
 # crop, then scale what is left
 encode crop_scale pattern_bars.mkv 'crop = true\nscale = 138'
 # Downscaled chroma planes cost a few dB, still twice what a shifted frame reaches.

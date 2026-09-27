@@ -389,10 +389,14 @@ pub fn mkvmerge_color_args(encoder_args: &[String], track: u32) -> Vec<String> {
     }
     if let Some(md) = value("--mastering-display").and_then(parse_mastering_display) {
         let [g, b, r, wp, l] = md;
-        push("--chromaticity-coordinates", format!("{},{},{},{},{},{}", r.0, r.1, g.0, g.1, b.0, b.1));
-        push("--white-color-coordinates", format!("{},{}", wp.0, wp.1));
-        push("--max-luminance", l.0.to_string());
-        push("--min-luminance", l.1.to_string());
+        let n = |v: f64| {
+            let s = format!("{v:.10}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        };
+        push("--chromaticity-coordinates", format!("{},{},{},{},{},{}", n(r.0), n(r.1), n(g.0), n(g.1), n(b.0), n(b.1)));
+        push("--white-color-coordinates", format!("{},{}", n(wp.0), n(wp.1)));
+        push("--max-luminance", n(l.0));
+        push("--min-luminance", n(l.1));
     }
     args
 }
@@ -784,6 +788,14 @@ mod tests {
         let untagged_full = ["--color-range", "1"].map(String::from);
         assert_eq!(mkvmerge_color_args(&untagged_full, 0), ["--color-range", "0:2"]);
         assert!(mkvmerge_color_args(&["--color-range", "0"].map(String::from), 0).is_empty());
+    }
+
+    #[test]
+    fn a_float32_luminance_reaches_mkvmerge_short_of_the_19_decimals_it_misreads() {
+        let float32 = ["--mastering-display", "G(0.265,0.69)B(0.15,0.06)R(0.68,0.32)WP(0.3127,0.329)L(1000,0.00009999999747378462)"]
+            .map(String::from);
+        let args = mkvmerge_color_args(&float32, 0);
+        assert!(args.windows(2).any(|w| w == ["--min-luminance", "0:0.0001"]), "{args:?}");
     }
 
     #[test]

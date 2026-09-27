@@ -67,7 +67,7 @@ for spec in s:0 s:1 s:2; do
 done
 assert_chapters_match "$O/test.mkv" "$SRC"
 assert_stream_value "$O/test.mkv" v:0 stream=start_time "0.000000"
-assert_log_not_contains "Warning"
+assert_log_not_contains " WARN "
 
 # the same with a subtitle only mkvmerge reads, video passed through and encoded
 SRC="$FIXTURES_DIR/pattern_offset_vtt.mkv"

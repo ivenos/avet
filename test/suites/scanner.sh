@@ -119,8 +119,8 @@ preset = 12
 crf    = 50
 EOF
 done
-run_avet_timed "$I" "$O" 20 "share this name"
-assert_file_not_exists "$O/test.mkv"
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 20 "no jobs"
+assert_log_not_contains "encoding:"
 assert_file_exists     "$I/a/test.mkv"
 assert_file_exists     "$I/b/test.mkv"
 assert_log_contains    "share this name"
@@ -135,8 +135,8 @@ encoder = "svt-av1"
 preset = 12
 crf    = 50
 EOF
-run_avet_timed "$I" "$O" 20 "share this name"
-assert_file_not_exists "$O/test.mkv"
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 20 "no jobs"
+assert_log_not_contains "encoding:"
 assert_log_contains    "share this name"
 
 # line breaks in folder and file names are encoded like any other name

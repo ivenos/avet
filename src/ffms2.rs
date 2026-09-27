@@ -409,9 +409,28 @@ fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
         }
     }
 
+    const FIELD_SAFE: &[(&str, &str, u32, PixelSubsampling)] = &[
+        ("yuyv422", "yuv422p", 8, Yuv422),
+        ("uyvy422", "yuv422p", 8, Yuv422),
+        ("yvyu422", "yuv422p", 8, Yuv422),
+        ("nv16", "yuv422p", 8, Yuv422),
+        ("yuv411p", "yuv422p", 8, Yuv422),
+        ("yuv440p", "yuv444p", 8, Yuv444),
+        ("yuvj440p", "yuv444p", 8, Yuv444),
+        ("gbrp", "yuv444p", 8, Yuv444),
+        ("rgb24", "yuv444p", 8, Yuv444),
+        ("bgr24", "yuv444p", 8, Yuv444),
+        ("y210le", "yuv422p10le", 10, Yuv422),
+        ("gbrp10le", "yuv444p10le", 10, Yuv444),
+    ];
+    for &(name, target, bit_depth, subsampling) in FIELD_SAFE {
+        if pix_fmt == get_pixel_format(name) {
+            return PixelFormat { pix_fmt: get_pixel_format(target), bit_depth, subsampling };
+        }
+    }
+
     const EIGHT_BIT: &[&str] = &[
-        "yuv411p", "yuv410p", "yuv440p", "yuvj440p", "nv12", "nv21", "yuyv422", "uyvy422",
-        "gray", "pal8", "gbrp", "rgb24", "bgr24", "rgba", "bgra", "argb", "abgr", "rgb0", "bgr0",
+        "yuv410p", "nv12", "nv21", "gray", "pal8", "rgba", "bgra", "argb", "abgr", "rgb0", "bgr0",
     ];
     let bit_depth = if EIGHT_BIT.iter().any(|n| pix_fmt == get_pixel_format(n)) { 8 } else { 10 };
     // A real format, not the source's own: FFMS2 skips the conversion for a target it
@@ -760,17 +779,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_pixel_format_is_converted_at_its_own_depth_and_not_passed_through() {
+    fn an_unknown_pixel_format_is_converted_at_its_own_depth_with_no_row_resampled() {
+        use PixelSubsampling::*;
         // Passed through, FFMS2 skips swscale and the Y4M header describes the wrong layout.
-        for (name, target, depth) in [
-            ("yuv411p", "yuv420p", 8), ("nv12", "yuv420p", 8), ("gray", "yuv420p", 8), ("bgr24", "yuv420p", 8),
-            ("gbrp10le", "yuv420p10le", 10), ("gray16le", "yuv420p10le", 10),
+        for (name, target, depth, subsampling) in [
+            ("nv12", "yuv420p", 8, Yuv420), ("gray", "yuv420p", 8, Yuv420), ("gray16le", "yuv420p10le", 10, Yuv420),
+            ("yuv411p", "yuv422p", 8, Yuv422), ("yuyv422", "yuv422p", 8, Yuv422), ("uyvy422", "yuv422p", 8, Yuv422),
+            ("bgr24", "yuv444p", 8, Yuv444), ("gbrp10le", "yuv444p10le", 10, Yuv444),
         ] {
             let raw = get_pixel_format(name);
             let detected = detect_pixel_format(raw);
             assert_ne!(detected.pix_fmt, raw, "{name} reaches the encoder unconverted");
             assert_eq!(detected.pix_fmt, get_pixel_format(target), "{name}");
-            assert_eq!((detected.bit_depth, detected.subsampling), (depth, PixelSubsampling::Yuv420), "{name}");
+            assert_eq!((detected.bit_depth, detected.subsampling), (depth, subsampling), "{name}");
         }
 
         for known in ["yuv422p10le", "yuvj422p"] {

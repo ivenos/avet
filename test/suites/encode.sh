@@ -32,6 +32,7 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "keyint override: no output"
 assert_log_contains     "auto-keyint"
 assert_log_contains     "keyint=240"
+assert_log_not_contains "keyint=120"
 
 # auto-HDR param skipped when encoder_params has the same key
 I="$WORKDIR/3/in"; O="$WORKDIR/3/out"; mkdir -p "$I/p" "$O"

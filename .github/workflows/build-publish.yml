@@ -182,7 +182,7 @@ jobs:
       - name: Run integration tests
         env:
           SUITE: ${{ matrix.suite }}
-        run: ./test/run.sh --no-build "$SUITE"
+        run: ./test/run.sh --no-build --verbose "$SUITE"
 
   build:
     needs: [test, msrv, integration]

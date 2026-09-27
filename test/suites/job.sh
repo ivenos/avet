@@ -140,8 +140,9 @@ assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$O/.avet_test/.failed"
 assert_log_contains    "has an IPT base layer"
 
-run_avet_timed "$I" "$O" 15 "permanently failed"
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 15 "no jobs"
 assert_log_contains "permanently failed"
+assert_log_not_contains "indexing"
 
 rm -f "$O/.avet_test/.failed"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"

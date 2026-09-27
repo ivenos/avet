@@ -26,9 +26,7 @@ assert_intact() {
 }
 
 killed_after() { # LOG_PATTERN
-    TEST_CPUS=0.5
-    run_avet_timed "$I" "$O" 180 "$1"
-    TEST_CPUS=
+    TEST_CPUS=0.5 run_avet_timed "$I" "$O" 180 "$1"
     assert_log_contains "$1"
     assert_file_not_exists "$O/test.mkv"
     [ -s "$O/.avet_test/done.json" ] || fail "no chunk was finished before the kill"

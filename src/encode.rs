@@ -118,6 +118,28 @@ fn insert_hdr_metadata(
         );
     }
 
+    // mkvmerge builds the Dolby Vision configuration record from the first frame's RPU alone.
+    let readable = |f: &FrameHdrMetadata| {
+        let dv_only = DynamicHdr { dolby_vision: true, hdr10plus: false };
+        f.dovi_rpu.is_some() && crate::hdr::t35_messages(f, dv_only, geometry).is_ok()
+    };
+    let repaired: Vec<FrameHdrMetadata>;
+    let frames = match frames.first() {
+        Some(first) if carry.dolby_vision && scene.index == 0 && !readable(first) => {
+            match frames.iter().position(readable) {
+                Some(i) => {
+                    tracing::warn!("chunk 00001: the first frame has no readable Dolby Vision RPU - using the one of frame {i}");
+                    let mut copy = frames.to_vec();
+                    copy[0].dovi_rpu = frames[i].dovi_rpu.clone();
+                    repaired = copy;
+                    &repaired[..]
+                }
+                None => frames,
+            }
+        }
+        _ => frames,
+    };
+
     let mut unreadable: Vec<anyhow::Error> = Vec::new();
     let messages = frames
         .iter()
@@ -186,14 +208,13 @@ fn encode_direct(
     crop: Option<Crop>,
     hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
 ) -> Result<()> {
-    let mut child = std::process::Command::new(encoder_bin)
-        .args(encoder_args)
+    let mut cmd = std::process::Command::new(encoder_bin);
+    cmd.args(encoder_args)
         .args(["--input", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start encoder '{encoder_name}'"))?;
+        .stderr(Stdio::piped());
+    let mut child = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"))?;
 
     // A progress line per frame: a full stderr pipe deadlocks it against the Y4M writer.
     let err_t = crate::ext::drain_text(child.stderr.take());
@@ -233,18 +254,17 @@ fn encode_filtered(
     let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let ff_err_t = crate::ext::drain_text(ff.stderr.take());
 
-    let mut child = match std::process::Command::new(encoder_bin)
-        .args(encoder_args)
+    let mut cmd = std::process::Command::new(encoder_bin);
+    cmd.args(encoder_args)
         .args(["--input", "-"])
         .stdin(Stdio::from(ff_out))
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'")) {
         Ok(child) => child,
         Err(e) => {
             crate::ext::reap(&mut ff);
-            return Err(e).with_context(|| format!("start encoder '{encoder_name}'"));
+            return Err(e);
         }
     };
     let enc_err_t = crate::ext::drain_text(child.stderr.take());
@@ -258,8 +278,7 @@ fn encode_filtered(
     let ff_stderr  = ff_err_t.join().unwrap_or_default();
     let enc_stderr = enc_err_t.join().unwrap_or_default();
 
-    // Encoder first: its death, even with exit 0, breaks the filter's pipe, never the other way round.
-    let enc_failed = !enc_status.success() || (!ff_status.success() && !enc_stderr.contains("Encoding"));
+    let enc_failed = encoder_to_blame(ff_status.success(), &ff_stderr, enc_status.success(), &enc_stderr);
     if enc_failed || !ff_status.success() {
         let err = if enc_failed {
             encoder_failure(enc_status, &enc_stderr, scene.index)
@@ -275,8 +294,16 @@ fn encode_filtered(
     Ok(())
 }
 
+/// The encoder's death breaks the filter's pipe; a filter that died without one starved the encoder.
+fn encoder_to_blame(ff_ok: bool, ff_stderr: &str, enc_ok: bool, enc_stderr: &str) -> bool {
+    let enc_started = enc_stderr.contains("Encoding");
+    let filter_died_alone = !ff_ok && !enc_started && !ff_stderr.contains("Broken pipe");
+    !filter_died_alone && (!enc_ok || (!ff_ok && !enc_started))
+}
+
 fn spawn_filter(vf: &str, fps_num: u32, fps_den: u32) -> Result<std::process::Child> {
-    std::process::Command::new(external_bin("ffmpeg"))
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
+    cmd
         // Without -r, ffmpeg rounds a Y4M rate near 120 or 240 fps and drops or doubles frames.
         .args(["-hide_banner", "-loglevel", "error", "-f", "yuv4mpegpipe", "-r", &format!("{fps_num}/{fps_den}"), "-i", "pipe:0"])
         // -strict -1: yuv4mpegpipe muxer needs it to write >8-bit Y4M.
@@ -284,8 +311,8 @@ fn spawn_filter(vf: &str, fps_num: u32, fps_den: u32) -> Result<std::process::Ch
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg filter")
+;
+    crate::ext::spawn(&mut cmd, "ffmpeg filter")
 }
 
 /// SvtAv1EncApp exits 0 on a full disk, leaving a short or empty file without a word.
@@ -524,6 +551,16 @@ mod tests {
         assert!(!transient(&mid_encode), "got: {mid_encode:#}");
         let crashed = encoder_failure(ExitStatus::from_raw(11), "", 0);
         assert!(!transient(&crashed), "got: {crashed:#}");
+    }
+
+    #[test]
+    fn a_filter_that_dies_before_its_first_frame_is_blamed_and_not_the_starved_encoder() {
+        let broken_pipe = "Error submitting a packet to the muxer: Broken pipe";
+        assert!(encoder_to_blame(false, broken_pipe, true, "Error: EncoderMode must be in the range of [-1-13]"));
+        assert!(encoder_to_blame(false, broken_pipe, false, "Encoding          \nSvt[error]: bug"));
+        assert!(!encoder_to_blame(false, "No such filter: 'bwdfi'", false, "Svt[error]: Forced Max Width must be at least 1"));
+        assert!(!encoder_to_blame(false, "Invalid data found when processing input", true, "Encoding          "));
+        assert!(!encoder_to_blame(true, "", true, "Encoding          "));
     }
 
     #[test]

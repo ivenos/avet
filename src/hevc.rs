@@ -180,16 +180,15 @@ fn video_packets(source: &Path) -> Result<Vec<Packet>> {
 }
 
 fn scan(source: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
-    let mut child = Command::new(external_bin("ffmpeg"))
-        .args(["-hide_banner", "-loglevel", "error", "-i"])
+    let mut cmd = Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
         .arg(source)
         // -copyinkf: a stream cut mid-GOP starts with pictures ffmpeg would drop, but ffprobe counts.
         .args(["-map", "0:v:0", "-c:v", "copy", "-copyinkf", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg to read the HEVC stream")?;
+        .stderr(Stdio::piped());
+    let mut child = crate::ext::spawn(&mut cmd, "ffmpeg to read the HEVC stream")?;
     let stdout = child.stdout.take().expect("ffmpeg stdout unavailable");
     let err = crate::ext::drain_text(child.stderr.take());
 

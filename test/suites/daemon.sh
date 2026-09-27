@@ -71,9 +71,7 @@ assert_frames_match "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 # SIGTERM mid-encode: the job is finished, then the loop ends
 setup sigterm 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
-TEST_CPUS=0.5
-start_avet "$I" "$O" 2
-TEST_CPUS=
+TEST_CPUS=0.5 start_avet "$I" "$O" 2
 wait_for_log "chunk 1/" 240 || fail "sigterm: no chunk was encoded before the signal"
 stop_avet 300
 [ "$AVET_RC" = 0 ] || fail "sigterm: avet exited with $AVET_RC, expected 0"
@@ -90,9 +88,7 @@ assert_decodes_cleanly  "$O/test.mkv"
 # a second signal stops it there and then
 setup twice 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
-TEST_CPUS=0.5
-start_avet "$I" "$O" 2
-TEST_CPUS=
+TEST_CPUS=0.5 start_avet "$I" "$O" 2
 wait_for_log "chunk 1/" 240 || fail "twice: no chunk was encoded before the signal"
 docker kill --signal=TERM "$AVET_CID" >/dev/null 2>&1
 wait_for_log "signal received" 30 || fail "twice: the first signal was not logged"

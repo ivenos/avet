@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -49,14 +49,13 @@ fn sibling_of_exe(file_name: &str) -> Option<PathBuf> {
     Some(dir.join(file_name))
 }
 
+pub fn spawn(cmd: &mut Command, what: &str) -> Result<Child> {
+    cmd.spawn().with_context(|| format!("start {what}")).context(crate::job::Transient)
+}
+
 /// Kills the command if it overruns; nothing else would notice a hung tool.
 pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<Output> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("run {what}"))?;
+    let mut child = spawn(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()), what)?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
 

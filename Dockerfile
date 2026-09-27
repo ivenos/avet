@@ -134,7 +134,6 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY .github/scripts/crate-licenses.sh ./
 
-ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 # The touch is load-bearing: COPY carries host mtimes in, /src/target is a cache mount,
 # and cargo would call the crate fresh and ship a stale binary.

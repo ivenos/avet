@@ -131,6 +131,11 @@ $FF -f lavfi -i "testsrc2=size=640x280:rate=24" \
     -vf "pad=640:360:0:40:black,format=yuv420p10le,setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
     -c:v libx265 -preset ultrafast -x265-params "$X265:$HDR10" \
     dv_base.hevc
+$FF -f lavfi -i "testsrc2=size=640x280:rate=24" \
+    -frames:v 1 \
+    -vf "pad=640:360:0:40:black,format=yuv420p10le,setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
+    -c:v libx265 -preset ultrafast -x265-params "$X265:$HDR10" \
+    dv_lead.hevc
 $FF -f lavfi -i "testsrc2=size=640x360:rate=24" \
     -frames:v 48 \
     -vf "format=yuv420p10le,setparams=range=tv:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc" \
@@ -203,6 +208,10 @@ dovi_tool inject-rpu -i dv_base.hevc --rpu-in rpu81.bin -o dv81.hevc >/dev/null
 hdr10plus_tool inject -i dv81.hevc -j hdr10plus.json -o dv81_hdr10plus.hevc >/dev/null
 mkvmerge -q -o dv81_hdr10plus.mkv --default-duration 0:24fps dv81_hdr10plus.hevc
 
+echo "  dv81_late_rpu.mkv"
+cat dv_lead.hevc dv81.hevc > dv81_late.hevc
+mkvmerge -q -o dv81_late_rpu.mkv --default-duration 0:24fps dv81_late.hevc
+
 echo "  dv84.mkv"
 dovi_tool inject-rpu -i dv_hlg.hevc --rpu-in rpu84.bin -o dv84.hevc >/dev/null
 mkvmerge -q -o dv84.mkv --default-duration 0:24fps dv84.hevc
@@ -225,8 +234,8 @@ mkvmerge -q -o hdr10plus_sparse.mkv --default-duration 0:24fps hdr10plus_sparse.
 
 rm -f dovi.json hdr10plus.json hdr10plus24.json duplicate.json fel.bin rpu81.bin rpu84.bin rpu5.bin rpu7.bin \
     dv_base.hevc dv_hlg.hevc dv_el.hevc dv_el_rpu.hevc dv81.hevc dv81_hdr10plus.hevc dv84.hevc dv5.hevc dv7.hevc \
-    hdr10plus_part24.hevc hdr10plus_part72.hevc hdr10plus_first.hevc hdr10plus_sparse.hevc
-chown "$OWNER" dv81_hdr10plus.mkv dv84.mkv dv5.mkv dv7_fel.mkv hdr10plus_sparse.mkv
+    dv_lead.hevc dv81_late.hevc hdr10plus_part24.hevc hdr10plus_part72.hevc hdr10plus_first.hevc hdr10plus_sparse.hevc
+chown "$OWNER" dv81_hdr10plus.mkv dv81_late_rpu.mkv dv84.mkv dv5.mkv dv7_fel.mkv hdr10plus_sparse.mkv
 GEN
 
 GEN_RC=$?
@@ -346,6 +355,13 @@ $FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -frames:v 120 \
 $FF -f lavfi -i "$(pattern 320x180 300 yuv420p)" -frames:v 300 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_300fps.mkv
 
+echo "  pattern_interlaced_yuyv.mkv, pattern_dv.avi"
+FIELDS="geq=lum=128+60*sin(X/9+N*1.7)+50*cos(Y/7-N*1.1):cb=128+60*sin(X/40+Y/9+N*1.3):cr=128+60*cos(Y/7-X/70-N*1.1)"
+$FF -f lavfi -i "nullsrc=size=320x180:rate=50,$FIELDS,format=yuv422p" -frames:v 48 \
+    -vf "tinterlace=mode=interleave_top,setfield=tff,format=yuyv422" -c:v rawvideo pattern_interlaced_yuyv.mkv
+$FF -f lavfi -i "nullsrc=size=720x480:rate=60000/1001,$FIELDS,format=yuv411p" -frames:v 48 \
+    -vf "tinterlace=mode=interleave_bottom,setfield=bff" -c:v dvvideo pattern_dv.avi
+
 echo "  pattern_119.mkv"
 $FF -f lavfi -i "$(pattern 160x90 120000/1001 yuv420p)" -frames:v 1199 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_119.mkv
@@ -364,6 +380,12 @@ echo "  pattern_bars.mkv, pattern_bars_rot90.mp4"
 $FF -f lavfi -i "nullsrc=size=640x276:rate=24,$PATTERN,format=yuv420p,pad=640:360:0:44:black" -frames:v 96 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_bars.mkv
 $FF -display_rotation 90 -i pattern_bars.mkv -map 0:v -c:v copy pattern_bars_rot90.mp4
+
+echo "  pattern_pixcrop.mkv"
+$FF -f lavfi -i "nullsrc=size=480x276:rate=24,$PATTERN,format=yuv420p,pad=640:276:72:0:black,pad=640:296:0:8:red" \
+    -frames:v 24 -c:v libx264 -qp 0 -preset ultrafast pixcrop_full.mkv
+mkvmerge -q -o pattern_pixcrop.mkv --cropping 0:0,8,0,12 pixcrop_full.mkv
+rm pixcrop_full.mkv
 
 echo "  pattern_dark.mkv"
 $FF -f lavfi -i "color=c=black:size=320x180:rate=24" -frames:v 48 \

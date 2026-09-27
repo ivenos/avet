@@ -33,13 +33,16 @@ impl std::error::Error for Transient {}
 
 /// `downcast_ref`, not `chain()`: a `.context()` value is not a link there. ENOSPC too.
 pub fn is_transient(err: &anyhow::Error) -> bool {
+    use std::io::ErrorKind::*;
     if err.downcast_ref::<Transient>().is_some() {
         return true;
     }
     err.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| matches!(io.kind(), std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded))
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| matches!(
+            io.kind(),
+            StorageFull | QuotaExceeded | TimedOut | StaleNetworkFileHandle | NotConnected
+                | HostUnreachable | NetworkUnreachable | NetworkDown | ConnectionReset | ConnectionAborted
+        ))
     })
 }
 
@@ -92,6 +95,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] audio {line}");
     }
     audio::check_encoders(&job.source_file, &audio_plan)?;
+    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
 
     let video_file = frame_accurate_source(&job.source_file, &temp, stem)?;
     let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
@@ -205,11 +209,19 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     };
 
     let duration_secs = video_info.num_frames as f64 / fps;
+    let visible = source_video.visible(video_info.width, video_info.height);
     let crop_str: Option<String> = if config.avet.crop {
-        crate::crop::detect(&video_file, duration_secs, &temp.crop_cache, stem)?
+        crate::crop::detect(&video_file, duration_secs, &temp.crop_cache, stem, visible)?
     } else {
         None
     };
+    let crop_str = crop_str.or_else(|| {
+        let whole = Crop { w: video_info.width, h: video_info.height, x: 0, y: 0 };
+        (visible != whole).then(|| {
+            tracing::info!("[{stem}] the container crops the picture to {}x{} at {},{}", visible.w, visible.h, visible.x, visible.y);
+            visible.to_filter()
+        })
+    });
     let deinterlace = crate::interlace::detect(&video_file, duration_secs, &temp.interlace_cache, stem)?;
 
     let (scale_target, crop, scene_vf) = compute_output_params(
@@ -460,7 +472,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         remove: true,
         expected_frames: Some(total_frames),
     };
-    finalize(job, ctx, &config, &temp, &audio_plan, video)
+    finalize(job, ctx, &config, &temp, &audio_plan, &subtitles, video)
 }
 
 /// Frames FFMS2 counts before the first one ffmpeg decodes, such as the open-GOP leftovers at
@@ -544,10 +556,10 @@ fn finalize(
     config: &Config,
     temp: &TempDir,
     audio_plan: &audio::AudioPlan,
+    subtitles: &crate::subtitle::SubtitlePlan,
     video: MuxVideo<'_>,
 ) -> Result<()> {
     let stem = job.stem();
-    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
     audio::extract(&job.source_file, &temp.tracks_path, audio_plan, &subtitles.extract)?;
     let languages = audio::Languages::probe(&job.source_file)?;
 
@@ -923,6 +935,7 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
     }
+    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
 
     tracing::info!("[{stem}] copy video, processing audio");
     let source_shift_ms = -probe_source_video(&job.source_file)?.matroska_start_ms;
@@ -932,7 +945,7 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
         path: &video_file, args: Vec::new(), timestamps: None, source_shift_ms,
         remove: false, expected_frames: None,
     };
-    finalize(job, ctx, config, temp, &audio_plan, video)
+    finalize(job, ctx, config, temp, &audio_plan, &subtitles, video)
 }
 
 fn ignored_video_opts(a: &crate::config::AvetConfig) -> Vec<&'static str> {
@@ -1092,10 +1105,19 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
     }
     if prev.is_some() {
         tracing::warn!("[{stem}] encode profile changed, discarding cached scenes and chunks");
-        let _ = std::fs::remove_file(&temp.scenes_path);
-        let _ = std::fs::remove_file(&temp.done_path);
-        let _ = std::fs::remove_file(&temp.tq_path);
-        let _ = std::fs::remove_dir_all(&temp.chunks_dir);
+        // A leftover that survives would be resumed under the new fingerprint.
+        for removed in [
+            std::fs::remove_file(&temp.scenes_path),
+            std::fs::remove_file(&temp.done_path),
+            std::fs::remove_file(&temp.tq_path),
+            std::fs::remove_dir_all(&temp.chunks_dir),
+        ] {
+            if let Err(e) = removed
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e).with_context(|| format!("discard the stale state in {}", temp.path.display()));
+            }
+        }
         temp.create_dirs()?;
     }
     crate::resume::write_atomic(&temp.fingerprint_path, fingerprint.as_bytes())
@@ -1271,9 +1293,22 @@ struct SourceVideo {
     sar: Option<(u32, u32)>,
     /// Degrees counter-clockwise, as ffprobe reports the display matrix.
     rotation: i64,
+    /// Matroska PixelCrop or MP4 `clap` as left, top, right, bottom.
+    container_crop: [u32; 4],
 }
 
 impl SourceVideo {
+    /// The picture a player shows, in FFMS2's frame: ffmpeg applies a container crop, FFMS2 does not.
+    fn visible(&self, width: u32, height: u32) -> Crop {
+        let [left, top, right, bottom] = self.container_crop;
+        let w = width.checked_sub(left.saturating_add(right)).filter(|&w| w > 0);
+        let h = height.checked_sub(top.saturating_add(bottom)).filter(|&h| h > 0);
+        match (w, h) {
+            (Some(w), Some(h)) => Crop { w, h, x: left, y: top },
+            _ => Crop { w: width, h: height, x: 0, y: 0 },
+        }
+    }
+
     fn display_args(&self, width: u32, height: u32) -> Vec<String> {
         let mut args = Vec::new();
         if let Some((n, d)) = self.sar.filter(|&(n, d)| n > 0 && d > 0 && n != d) {
@@ -1300,7 +1335,13 @@ struct VideoProbeStream {
     side_data_list: Vec<VideoProbeSideData>,
 }
 #[derive(serde::Deserialize)]
-struct VideoProbeSideData { rotation: Option<f64> }
+struct VideoProbeSideData {
+    rotation: Option<f64>,
+    crop_top: Option<u32>,
+    crop_bottom: Option<u32>,
+    crop_left: Option<u32>,
+    crop_right: Option<u32>,
+}
 #[derive(serde::Deserialize, Default)]
 struct VideoProbeFormat { #[serde(default)] format_name: String, start_time: Option<String> }
 
@@ -1308,7 +1349,7 @@ fn probe_source_video(source: &Path) -> Result<SourceVideo> {
     let probe: VideoProbe = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "stream=avg_frame_rate,r_frame_rate,start_time,sample_aspect_ratio",
-          "-show_entries", "stream_side_data=rotation",
+          "-show_entries", "stream_side_data=rotation,crop_top,crop_bottom,crop_left,crop_right",
           "-show_entries", "format=format_name,start_time",
           "-of", "json"],
         source,
@@ -1338,6 +1379,9 @@ impl SourceVideo {
             .map(|r| (r.round() as i64).rem_euclid(360))
             .map(|r| if r > 180 { r - 360 } else { r })
             .unwrap_or(0);
+        let container_crop = stream.side_data_list.iter()
+            .find(|s| s.crop_top.is_some())
+            .map_or([0; 4], |s| [s.crop_left, s.crop_top, s.crop_right, s.crop_bottom].map(|e| e.unwrap_or(0)));
 
         Ok(SourceVideo {
             fps_num,
@@ -1346,6 +1390,7 @@ impl SourceVideo {
             matroska_start_ms: if probe.format.format_name.contains("matroska") { container_start } else { 0 },
             sar,
             rotation,
+            container_crop,
         })
     }
 }
@@ -1440,6 +1485,17 @@ mod failure_class_tests {
     }
 
     #[test]
+    fn a_tool_that_does_not_start_and_a_share_that_went_away_are_retried() {
+        let missing = crate::ext::spawn(&mut std::process::Command::new("/nonexistent/SvtAv1EncApp"), "encoder").unwrap_err();
+        assert!(is_transient(&missing), "got: {missing:#}");
+
+        let stale = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StaleNetworkFileHandle)).context("read done.json");
+        assert!(is_transient(&stale), "got: {stale:#}");
+        let denied = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied)).context("read done.json");
+        assert!(!is_transient(&denied), "got: {denied:#}");
+    }
+
+    #[test]
     fn an_ordinary_failure_is_not_transient() {
         let err = Err::<(), _>(anyhow::anyhow!("encoder failed"))
             .context("chunk 00007")
@@ -1519,6 +1575,17 @@ mod output_param_tests {
                    [90, -90, -90, 180, 180, 0]);
         assert_eq!(source_video(r#"{"streams": [{"avg_frame_rate": "30/1", "side_data_list": [{"rotation": 90}]}]}"#)
             .display_args(640, 360), ["--projection-pose-roll", "0:90"]);
+    }
+
+    #[test]
+    fn a_container_crop_is_the_picture_in_ffms2s_frame() {
+        let cropped = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "side_data_list": [
+            {"side_data_type": "Frame Cropping", "crop_top": 8, "crop_bottom": 12, "crop_left": 0, "crop_right": 2}]}]}"#);
+        assert_eq!(cropped.visible(640, 296), Crop { w: 638, h: 276, x: 0, y: 8 });
+        assert_eq!(cropped.visible(10, 10), Crop { w: 10, h: 10, x: 0, y: 0 });
+
+        let plain = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "side_data_list": [{"rotation": 90}]}]}"#);
+        assert_eq!(plain.visible(640, 360), Crop { w: 640, h: 360, x: 0, y: 0 });
     }
 
     #[test]

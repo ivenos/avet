@@ -22,6 +22,8 @@ run_avet_timed "$I" "$O" 90 "requires a GPU"
 assert_log_contains "found only a software Vulkan device"
 assert_log_contains "llvmpipe"
 assert_file_not_exists "$O/test.mkv"
+assert_log_contains "retrying on the next scan"
+assert_file_not_exists "$O/.avet_test/.failed"
 
 docker run --rm --entrypoint vmaf "$TEST_IMAGE" --version >/dev/null 2>&1 || \
     fail "bundled vmaf does not start"

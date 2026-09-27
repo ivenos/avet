@@ -40,7 +40,7 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
             continue;
         }
         if profile_dir.file_name().and_then(OsStr::to_str).is_none() {
-            tracing::warn!("skipping profile folder with non-UTF8 name: {}", profile_dir.display());
+            report(format!("skipping profile folder with non-UTF8 name: {}", profile_dir.display()));
             continue;
         }
 
@@ -52,7 +52,7 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
         for (source_file, rel_dir) in find_video_files(&profile_dir) {
             let job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir };
             if output_exists(&job.output_dir(output_dir), &job.source_file) {
-                tracing::debug!(file = %job.source_file.display(), "skip: output exists");
+                report(format!("[{}] skip: output exists for {}", job.stem(), job.source_file.display()));
                 continue;
             }
             jobs.push(job);
@@ -127,25 +127,26 @@ fn find_video_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
 
 fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) {
     const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
+    const NAME_MAX: usize = 255;
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            tracing::warn!("skipping {}: {e}", dir.display());
+            report(format!("skipping {}: {e}", dir.display()));
             return;
         }
     };
 
     for entry in entries {
         let Ok(entry) = entry else {
-            tracing::warn!("skipping an unreadable entry in {}", dir.display());
+            report(format!("skipping an unreadable entry in {}", dir.display()));
             continue;
         };
         let path = entry.path();
         // DirEntry's type does not follow symlinks, so a link back up cannot loop.
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             match path.file_name().and_then(|n| n.to_str()) {
-                None => tracing::warn!("skipping folder with non-UTF8 name: {}", path.display()),
+                None => report(format!("skipping folder with non-UTF8 name: {}", path.display())),
                 Some(name) if name.starts_with('.') => {}
                 Some(name) => collect_video_files(&path, &rel.join(name), files),
             }
@@ -163,8 +164,16 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
             && EXTENSIONS.contains(&ext.as_str())
         {
             // Skip non-UTF8 stems: they'd collide on the fallback name and break temp-dir layout.
-            if path.file_stem().and_then(|s| s.to_str()).is_none() {
-                tracing::warn!("skipping file with non-UTF8 name: {}", path.display());
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                report(format!("skipping file with non-UTF8 name: {}", path.display()));
+                continue;
+            };
+            if stem.len() + ".mkv".len() > NAME_MAX {
+                report(format!("skipping {}: its output name would be longer than {NAME_MAX} bytes", path.display()));
+                continue;
+            }
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                tracing::debug!(file = %path.display(), "skip: empty");
                 continue;
             }
             files.push((path, rel.to_path_buf()));
@@ -179,7 +188,7 @@ fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
     match std::fs::metadata(&path) {
         Ok(m) if m.len() > 0 => true,
         Ok(_) => {
-            tracing::warn!("[{stem}] ignoring empty output file {}", path.display());
+            report(format!("[{stem}] ignoring empty output file {}", path.display()));
             false
         }
         Err(_) => false,
@@ -283,6 +292,21 @@ mod tests {
         fs::write(output.join("film.mkv"), b"").unwrap();
 
         assert_eq!(scan(&input, &output).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_source_and_one_whose_output_name_is_too_long_are_not_jobs() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("copying.mkv"), b"").unwrap();
+        fs::write(profile.join(format!("{}.ts", "a".repeat(252))), b"fake").unwrap();
+        fs::write(profile.join(format!("{}.ts", "b".repeat(251))), b"fake").unwrap();
+
+        let jobs = scan(&input, &output).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].stem(), "b".repeat(251));
     }
 
     #[test]

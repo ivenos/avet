@@ -243,4 +243,23 @@ expected=$(awk 'BEGIN { for (i = 112; i <= 123; i++) printf "%d ", i; for (i = 2
 got=$(hdr10plus_average_rgb "$O/test.mkv")
 [ "$got" = "$expected" ] || fail "HDR10+ from a cut MP4: expected AverageRGB '$expected', got '$got'"
 
+# -- No RPU on the very first picture: the output still carries a Dolby Vision record -
+I="$WORKDIR/17/in"; O="$WORKDIR/17/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/dv81_late_rpu.mkv" "$I/p/test.mkv"
+cat > "$I/p/encode.toml" << 'EOF'
+encoder = "svt-av1"
+[encoder_params]
+preset = 12
+crf    = 50
+[avet]
+dv = true
+[scene_detection]
+extra_split = 24
+EOF
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "DV without a first RPU: no output"
+assert_log_contains "the first frame has no readable Dolby Vision RPU"
+assert_video_frames "$O/test.mkv" 49
+assert_dovi_record  "$O/test.mkv" "10,1"
+assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 49
+
 test_done

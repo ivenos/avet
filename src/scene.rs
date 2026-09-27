@@ -17,8 +17,8 @@ pub fn detect(
     let actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
 
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    // FFMS2 decodes in storage orientation, which is what the crop filter is built for.
-    cmd.args(["-hide_banner", "-loglevel", "error", "-noautorotate"])
+    // FFMS2 decodes in storage orientation and without a container's crop: the crop filter's frame.
+    cmd.args(["-hide_banner", "-loglevel", "error", "-noautorotate", "-apply_cropping", "codec"])
         .arg("-i")
         .arg(source_file)
         .args(["-map", "0:v:0"]);
@@ -27,16 +27,14 @@ pub fn detect(
         cmd.args(["-vf", vf]);
     }
 
-    let mut ffmpeg = cmd
-        .args(["-pix_fmt", "yuv420p"])
+    cmd.args(["-pix_fmt", "yuv420p"])
         // yuv4mpegpipe is not a VFR muxer: without this, frames are dropped or doubled.
         .args(["-fps_mode", "passthrough"])
         .args(["-f", "yuv4mpegpipe", "pipe:1"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start ffmpeg for scene detection")?;
+        .stderr(Stdio::piped());
+    let mut ffmpeg = crate::ext::spawn(&mut cmd, "ffmpeg for scene detection")?;
 
     let stdout = ffmpeg.stdout.take().expect("ffmpeg stdout unavailable");
     let stderr_handle = crate::ext::drain_text(ffmpeg.stderr.take());

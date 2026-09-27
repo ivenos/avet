@@ -78,23 +78,37 @@ impl Counts {
 
 fn flagged_interlaced(source: &Path) -> Result<bool> {
     #[derive(serde::Deserialize)]
-    struct Probe { #[serde(default)] streams: Vec<Stream> }
+    struct Probe {
+        #[serde(default)] streams: Vec<Stream>,
+        #[serde(default)] frames: Vec<Frame>,
+    }
     #[derive(serde::Deserialize)]
     struct Stream { field_order: Option<String> }
+    #[derive(serde::Deserialize)]
+    struct Frame { #[serde(default)] interlaced_frame: u8 }
 
     let probe: Probe = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=field_order", "-of", "json"],
         source,
     )
     .context("probe the field order")?;
-    Ok(probe.streams.first()
-        .and_then(|s| s.field_order.as_deref())
-        .is_some_and(|f| matches!(f, "tt" | "bb" | "tb" | "bt")))
+    match probe.streams.first().and_then(|s| s.field_order.as_deref()) {
+        Some("tt" | "bb" | "tb" | "bt") => return Ok(true),
+        Some("progressive") => return Ok(false),
+        _ => {}
+    }
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#5",
+          "-show_entries", "frame=interlaced_frame", "-of", "json"],
+        source,
+    )
+    .context("probe the frames' interlace flags")?;
+    Ok(probe.frames.iter().any(|f| f.interlaced_frame == 1))
 }
 
 fn run_idet(source: &Path, seek_secs: u64) -> Result<Counts> {
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-nostdin", "-ss", &seek_secs.to_string()])
+    cmd.args(["-hide_banner", "-nostdin", "-noautorotate", "-ss", &seek_secs.to_string()])
         .arg("-i").arg(source)
         .args(["-map", "0:v:0", "-frames:v", "200", "-vf", "idet", "-f", "null", "-"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg idet")?;

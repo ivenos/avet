@@ -135,7 +135,7 @@ language_whitelist = ["eng", "jpn"]
 
 ### `[encoder_params]`
 
-Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `[target_quality]` cannot be combined with `tbr`, an `rc` other than `0`, `color-primaries`, `transfer-characteristics`, `matrix-coefficients` or `color-range`.
+Passed to the encoder as `--key value`; booleans become `1`/`0`. avet reads two of them itself: it encodes one chunk per `lp` CPU cores at once (`6` when unset) as far as free RAM allows, and `crf` is the first probe when `[target_quality]` is set. `color-primaries`, `transfer-characteristics`, `matrix-coefficients`, `color-range` and `chroma-sample-position` take their numeric code, e.g. `9` for BT.2020. `[target_quality]` cannot be combined with `tbr`, `cqp`, an `rc` other than `0`, `color-primaries`, `transfer-characteristics`, `matrix-coefficients` or `color-range`.
 
 ### `[target_quality]`
 
@@ -192,7 +192,7 @@ jod = 9.5
 - Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM. A track ffmpeg can neither copy into Matroska nor decode, such as AC-4, is left out with a warning.
 - Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1, and the bitrate of that layout. A layout none of them holds, such as 7.1(wide) or 7.1.4, is mixed to the one with its channel count, at most 7.1.
 
-`[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.
+`[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). FLAC stores floating-point PCM as 24-bit integers. `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.
 
 ```toml
 [audio.codec_rules]

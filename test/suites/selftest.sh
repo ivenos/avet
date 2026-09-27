@@ -147,6 +147,8 @@ expect_fail "a chunk 40 frames over" assert_max_chunk_frames "$W/two_chunks.json
 expect_fail "a long last chunk"      assert_max_chunk_frames "$W/short.json" 100
 
 # frame counts, stream values and track flags
+$FF -i "$SRC" -map 0:a:0 -c copy "$W/audio_only.mkv"
+need "$W/audio_only.mkv"
 expect_pass "the frame count"        assert_video_frames "$SRC" 240
 expect_fail "240 frames too many"    assert_video_frames "$FIXTURES_DIR/pattern_vfr.mkv" 240
 expect_fail "counting an absent file" assert_video_frames "$W/missing.mkv" 240
@@ -154,6 +156,8 @@ expect_pass "the pixel format"       assert_stream_value "$SRC" v:0 stream=pix_f
 expect_fail "the wrong one"          assert_stream_value "$SRC" v:0 stream=pix_fmt yuv420p10le
 expect_fail "no expected value"      assert_stream_value "$SRC" v:0 stream_side_data=rotation ""
 expect_pass "no rotation, spelled out" assert_stream_value "$SRC" v:0 stream_side_data=rotation -
+expect_fail "no rotation in no file" assert_stream_value "$W/missing.mkv" v:0 stream_side_data=rotation -
+expect_fail "no rotation without video" assert_stream_value "$W/audio_only.mkv" v:0 stream_side_data=rotation -
 expect_pass "language and flags"     assert_track_flags_match "$SRC" "$SRC" a
 expect_fail "a lost default flag"    assert_track_flags_match "$W/flag.mkv" "$SRC" a
 
@@ -176,12 +180,14 @@ DV="$FIXTURES_DIR/dv81_hdr10plus.mkv"
 expect_pass "HDR10+ on every frame"  assert_frames_with_side_data "$DV" "SMPTE2094-40" 48
 expect_fail "one frame too few"      assert_frames_with_side_data "$DV" "SMPTE2094-40" 47
 expect_fail "frames carrying none"   assert_frames_with_side_data "$SRC" "SMPTE2094-40" 48
+expect_fail "none without video"     assert_frames_with_side_data "$W/audio_only.mkv" "Dolby Vision" 0
 expect_pass "HDR10+ values as in the source" assert_hdr10plus_matches "$DV" "$DV"
 expect_fail "another sequence of them" assert_hdr10plus_matches "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$DV"
 expect_fail "none at all"            assert_hdr10plus_matches "$SRC" "$DV"
 expect_pass "the Dolby Vision record" assert_dovi_record "$DV" "8,1"
 expect_fail "the wrong profile"      assert_dovi_record "$DV" "10,1"
 expect_fail "no record at all"       assert_dovi_record "$SRC" "8,1"
+expect_fail "no record without video" assert_dovi_record "$W/audio_only.mkv" ""
 
 expect_pass "seeks landing correctly" assert_seeks_land_on_frames "$SRC"
 $FF -i "$SRC" -map 0:v:0 $(x264) -g 10 -bf 0 "$W/gop10.mkv"

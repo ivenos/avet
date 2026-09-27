@@ -425,6 +425,13 @@ impl Config {
                 bail!("encoder_params.crf must be a number (got {crf})");
             }
         }
+        for key in ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range", "chroma-sample-position"] {
+            if let Some(v) = self.encoder_params.get(key)
+                && toml_value_to_arg(v).parse::<u32>().is_err()
+            {
+                bail!("encoder_params.{key} must be its numeric code, such as 9 for BT.2020 primaries (got {v})");
+            }
+        }
         if let Some(tq) = &self.target_quality {
             if self.avet.video == VideoMode::Copy {
                 bail!("target_quality requires avet.video = \"encode\"");
@@ -437,10 +444,12 @@ impl Config {
                      itself counts as a loss and no CRF reaches the floor. Remove one of them."
                 );
             }
+            // SvtAv1EncApp's --cqp overrides --crf wherever it stands.
             if self.encoder_params.contains_key("tbr")
+                || self.encoder_params.contains_key("cqp")
                 || self.encoder_params.get("rc").is_some_and(|v| toml_value_to_arg(v) != "0")
             {
-                bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc or tbr");
+                bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc, tbr or cqp");
             }
             if let Some(key) = ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range"]
                 .into_iter()
@@ -576,11 +585,12 @@ fn validate_bitrate_values(ctx: &str, bitrate: Option<&Bitrate>) -> Result<()> {
 }
 
 /// The forms ffmpeg's `-b:a` takes: a plain count of bits, or one with a k/M suffix.
-fn parse_bitrate(value: &str) -> Result<u64> {
+pub(crate) fn parse_bitrate(value: &str) -> Result<u64> {
     let text = value.trim();
     let (digits, factor) = match text.as_bytes().last() {
         Some(b'k' | b'K') => (&text[..text.len() - 1], 1_000),
-        Some(b'm' | b'M') => (&text[..text.len() - 1], 1_000_000),
+        Some(b'M') => (&text[..text.len() - 1], 1_000_000),
+        Some(b'm') => bail!("a lowercase m is milli to ffmpeg; write M for megabits"),
         _ => (text, 1),
     };
     let number: f64 = digits.parse().map_err(|_| anyhow::anyhow!("not a number"))?;
@@ -918,6 +928,9 @@ mod tests {
 
         let err = Config::from_str_for_test(&profile("{ stereo = \"128\" }")).unwrap_err().to_string();
         assert!(err.contains("128 bit/s"), "got: {err}");
+
+        let err = format!("{:#}", Config::from_str_for_test(&profile("\"1m\"")).unwrap_err());
+        assert!(err.contains("write M"), "got: {err}");
     }
 
     #[test]
@@ -988,10 +1001,11 @@ mod tests {
     fn target_quality_refuses_a_bitrate_target() {
         let tq = |params: &str| format!("encoder = \"svt-av1\"\n[encoder_params]\n{params}\n[target_quality]\njod = 9.5\n");
         Config::from_str_for_test(&tq("rc = 0\npreset = 6")).unwrap();
-        for bad in ["rc = 1", "tbr = 3000", "rc = \"2\""] {
+        for bad in ["rc = 1", "tbr = 3000", "rc = \"2\"", "cqp = 50"] {
             let err = Config::from_str_for_test(&tq(bad)).unwrap_err().to_string();
-            assert!(err.contains("rc or tbr"), "{bad}: {err}");
+            assert!(err.contains("rc, tbr or cqp"), "{bad}: {err}");
         }
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[encoder_params]\ncqp = 50\n").unwrap();
     }
 
     #[test]
@@ -1002,6 +1016,21 @@ mod tests {
             let err = Config::from_str_for_test(&tq(&format!("{key} = 1"))).unwrap_err().to_string();
             assert!(err.contains(key), "{key}: {err}");
             Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\n{key} = 1\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_color_key_has_to_be_its_numeric_code() {
+        let param = |kv: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\n{kv}\n"));
+        for good in ["color-primaries = 9", "transfer-characteristics = \"16\"", "matrix-coefficients = 9", "color-range = 1", "chroma-sample-position = 2"] {
+            param(good).unwrap_or_else(|e| panic!("{good}: {e:#}"));
+        }
+        for (key, bad) in [
+            ("color-primaries", "\"bt2020\""), ("transfer-characteristics", "\"smpte2084\""),
+            ("matrix-coefficients", "\"bt2020-ncl\""), ("color-range", "\"full\""), ("chroma-sample-position", "\"left\""),
+        ] {
+            let err = param(&format!("{key} = {bad}")).unwrap_err().to_string();
+            assert!(err.contains(&format!("encoder_params.{key}")), "{key}: {err}");
         }
     }
 

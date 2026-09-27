@@ -40,7 +40,7 @@ for fmt in rgb gray; do
     assert_video_pix_fmt "$O/test.mkv" yuv420p
 done
 
-# interlaced: deinterlaced to one frame per frame; flagged alone, left as it is
+# interlaced, DV and packed 4:2:2 included: one frame per frame, fields kept apart; flagged alone, left as it is
 encode interlaced pattern_interlaced.mkv 'keep_temp = true'
 assert_log_contains "interlaced, top field first"
 assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=tff:deint=all"
@@ -54,6 +54,11 @@ encode flagged pattern_flagged.mkv 'keep_temp = true'
 assert_log_contains "flagged interlaced, but the frames are not"
 assert_frames_match "$O/test.mkv" "$SRC"
 [ "$(cat "$O/.avet_test/interlace.cache" 2>/dev/null)" = progressive ] || fail "flagged: deinterlaced although the frames are progressive"
+encode interlaced_dv pattern_dv.avi
+assert_log_contains "interlaced, bottom field first"
+assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=bff:deint=all" 30
+encode interlaced_yuyv pattern_interlaced_yuyv.mkv
+assert_frames_match "$O/test.mkv" "$SRC" "format=yuv422p,bwdif=mode=send_frame:parity=tff:deint=all" 30
 
 # bit_depth converts without touching the picture
 encode up8to10 pattern.mkv 'bit_depth = 10'

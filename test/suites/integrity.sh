@@ -43,7 +43,7 @@ EOF
     assert_frames_match "$O/test.mkv" "$SRC"
     assert_everything_but_video_kept "$O/test.mkv"
     assert_keyframes_at_chunks  "$O/test.mkv" "$O/.avet_test/scenes.json"
-    assert_log_not_contains     "Warning"
+    assert_log_not_contains     " WARN "
     assert_seeks_land_on_frames "$O/test.mkv"
     # The source is archived, not rewritten.
     assert_same_bytes "$I/processed/test.mkv" "$SRC"

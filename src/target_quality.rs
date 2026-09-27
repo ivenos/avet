@@ -105,9 +105,16 @@ pub fn ensure_available() -> Result<GpuSelection> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    match select_gpu(&text) {
-        Some(g) if g.hardware => Ok(g),
+    let devices = list_gpus(&String::from_utf8_lossy(&out.stdout));
+    if let Some(g) = first_usable(&devices, passes_kernel_check) {
+        return Ok(g.clone());
+    }
+    let hardware: Vec<&str> = devices.iter().filter(|d| d.hardware).map(|d| d.label.as_str()).collect();
+    match devices.first() {
+        _ if !hardware.is_empty() => bail!(
+            "target_quality requires a GPU, but none passes Vship's own check: {}. {HINT}",
+            hardware.join(", ")
+        ),
         Some(g) => bail!(
             "target_quality requires a GPU, but FFVship found only a software Vulkan device ({}). {HINT}",
             g.label
@@ -116,8 +123,20 @@ pub fn ensure_available() -> Result<GpuSelection> {
     }
 }
 
-/// First hardware device from `FFVship --list-gpu`, else the first software one.
-fn select_gpu(list: &str) -> Option<GpuSelection> {
+fn first_usable(devices: &[GpuSelection], passes: impl Fn(u32) -> bool) -> Option<&GpuSelection> {
+    devices.iter().find(|d| d.hardware && passes(d.id))
+}
+
+/// `--list-gpu` also lists devices Vship refuses to run on, such as one without 64-bit shader integers.
+fn passes_kernel_check(id: u32) -> bool {
+    let mut cmd = std::process::Command::new(external_bin("FFVship"));
+    cmd.args(["--gpu-info", "--gpu-id", &id.to_string()]);
+    crate::ext::output_with_timeout(&mut cmd, 120, "FFVship --gpu-info").is_ok_and(|out| {
+        out.status.success() && !String::from_utf8_lossy(&out.stdout).contains("Passes Kernel Check: 0")
+    })
+}
+
+fn list_gpus(list: &str) -> Vec<GpuSelection> {
     let mut devices: Vec<GpuSelection> = Vec::new();
     for line in list.lines() {
         let Some(rest) = line.trim().strip_prefix("GPU ") else { continue };
@@ -130,10 +149,6 @@ fn select_gpu(list: &str) -> Option<GpuSelection> {
         devices.push(GpuSelection { id, label, hardware });
     }
     devices
-        .iter()
-        .find(|d| d.hardware)
-        .cloned()
-        .or_else(|| devices.into_iter().next())
 }
 
 pub struct ProbeContext<'a> {
@@ -586,6 +601,8 @@ fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyh
         "device lost",
         "Failed to synchronize to Fence",
         "Failed to Submit commandBuffer",
+        "Pinned buffer allocation failed",
+        "OutOfRAM",
     ];
     let err = crate::ext::tool_error(what, status, stderr);
     if err.downcast_ref::<crate::job::Transient>().is_none()
@@ -615,9 +632,7 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
         return Err(gpu_error("FFVship", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
 
-    let raw = std::fs::read_to_string(&json)
-        .with_context(|| format!("read FFVship json: {}", json.display()))?;
-    parse_cvvdp(&raw)
+    parse_cvvdp(&read_metric_json(&json, "FFVship")?)
 }
 
 /// Everything but the file paths. The probe holds the chunk's frames from 0, and avet's
@@ -642,6 +657,15 @@ fn measure_args(m: &MeasureOpts) -> Vec<String> {
     args
 }
 
+fn read_metric_json(path: &Path, what: &str) -> Result<String> {
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {what} json: {}", path.display()))?;
+    if serde_json::from_str::<serde::de::IgnoredAny>(&raw).is_err_and(|e| e.is_eof()) {
+        return Err(anyhow::Error::new(crate::job::Transient)
+            .context(format!("{what} left {} empty or cut short - is the disk full?", path.display())));
+    }
+    Ok(raw)
+}
+
 /// CVVDP JSON is `[[cum], [cum], ...]`; the last row is the whole clip's score.
 fn parse_cvvdp(raw: &str) -> Result<f64> {
     let rows: Vec<Vec<f64>> = serde_json::from_str(raw).context("parse FFVship CVVDP json")?;
@@ -656,7 +680,8 @@ fn parse_cvvdp(raw: &str) -> Result<f64> {
 fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str) -> Result<Cambi> {
     let timeout_secs = 1800 + scene.frame_count();
 
-    let fifo = ctx.temp_dir.join(format!("cambi_{tag}.y4m"));
+    // Not in the temp dir: a share without Unix extensions has no FIFOs.
+    let fifo = std::env::temp_dir().join(format!("avet_{}_cambi_{tag}.y4m", std::process::id()));
     let json = ctx.temp_dir.join(format!("cambi_{tag}.json"));
     let _ = std::fs::remove_file(&fifo);
     let _cleanup = Cleanup(vec![fifo.clone(), json.clone()]);
@@ -666,28 +691,26 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let hold = std::fs::OpenOptions::new().read(true).write(true).open(&fifo)
         .with_context(|| format!("open {}", fifo.display()))?;
 
-    let mut vmaf = std::process::Command::new(external_bin("vmaf"))
-        .args(["--reference", "/dev/stdin", "--distorted"]).arg(&fifo)
+    let mut cmd = std::process::Command::new(external_bin("vmaf"));
+    cmd.args(["--reference", "/dev/stdin", "--distorted"]).arg(&fifo)
         .args(["--no_prediction", "--threads", &ctx.n_threads.to_string()])
         .args(["--feature", cambi_feature(&ctx.opts.hdr_args), "--json", "--output"]).arg(&json)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start vmaf")?;
-    let mut decoder = match std::process::Command::new(external_bin("ffmpeg"))
-        // CAMBI only scores flat areas, and synthesized grain leaves none: it would read 0.
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-export_side_data", "film_grain", "-i"]).arg(probe)
+        .stderr(Stdio::piped());
+    let mut vmaf = crate::ext::spawn(&mut cmd, "vmaf")?;
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
+    // CAMBI only scores flat areas, and synthesized grain leaves none: it would read 0.
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-export_side_data", "film_grain", "-i"]).arg(probe)
         .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-strict", "-1", "-f", "yuv4mpegpipe"]).arg(&fifo)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut decoder = match crate::ext::spawn(&mut cmd, "ffmpeg probe decoder") {
         Ok(c) => c,
         Err(e) => {
             reap(&mut vmaf);
-            return Err(e).context("start ffmpeg probe decoder");
+            return Err(e);
         }
     };
 
@@ -755,9 +778,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     }
     write_res.context("write Y4M reference to vmaf")?;
 
-    let raw = std::fs::read_to_string(&json)
-        .with_context(|| format!("read vmaf json: {}", json.display()))?;
-    parse_cambi(&raw)
+    parse_cambi(&read_metric_json(&json, "vmaf")?)
 }
 
 /// CAMBI's visibility thresholds come in BT.1886 and PQ; HLG is measured as BT.1886.
@@ -892,26 +913,33 @@ mod tests {
     }
 
     #[test]
-    fn select_gpu_prefers_hardware() {
-        let list = "GPU 0: NVIDIA GeForce RTX 5060 Ti\nGPU 1: llvmpipe (LLVM 22.1.7, 256 bits)\n";
-        let g = select_gpu(list).unwrap();
-        assert_eq!(g.id, 0);
-        assert!(g.hardware);
+    fn the_first_hardware_gpu_that_passes_is_chosen() {
+        let all = |_: u32| true;
+        let devices = list_gpus("GPU 0: NVIDIA GeForce RTX 5060 Ti\nGPU 1: llvmpipe (LLVM 22.1.7, 256 bits)\n");
+        assert_eq!(first_usable(&devices, all).map(|g| g.id), Some(0));
+
+        let devices = list_gpus("GPU 0: llvmpipe (LLVM 22.1.7)\nGPU 1: Intel Graphics\n");
+        assert_eq!(first_usable(&devices, all).map(|g| g.id), Some(1));
+
+        let devices = list_gpus("GPU 0: Intel(R) HD Graphics 4600 (HSW GT2)\nGPU 1: AMD Radeon RX 7600 (RADV NAVI33)\n");
+        assert_eq!(first_usable(&devices, |id| id != 0).map(|g| g.id), Some(1));
+        assert!(first_usable(&devices, |_| false).is_none());
+
+        let software = list_gpus("GPU 0: llvmpipe (LLVM 22.1.7)\n");
+        assert_eq!(software.len(), 1);
+        assert!(!software[0].hardware);
+        assert!(first_usable(&software, all).is_none());
     }
 
     #[test]
-    fn select_gpu_picks_hardware_even_after_software() {
-        let list = "GPU 0: llvmpipe (LLVM 22.1.7)\nGPU 1: Intel Graphics\n";
-        let g = select_gpu(list).unwrap();
-        assert_eq!(g.id, 1);
-        assert!(g.hardware);
-    }
-
-    #[test]
-    fn select_gpu_reports_software_only() {
-        let g = select_gpu("GPU 0: llvmpipe (LLVM 22.1.7)\n").unwrap();
-        assert_eq!(g.id, 0);
-        assert!(!g.hardware);
+    fn a_metric_json_left_empty_or_cut_short_is_retried() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("m.json");
+        for (text, transient) in [("", true), ("[[9.9],[9.8", true), ("[[9.9],[9.8]]", false), ("{\"frames\": 1}", false)] {
+            std::fs::write(&path, text).unwrap();
+            let res = read_metric_json(&path, "FFVship");
+            assert_eq!(res.as_ref().err().is_some_and(crate::job::is_transient), transient, "{text:?}");
+        }
     }
 
     #[test]

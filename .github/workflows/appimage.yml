@@ -196,8 +196,6 @@ jobs:
           sudo install -m755 /tmp/vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf
 
       - name: Build avet
-        env:
-          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
         run: cargo build --release --locked
 
       - name: Stage AppDir

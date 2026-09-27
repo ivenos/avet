@@ -74,6 +74,7 @@ keep_temp = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "scenes reuse: no output"
 assert_log_contains "reusing scenes.json"
+assert_log_not_contains "scene detection"
 
 # a scene list short of the source is extended, a longer one clamped
 I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O/.avet_test"
@@ -122,8 +123,8 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "empty scenes.json: no output"
 assert_log_contains "scene detection"
 assert_video_frames "$O/test.mkv" 240
 
-# min_scene_len reaches the detector: no chunk shorter than it
-# pattern.mkv changes completely from frame to frame: every frame is a cut candidate.
+# min_scene_len reaches the detector: no chunk shorter than it, and cuts still made
+# pattern.mkv flashes white every 48 frames; 60 frames apart, every other flash is a cut.
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -139,6 +140,8 @@ extra_split     = 0
 extra_split_sec = 0
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "min_scene_len: no output"
+chunks=$(log_capture 's/.*\] \([0-9]*\) chunks$/\1/p')
+[ "${chunks:-0}" -ge 2 ] || fail "min_scene_len: expected cuts, got '$chunks' chunk(s)"
 assert_scenes_cover       "$O/.avet_test/scenes.json"
 assert_min_chunk_frames   "$O/.avet_test/scenes.json" 60
 assert_video_frames       "$O/test.mkv" 240

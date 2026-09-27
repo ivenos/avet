@@ -201,7 +201,7 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "und track: no output"
 assert_audio_track_count "$O/test.mkv" 1
 
-# lossless override: flac source to flac, no bitrate, options applied
+# lossless override: flac source to flac, without the lossy bitrate
 I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_71audio.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -222,6 +222,8 @@ assert_audio_track_count "$O/test.mkv" 1
 assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 assert_audio_title       "$O/test.mkv" 0 "FLAC"   # untitled source to marker only
+assert_log_contains      "(lossless) -> FLAC"
+assert_log_not_contains  "FLAC 128k"
 
 # lossy default + per-layout bitrate: lossy tracks to opus
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"

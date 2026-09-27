@@ -8,7 +8,7 @@
   "platformAutomerge": false,
   "automergeStrategy": "squash",
   "ignorePaths": [],
-  "lockFileMaintenance": { "enabled": true, "automerge": true },
+  "lockFileMaintenance": { "enabled": true },
   "packageRules": [
     {
       "matchManagers": ["github-actions"],

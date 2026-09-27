@@ -23,6 +23,7 @@ fi
 
 _FAIL=0
 _ERRORS=""
+_LOGGED=""
 _DONE=0
 _SCRATCH=$(mktemp -d)
 RUN_LOGS=""
@@ -50,6 +51,12 @@ fail() {
     _FAIL=1
     _ERRORS="${_ERRORS}  > $1
 "
+    if [ "${VERBOSE:-0}" = "1" ] && [ -n "$RUN_LOGS" ] && [ "$RUN_LOGS" != "$_LOGGED" ]; then
+        _LOGGED=$RUN_LOGS
+        _ERRORS="${_ERRORS}  [Docker logs]
+$(printf '%s\n' "$RUN_LOGS" | sed 's/^/  | /')
+"
+    fi
 }
 
 test_workdir() {
@@ -87,11 +94,13 @@ run_avet() {
     # Output file appears at mux time but source is only moved to processed/
     # several lines later. Wait for "[stem] done" to confirm full cleanup.
     if [ -s "$expected" ]; then
-        local stem done_wait=0
+        local stem done_line done_wait=0
         stem=$(basename "$expected" .mkv)
+        # grep -F reads every line of a pattern as a pattern of its own.
+        done_line=$(printf '[%s] done' "$stem" | tail -n 1)
         while [ "$done_wait" -lt 30 ]; do
             docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | \
-                grep -qF "[$stem] done" && break
+                grep -qF -e "$done_line" && break
             sleep 1
             done_wait=$((done_wait + 1))
         done
@@ -818,6 +827,14 @@ assert_same_bytes() {
     cmp -s "$1" "$2" || fail "bytes: $1 differs from $2"
 }
 
+assert_has_stream() {
+    local file="$1" spec="$2"
+    assert_probeable "$file" || return 1
+    [ -n "$(ffprobe -v error -select_streams "$spec" -show_entries stream=index -of csv=p=0 "$file")" ] && return 0
+    fail "$file has no stream $spec"
+    return 1
+}
+
 # EXPECTED is "-" for "no such value"; an empty one is a fixture that lost the property.
 assert_stream_value() {
     local file="$1" spec="$2" entry="$3" expected="$4" actual
@@ -825,6 +842,7 @@ assert_stream_value() {
         fail "$entry of $spec: no expected value given (pass - for none) ($file)"
         return
     fi
+    assert_has_stream "$file" "$spec" || return
     [ "$expected" = "-" ] && expected=""
     actual=$(ffprobe -v error -select_streams "$spec" -show_entries "$entry" \
         -of default=nw=1:nk=1 "$file" | tr '\n' ' ' | sed 's/ *$//')
@@ -845,7 +863,7 @@ frames_with_side_data() {
 
 assert_frames_with_side_data() {
     local file="$1" pattern="$2" expected="$3" actual
-    assert_probeable "$file" || return
+    assert_has_stream "$file" v:0 || return
     actual=$(frames_with_side_data "$file" "$pattern")
     [ "$actual" = "$expected" ] || \
         fail "frames with '$pattern': expected $expected, got $actual ($file)"
@@ -869,7 +887,7 @@ hdr10plus_average_rgb() {
 
 assert_dovi_record() {
     local file="$1" expected="$2" actual
-    assert_probeable "$file" || return
+    assert_has_stream "$file" v:0 || return
     actual=$(ffprobe -v error "$file" -select_streams v:0 \
         -show_entries stream_side_data=dv_profile,dv_bl_signal_compatibility_id -of default=nw=1:nk=1 | paste -sd, -)
     [ "$actual" = "$expected" ] || \
@@ -904,12 +922,6 @@ test_done() {
         exit 0
     fi
     printf "%s" "$_ERRORS"
-    if [ "${VERBOSE:-0}" = "1" ] && [ -n "$RUN_LOGS" ]; then
-        printf "  [Docker logs]\n"
-        echo "$RUN_LOGS" | while IFS= read -r line; do
-            printf "  | %s\n" "$line"
-        done
-    fi
     exit 1
 }
 
