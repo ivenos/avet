@@ -99,12 +99,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # The same value as in the build job, so that job reuses this one's layers.
+      - name: Resolve version
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) VERSION="$GITHUB_REF_NAME" ;;
+            *)            VERSION="dev-${GITHUB_SHA:0:7}" ;;
+          esac
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*) echo "::error::refusing unusual version name"; exit 1 ;;
+          esac
+          echo "AVET_VERSION=$VERSION" >> "$GITHUB_ENV"
+
       # Not test/run.sh's own build: without the layer cache, SVT-AV1, FFMS2 and Vship
       # eat the timeout before the first test runs.
       - name: Build test image
         uses: docker/build-push-action@v7
         with:
           context: .
+          build-args: AVET_VERSION=${{ env.AVET_VERSION }}
           tags: avet:test
           outputs: type=docker,dest=${{ runner.temp }}/avet-test.tar
           cache-from: type=gha,scope=${{ matrix.arch }}
@@ -121,7 +134,7 @@ jobs:
       - name: Every bundled tool starts
         run: |
           docker load -i "$RUNNER_TEMP/avet-test.tar"
-          docker run --rm --entrypoint sh avet:test -c '
+          docker run --rm -e AVET_VERSION --entrypoint sh avet:test -c '
             set -e
             ffmpeg   -hide_banner -version >/dev/null
             ffprobe  -hide_banner -version >/dev/null
@@ -131,10 +144,7 @@ jobs:
             vmaf             --version     >/dev/null
             ffmsindex 2>&1 | grep -qi usage
             FFVship --list-gpu             >/dev/null
-            # avet is a daemon and takes no arguments, so `avet --version` would run the
-            # scan loop until this job times out.
-            timeout -s KILL 10 avet >/tmp/start.log 2>&1 || true
-            grep -q "avet started" /tmp/start.log
+            [ "$(avet --version)" = "avet $AVET_VERSION" ]
           '
           want=$(sed -n 's/^  FFMPEG_VERSION: n//p' .github/workflows/appimage.yml)
           have=$(docker run --rm --entrypoint ffmpeg avet:test -version | sed -n 's/^ffmpeg version \([0-9.]*\).*/\1/p')
@@ -222,12 +232,25 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve version
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) VERSION="$GITHUB_REF_NAME" ;;
+            *)            VERSION="dev-${GITHUB_SHA:0:7}" ;;
+          esac
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*) echo "::error::refusing unusual version name"; exit 1 ;;
+          esac
+          echo "AVET_VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.GITHUB_IMAGE }}
-          labels: org.opencontainers.image.licenses=GPL-3.0-only
+          labels: |
+            org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.version=${{ env.AVET_VERSION }}
 
       - name: Build and push by digest
         id: build
@@ -235,6 +258,7 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: AVET_VERSION=${{ env.AVET_VERSION }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,"name=${{ env.GITHUB_IMAGE }},docker.io/${{ env.DOCKERHUB_IMAGE }}",push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}

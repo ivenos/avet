@@ -18,6 +18,7 @@ assert_file_nonempty   "$O/test.mkv"
 assert_file_exists     "$I/processed/test.mkv"
 assert_file_not_exists "$I/p/test.mkv"
 assert_dir_not_exists  "$O/.avet_test"
+assert_log_contains    "% of the source) in "
 
 # keep_temp=true: temp dir preserved
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
@@ -192,7 +193,7 @@ TEST_RUST_LOG=debug run_avet "$I" "$O" "$O/test.mkv" 90 || fail "done resume: se
 assert_log_contains  "already done"
 assert_file_nonempty "$O/test.mkv"
 
-# edge cases: a single picture, a name at the 255-byte limit, a file without video
+# edge cases: a single picture, a name at the 255-byte limit, a file without video, an output larger than its source
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/one_frame.mkv" "$I/p/test.mkv"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
@@ -214,6 +215,13 @@ printf 'encoder = "svt-av1"\n' > "$I/p/encode.toml"
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_file_not_exists "$O/test.mkv"
 grep -q "no video track" "$O/.avet_test/.failed" 2>/dev/null || fail "audio only: .failed does not name the missing video"
+
+I="$WORKDIR/16/in"; O="$WORKDIR/16/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf '[avet]\nvideo = "copy"\n[audio]\nmode = "encode"\ncodec = "pcm_s24le"\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "larger: no output"
+assert_log_contains "the output is larger than the source"
+assert_audio_codec  "$O/test.mkv" 0 pcm_s24le
 
 # an empty output file is a leftover, not a finished encode
 I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"

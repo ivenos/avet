@@ -29,13 +29,13 @@ pub fn detect(
 
     tracing::info!("[{stem}] auto-crop: running cropdetect...");
 
+    // The keyframes of the whole file catch what the windows miss, such as a film's IMAX scenes.
+    let windows = [5u64, 20, 40, 60, 80, 95].map(|pct| Some((duration_secs * pct as f64 / 100.0) as u64));
     let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = [5u64, 20, 40, 60, 80, 95]
-            .iter()
-            .map(|&pct| {
-                let seek = (duration_secs * pct as f64 / 100.0) as u64;
-                s.spawn(move || run_cropdetect(source_file, seek))
-            })
+        let handles: Vec<_> = windows
+            .into_iter()
+            .chain([None])
+            .map(|seek| s.spawn(move || run_cropdetect(source_file, seek)))
             .collect();
         handles.into_iter().map(|h| h.join()).collect()
     });
@@ -126,30 +126,34 @@ fn is_bars(c: &Crop, src_w: u32, src_h: u32) -> bool {
         && centered(c.y, src_h.saturating_sub(c.y + c.h), src_h)
 }
 
-/// The last cropdetect box of one sample, which is its cumulative bounding box.
-fn run_cropdetect(source_file: &Path, seek_secs: u64) -> Result<Option<Crop>> {
-    const TIMEOUT_SECS: u64 = 300;
-
+/// The last box, which cropdetect accumulates: ten seconds from `seek_secs`, or every keyframe.
+fn run_cropdetect(source_file: &Path, seek_secs: Option<u64>) -> Result<Option<Crop>> {
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     // FFMS2 decodes in storage orientation; autorotate would box the displayed image.
-    cmd.args(["-noautorotate", "-ss", &seek_secs.to_string()])
-        .arg("-i").arg(source_file)
+    cmd.arg("-noautorotate");
+    let timeout = match seek_secs {
+        Some(seek) => {
+            cmd.args(["-ss", &seek.to_string(), "-t", "10"]);
+            300
+        }
+        None => {
+            cmd.args(["-skip_frame", "nokey"]);
+            crate::ext::whole_file_timeout(source_file, 1800)
+        }
+    };
+    cmd.arg("-i").arg(source_file)
         // The track FFMS2 indexes; ffmpeg's own pick is by resolution.
         .args(["-map", "0:v:0"])
         // Below 1.0 ffmpeg scales the limit by the bit depth; round=16 would report
         // 640x352 for a clean 640x360 source.
-        .args(["-t", "10", "-vf", "cropdetect=0.094:2:0", "-f", "null", "-"]);
-    let output = crate::ext::output_with_timeout(&mut cmd, TIMEOUT_SECS, "ffmpeg cropdetect")?;
+        .args(["-vf", "cropdetect=0.094:2:0", "-f", "null", "-"]);
+    let what = seek_secs.map_or_else(|| "ffmpeg cropdetect on the keyframes".to_string(), |s| format!("ffmpeg cropdetect at {s}s"));
+    let output = crate::ext::output_with_timeout(&mut cmd, timeout, &what)?;
 
     if !output.status.success() {
-        return Err(crate::ext::tool_error(
-            &format!("ffmpeg cropdetect at {seek_secs}s"),
-            output.status,
-            &String::from_utf8_lossy(&output.stderr),
-        ));
+        return Err(crate::ext::tool_error(&what, output.status, &String::from_utf8_lossy(&output.stderr)));
     }
 
-    // cropdetect writes results to stderr
     Ok(String::from_utf8_lossy(&output.stderr)
         .lines()
         .filter_map(|line| {

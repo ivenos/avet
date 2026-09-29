@@ -86,6 +86,8 @@ struct FfprobeStream {
     #[serde(default)]
     initial_padding: Option<u32>,
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     tags: FfprobeTags,
 }
 
@@ -105,6 +107,7 @@ struct AudioTrack {
     bits_per_raw_sample: u32,
     sample_fmt: String,
     initial_padding: u32,
+    stream_id: Option<String>,
     language: Option<String>,
     title: Option<String>,
 }
@@ -160,7 +163,6 @@ fn parse_audio_codecs(stdout: &str) -> AudioCodecs {
     AudioCodecs { lossless, decodable: Some(decodable) }
 }
 
-/// Audio encoder names ffmpeg offers, from the first successful `ffmpeg -encoders`.
 static AUDIO_ENCODERS: OnceLock<HashSet<String>> = OnceLock::new();
 
 fn audio_encoders() -> Option<&'static HashSet<String>> {
@@ -212,7 +214,6 @@ fn fallback_lossless_codecs() -> HashSet<String> {
     .collect()
 }
 
-/// PCM is always lossless; DTS only in its Master Audio profile.
 fn is_lossless(codec_name: &str, profile: Option<&str>, lossless: &HashSet<String>) -> bool {
     if codec_name == "dts" {
         return profile.is_some_and(|p| p.contains("MA"));
@@ -298,7 +299,7 @@ fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
     let parsed: FfprobeOutput = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "a",
           "-show_entries",
-          "stream=codec_name,profile,channels,channel_layout,sample_rate,bits_per_raw_sample,sample_fmt,initial_padding:stream_tags=language,title",
+          "stream=id,codec_name,profile,channels,channel_layout,sample_rate,bits_per_raw_sample,sample_fmt,initial_padding:stream_tags=language,title",
           "-of", "json"],
         source_file,
     )?;
@@ -318,10 +319,80 @@ fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
             bits_per_raw_sample: number(s.bits_per_raw_sample),
             sample_fmt: s.sample_fmt.unwrap_or_default(),
             initial_padding: s.initial_padding.unwrap_or(0),
+            stream_id: s.id,
             language: s.tags.language,
             title: s.tags.title,
         })
         .collect())
+}
+
+fn source_span(source_file: &Path) -> Result<Option<(f64, f64)>> {
+    #[derive(Deserialize)]
+    struct Probe { #[serde(default)] format: Format }
+    #[derive(Deserialize, Default)]
+    struct Format { start_time: Option<String>, duration: Option<String> }
+
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-show_entries", "format=start_time,duration", "-of", "json"],
+        source_file,
+    )
+    .context("probe the source duration")?;
+    let secs = |s: Option<String>| s.and_then(|s| s.parse::<f64>().ok()).filter(|s| s.is_finite());
+    Ok(secs(probe.format.duration).map(|duration| (secs(probe.format.start_time).unwrap_or(0.0), duration)))
+}
+
+fn lenient<T>(probe: Result<T>, audio_index: usize) -> Result<Option<T>> {
+    match probe {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if crate::job::is_transient(&e) => Err(e),
+        Err(e) => {
+            tracing::warn!("audio track {audio_index}: {e:#}");
+            Ok(None)
+        }
+    }
+}
+
+/// The widest layout of a track that changes it midway; ffmpeg opens the encoder on the first frame.
+fn switched_layout(source_file: &Path, audio_index: usize, span: Option<(f64, f64)>) -> Result<Option<(String, u32)>> {
+    #[derive(Deserialize)]
+    struct Probe { #[serde(default)] frames: Vec<Frame> }
+    #[derive(Deserialize)]
+    struct Frame { channels: Option<u32>, channel_layout: Option<String> }
+
+    const SAMPLES: u32 = 40;
+    let mut intervals = vec!["%+#2".to_string()];
+    if let Some((start, duration)) = span {
+        let step = duration / f64::from(SAMPLES);
+        intervals.extend((1..SAMPLES).map(|k| format!("{:.3}%+#2", start + f64::from(k) * step)));
+    }
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", &format!("a:{audio_index}"), "-read_intervals", &intervals.join(","),
+          "-show_entries", "frame=channels,channel_layout", "-of", "json"],
+        source_file,
+    )
+    .with_context(|| format!("probe the channel layouts of audio track {audio_index}"))?;
+    let layouts: Vec<(u32, String)> = probe.frames.into_iter().filter_map(|f| Some((f.channels?, f.channel_layout?))).collect();
+    let Some(widest) = layouts.iter().max_by_key(|(channels, _)| *channels) else { return Ok(None) };
+    Ok(layouts.iter().any(|l| l != widest).then(|| (widest.1.clone(), widest.0)))
+}
+
+/// DVB-T2's LATM AAC, which mkvmerge turns into plain AAC.
+fn mkvmerge_repacks(
+    source_file: &Path,
+    track: &AudioTrack,
+    identified: &mut Option<Vec<crate::subtitle::Identified>>,
+) -> Result<Option<u64>> {
+    if track.codec_name != "aac_latm" {
+        return Ok(None);
+    }
+    if identified.is_none() {
+        *identified = Some(crate::subtitle::identify(source_file, "audio")?);
+    }
+    let tracks = identified.as_deref().unwrap_or_default();
+    Ok(match crate::subtitle::match_track(tracks, track.audio_index, track.stream_id.as_deref())[..] {
+        [one] => Some(one.id),
+        _ => None,
+    })
 }
 
 /// Into a seekable sink: into a pipe the muxer cannot finish ADTS AAC's header and refuses it.
@@ -483,7 +554,7 @@ fn fold_unplaced(source: &[&str]) -> Option<String> {
     Some(format!("aformat=sample_fmts=fltp,pan={layout}|{gains}"))
 }
 
-/// Drops a trailing "(Marker)" this function added on an earlier run.
+/// Drops the trailing "(Marker)" an earlier encode added.
 fn strip_codec_marker<'a>(title: &'a str, marker: &str) -> &'a str {
     title
         .strip_suffix(')')
@@ -495,6 +566,9 @@ fn strip_codec_marker<'a>(title: &'a str, marker: &str) -> &'a str {
 enum Action {
     Copy {
         preroll: usize,
+    },
+    FromSource {
+        id: u64,
     },
     Pcm {
         codec: &'static str,
@@ -566,12 +640,16 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
     let codecs = audio_codecs();
     warn_about_unknown_codec_rules(config, codecs.decodable.as_ref());
     let mut planned = Vec::with_capacity(kept.len());
-    for track in kept {
+    let mut span = None;
+    let mut identified = None;
+    for mut track in kept {
         let lossless = is_lossless(&track.codec_name, track.profile.as_deref(), &codecs.lossless);
         let decodable = codecs.decodable.as_ref().is_none_or(|d| d.contains(&track.codec_name));
         let r = config.resolve(&track.codec_name, lossless);
         let action = if r.mode == AudioMode::Copy || !decodable {
-            if copies_into_matroska(source_file, track.audio_index)? {
+            if let Some(id) = mkvmerge_repacks(source_file, &track, &mut identified)? {
+                Action::FromSource { id }
+            } else if copies_into_matroska(source_file, track.audio_index)? {
                 if r.mode == AudioMode::Encode {
                     tracing::warn!("audio track {} ({}): ffmpeg cannot decode it - copied instead", track.audio_index, track.codec_name);
                 }
@@ -596,9 +674,22 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                     "audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index
                 )));
             }
-            let layout = codec
-                .contains("opus")
-                .then(|| opus_layout(track.channel_layout.as_deref(), track.channels));
+            if span.is_none() {
+                span = Some(lenient(source_span(source_file), track.audio_index)?.flatten());
+            }
+            let switched = lenient(switched_layout(source_file, track.audio_index, span.flatten()), track.audio_index)?.flatten();
+            if let Some((layout, channels)) = &switched {
+                tracing::info!("audio track {}: changes its channel layout midway - encoding all of it as {layout}", track.audio_index);
+                track.channel_layout = Some(layout.clone());
+                track.channels = Some(*channels);
+            }
+            let widen = switched.map(|(layout, _)| format!("aformat=channel_layouts={layout}"));
+            let layout = if codec.contains("opus") {
+                let (name, filter) = opus_layout(track.channel_layout.as_deref(), track.channels);
+                Some((name, widen.map_or_else(|| filter.clone(), |w| format!("{w},{filter}"))))
+            } else {
+                widen.map(|w| (layout_name(track.channels.unwrap_or(2)), w))
+            };
             let bitrate = if output_is_lossless(codec) {
                 None
             } else {
@@ -642,6 +733,19 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
 }
 
 impl AudioPlan {
+    fn extracted(&self) -> Vec<&PlannedTrack> {
+        self.tracks.iter().filter(|t| !matches!(t.action, Action::FromSource { .. })).collect()
+    }
+
+    pub fn source_tracks(&self) -> Vec<(usize, u64)> {
+        self.tracks.iter()
+            .filter_map(|t| match t.action {
+                Action::FromSource { id } => Some((t.audio_index, id)),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn summary_lines(&self) -> Vec<String> {
         if self.tracks.is_empty() {
             return vec!["no audio tracks".to_string()];
@@ -656,6 +760,7 @@ impl AudioPlan {
                 let action = match &t.action {
                     Action::Copy { preroll: 0 } => "copy".to_string(),
                     Action::Copy { preroll } => format!("copy without {preroll} priming packet(s)"),
+                    Action::FromSource { .. } => "copy as AAC".to_string(),
                     Action::Pcm { codec } => format!("{codec}, no Matroska codec ID for {}", t.codec_name),
                     Action::Encode { codec, bitrate, layout, .. } => {
                         let mut s = codec_display(codec).to_string();
@@ -680,7 +785,8 @@ pub fn extract(
     plan: &AudioPlan,
     subtitles: &[(usize, Option<&'static str>)],
 ) -> Result<()> {
-    if plan.tracks.is_empty() && subtitles.is_empty() {
+    let tracks = plan.extracted();
+    if tracks.is_empty() && subtitles.is_empty() {
         // The muxer only tests whether this file exists.
         let _ = std::fs::remove_file(tracks_path);
         return Ok(());
@@ -691,7 +797,7 @@ pub fn extract(
         .arg("-i")
         .arg(source_file);
 
-    for t in &plan.tracks {
+    for t in &tracks {
         cmd.args(["-map", &format!("0:a:{}", t.audio_index)]);
     }
     for (index, _) in subtitles {
@@ -701,8 +807,9 @@ pub fn extract(
         cmd.args([format!("-c:s:{out_idx}"), codec.unwrap_or("copy").to_string()]);
     }
 
-    for (out_idx, t) in plan.tracks.iter().enumerate() {
+    for (out_idx, t) in tracks.iter().enumerate() {
         match &t.action {
+            Action::FromSource { .. } => {}
             Action::Copy { preroll } => {
                 cmd.args([format!("-c:a:{out_idx}"), "copy".into()]);
                 if *preroll > 0 {
@@ -735,7 +842,7 @@ fn encode_args(cmd: &mut Command, out_idx: usize, t: &PlannedTrack) {
     if let Some((name, filter)) = layout {
         cmd.args([format!("-filter:a:{out_idx}"), filter.clone()]);
         // libopusenc's default channel order swaps channels of 5.0 and 6.1.
-        if OPUS_LAYOUTS.iter().any(|(n, c)| n == name && c.len() > 2) {
+        if codec.contains("opus") && OPUS_LAYOUTS.iter().any(|(n, c)| n == name && c.len() > 2) {
             cmd.args([format!("-mapping_family:a:{out_idx}"), "1".into()]);
         }
     }
@@ -783,10 +890,29 @@ pub fn check_encoders(source_file: &Path, plan: &AudioPlan) -> Result<()> {
     cmd.args(["-f", "null", "-"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg audio encoder check")?;
     if !out.status.success() {
-        return Err(extraction_error(out.status, &String::from_utf8_lossy(&out.stderr))
-            .context("try the audio encoders on the first second"));
+        let err = extraction_error(out.status, &String::from_utf8_lossy(&out.stderr))
+            .context("try the audio encoders on the first second");
+        // ffmpeg words a refused option value and a track the encoder cannot take alike.
+        if !crate::job::is_transient(&err) && !encoders_open_on_stereo(&tracks)? {
+            return Err(err.context(crate::job::Transient));
+        }
+        return Err(err);
     }
     Ok(())
+}
+
+fn encoders_open_on_stereo(tracks: &[&PlannedTrack]) -> Result<bool> {
+    let mut cmd = Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-t", "1", "-i", "anullsrc=r=48000:cl=stereo"]);
+    for (out_idx, t) in tracks.iter().enumerate() {
+        let Action::Encode { codec, options, .. } = &t.action else { continue };
+        cmd.args(["-map", "0:a"]).args([format!("-c:a:{out_idx}"), codec.clone()]);
+        for (k, v) in options {
+            cmd.args([format!("-{k}:a:{out_idx}"), v.clone()]);
+        }
+    }
+    cmd.args(["-f", "null", "-"]);
+    Ok(crate::ext::output_with_timeout(&mut cmd, 120, "ffmpeg audio encoder check on silence")?.status.success())
 }
 
 fn extraction_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
@@ -873,7 +999,7 @@ impl Languages {
 
     /// One per track of tracks.mkv, in the order `extract` writes them.
     pub fn of_tracks(&self, plan: &AudioPlan, subtitles: &[(usize, Option<&'static str>)]) -> Vec<Option<String>> {
-        plan.tracks.iter()
+        plan.extracted().into_iter()
             .map(|t| self.audio.get(t.audio_index).cloned().flatten())
             .chain(subtitles.iter().map(|(i, _)| self.subtitles.get(*i).cloned().flatten()))
             .collect()
@@ -887,10 +1013,17 @@ fn matched_tags(ffprobe: &[Option<&str>], mkvmerge: &[(Option<&str>, Option<&str
         .map(|(i, ours)| {
             let ours = (*ours)?;
             let first = ours.split(',').next()?.trim();
-            let bcp47 = mkvmerge.get(i)
-                .filter(|(theirs, _)| same_tracks && *theirs == Some(first))
-                .and_then(|(_, tag)| tag.filter(|t| t.contains('-')));
-            bcp47.or((first != ours).then_some(first)).map(str::to_owned)
+            let theirs = mkvmerge.get(i).filter(|_| same_tracks);
+            if let Some((Some(legacy), Some(bcp47))) = theirs
+                && *legacy == first
+            {
+                return Some((*bcp47).to_owned());
+            }
+            // mkvmerge leaves out a descriptor code it does not know, and `--language` refuses it.
+            if first != ours && theirs.is_some_and(|(legacy, _)| legacy.is_none()) {
+                return None;
+            }
+            (first != ours).then(|| first.to_owned())
         })
         .collect()
 }
@@ -911,10 +1044,11 @@ pub fn mux_final(
     source_file: &Path,
     video_language: Option<&str>,
     source_shift_ms: i64,
-    source_subtitles: &[u64],
+    sources: &Sources,
     output_path: &Path,
-) -> Result<()> {
+) -> Result<Option<Vec<bool>>> {
     let has_tracks = std::fs::metadata(tracks_path).is_ok_and(|m| m.len() > 0);
+    let from_source = !(sources.source_audio.is_empty() && sources.source_subtitles.is_empty());
 
     // video.ivf has none; in copy mode the source has its own and track 0 may be audio.
     let encoded = video_path.extension().is_some_and(|e| e == "ivf");
@@ -922,6 +1056,21 @@ pub fn mux_final(
 
     let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.arg("-o").arg(output_path);
+
+    // Otherwise the tracks mkvmerge takes from the source end up behind all of ffmpeg's.
+    let order = if from_source {
+        let videos: Vec<u64> = if encoded {
+            vec![0]
+        } else {
+            crate::subtitle::identify(video_path, "video")?.into_iter().map(|t| t.id).collect()
+        };
+        let order = track_order(&videos, sources, if has_tracks { 2 } else { 1 });
+        let list: Vec<String> = order.iter().map(|(file, id)| format!("{file}:{id}")).collect();
+        cmd.arg("--track-order").arg(list.join(","));
+        Some(order.iter().map(|(file, _)| has_tracks && *file == 1).collect())
+    } else {
+        None
+    };
 
     if let Some(v) = source_video.first() {
         cmd.args(v.disposition.to_mkvmerge_flags(0));
@@ -942,24 +1091,23 @@ pub fn mux_final(
 
     if has_tracks {
         cmd.args(["--no-video", "--no-chapters", "--no-global-tags", "--no-track-tags"]);
+        let shift = extraction_shift_ms(source_file, tracks_path, sources)?;
         for (tid, lang) in tracks_languages.iter().enumerate() {
             if let Some(lang) = lang {
                 cmd.arg("--language").arg(format!("{tid}:{lang}"));
+            }
+            if shift != 0 {
+                cmd.arg("--sync").arg(format!("{tid}:{shift}"));
             }
         }
         cmd.arg(tracks_path);
     }
 
-    cmd.args(["--no-video", "--no-audio", "--no-track-tags"]);
-    if source_subtitles.is_empty() {
-        cmd.arg("--no-subtitles");
-    } else {
-        let ids = source_subtitles.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
-        cmd.args(["--subtitle-tracks", &ids]);
-    }
+    cmd.args(["--no-video", "--no-track-tags"]);
+    cmd.args(sources.source_args());
     // A copied video keeps mkvmerge's timeline, and realign_copied_video moves these with it.
-    if !source_subtitles.is_empty() && encoded {
-        let shift = source_shift_ms + wrapped_ts_shift_ms(source_file, source_subtitles, output_path)?;
+    if from_source && encoded {
+        let shift = source_shift_ms + wrapped_ts_shift_ms(source_file, sources, output_path)?;
         if shift != 0 {
             cmd.arg("--sync").arg(format!("-1:{shift}"));
         }
@@ -970,7 +1118,6 @@ pub fn mux_final(
     cmd.arg(source_file);
 
     let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source_file, 3600), "mkvmerge")?;
-    // mkvmerge exits 1 for warnings (non-fatal), 2+ for errors
     if out.status.code().unwrap_or(2) >= 2 {
         return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
     }
@@ -983,11 +1130,90 @@ pub fn mux_final(
         }
     }
 
-    Ok(())
+    Ok(order)
 }
 
-/// mkvmerge keeps the absolute time of a wrapping MPEG-TS, and its subtitles land past the end.
-fn wrapped_ts_shift_ms(source: &Path, subtitle_ids: &[u64], scratch: &Path) -> Result<i64> {
+pub struct Sources {
+    pub extracted_audio: Vec<usize>,
+    pub source_audio: Vec<(usize, u64)>,
+    pub extracted_subtitles: Vec<usize>,
+    pub source_subtitles: Vec<(usize, u64)>,
+}
+
+impl Sources {
+    pub fn new(plan: &AudioPlan, subtitles: &crate::subtitle::SubtitlePlan) -> Self {
+        Sources {
+            extracted_audio: plan.extracted().iter().map(|t| t.audio_index).collect(),
+            source_audio: plan.source_tracks(),
+            extracted_subtitles: subtitles.extract.iter().map(|(i, _)| *i).collect(),
+            source_subtitles: subtitles.from_source.clone(),
+        }
+    }
+
+    fn source_args(&self) -> Vec<String> {
+        let ids = |tracks: &[(usize, u64)]| tracks.iter().map(|(_, id)| id.to_string()).collect::<Vec<_>>().join(",");
+        let pick = |tracks: &[(usize, u64)], flag: &str, none: &str| {
+            if tracks.is_empty() { vec![none.to_string()] } else { vec![flag.to_string(), ids(tracks)] }
+        };
+        [pick(&self.source_audio, "--audio-tracks", "--no-audio"), pick(&self.source_subtitles, "--subtitle-tracks", "--no-subtitles")].concat()
+    }
+}
+
+/// mkvmerge's file and track IDs in the source's order: video, then audio, then subtitles.
+fn track_order(videos: &[u64], sources: &Sources, source_file: u32) -> Vec<(u32, u64)> {
+    let by_index = |extracted: &[usize], first_id: usize, from_source: &[(usize, u64)]| {
+        let mut tracks: Vec<(usize, (u32, u64))> = extracted.iter().enumerate()
+            .map(|(n, &index)| (index, (1, (first_id + n) as u64)))
+            .chain(from_source.iter().map(|&(index, id)| (index, (source_file, id))))
+            .collect();
+        tracks.sort_by_key(|(index, _)| *index);
+        tracks.into_iter().map(|(_, track)| track)
+    };
+    videos.iter().map(|&id| (0, id))
+        .chain(by_index(&sources.extracted_audio, 0, &sources.source_audio))
+        .chain(by_index(&sources.extracted_subtitles, sources.extracted_audio.len(), &sources.source_subtitles))
+        .collect()
+}
+
+/// ffmpeg starts an MPEG-TS extraction at the first packet it keeps, the video at the container start.
+fn extraction_shift_ms(source: &Path, tracks_path: &Path, sources: &Sources) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Probe { #[serde(default)] streams: Vec<Stream>, #[serde(default)] format: Format }
+    #[derive(Deserialize)]
+    struct Stream { start_time: Option<String> }
+    #[derive(Deserialize, Default)]
+    struct Format { #[serde(default)] format_name: String, start_time: Option<String> }
+
+    let spec = match (sources.extracted_audio.first(), sources.extracted_subtitles.first()) {
+        (Some(i), _) => format!("a:{i}"),
+        (None, Some(i)) => format!("s:{i}"),
+        (None, None) => return Ok(0),
+    };
+    let probe = |path: &Path, spec: &str| -> Result<Probe> {
+        crate::ext::ffprobe_json(
+            &["-v", "error", "-select_streams", spec, "-show_entries", "stream=start_time:format=format_name,start_time", "-of", "json"],
+            path,
+        )
+        .context("probe the start of the extracted tracks")
+    };
+    let source_probe = probe(source, &spec)?;
+    if source_probe.format.format_name != "mpegts" {
+        return Ok(0);
+    }
+    let extracted = probe(tracks_path, "0")?;
+    let secs = |s: Option<&String>| s.and_then(|v| v.parse::<f64>().ok());
+    let (Some(first), Some(container), Some(kept)) = (
+        secs(source_probe.streams.first().and_then(|s| s.start_time.as_ref())),
+        secs(source_probe.format.start_time.as_ref()),
+        secs(extracted.streams.first().and_then(|s| s.start_time.as_ref())),
+    ) else {
+        return Ok(0);
+    };
+    Ok(((first - container - kept) * 1000.0).round() as i64)
+}
+
+/// mkvmerge keeps the absolute time of a wrapping MPEG-TS, and the tracks it takes land past the end.
+fn wrapped_ts_shift_ms(source: &Path, sources: &Sources, scratch: &Path) -> Result<i64> {
     #[derive(Deserialize)]
     struct Probe { format: Format }
     #[derive(Deserialize)]
@@ -1009,29 +1235,28 @@ fn wrapped_ts_shift_ms(source: &Path, subtitle_ids: &[u64], scratch: &Path) -> R
         return Ok(0);
     }
 
-    let subtitles = scratch.with_file_name("subtitles.mkv");
-    let ids = subtitle_ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+    let taken = scratch.with_file_name("from_source.mkv");
     let mut cmd = Command::new(external_bin("mkvmerge"));
-    cmd.arg("-o").arg(&subtitles)
-        .args(["--no-video", "--no-audio", "--no-attachments", "--no-chapters", "--no-global-tags",
-               "--no-track-tags", "--subtitle-tracks", &ids])
+    cmd.arg("-o").arg(&taken)
+        .args(["--no-video", "--no-attachments", "--no-chapters", "--no-global-tags", "--no-track-tags"])
+        .args(sources.source_args())
         .arg(source);
     let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source, 3600), "mkvmerge")?;
     if out.status.code().unwrap_or(2) >= 2 {
-        let _ = std::fs::remove_file(&subtitles);
-        return Err(crate::ext::tool_error("mkvmerge subtitle probe", out.status, &String::from_utf8_lossy(&out.stdout)));
+        let _ = std::fs::remove_file(&taken);
+        return Err(crate::ext::tool_error("mkvmerge probe of the source tracks", out.status, &String::from_utf8_lossy(&out.stdout)));
     }
     let packets: Result<Packets> = crate::ext::ffprobe_json(
         &["-v", "error", "-read_intervals", "%+#8", "-show_entries", "packet=pts_time", "-of", "json"],
-        &subtitles,
+        &taken,
     );
-    let _ = std::fs::remove_file(&subtitles);
+    let _ = std::fs::remove_file(&taken);
     let first = packets?.packets.iter().filter_map(|p| secs(p.pts_time.as_deref())).reduce(f64::min);
     Ok(absolute_time_shift_ms(first, start, duration))
 }
 
-fn absolute_time_shift_ms(first_subtitle: Option<f64>, start: f64, duration: f64) -> i64 {
-    match first_subtitle {
+fn absolute_time_shift_ms(first_packet: Option<f64>, start: f64, duration: f64) -> i64 {
+    match first_packet {
         Some(t) if t > duration + 1.0 => -(start * 1000.0).round() as i64,
         _ => 0,
     }
@@ -1058,22 +1283,35 @@ mod tests {
     }
 
     #[test]
+    fn tracks_mkvmerge_takes_from_the_source_keep_their_place() {
+        let sources = Sources {
+            extracted_audio: vec![0, 2], source_audio: vec![(1, 5)],
+            extracted_subtitles: vec![0, 2], source_subtitles: vec![(1, 7)],
+        };
+        assert_eq!(track_order(&[0], &sources, 2), [(0, 0), (1, 0), (2, 5), (1, 1), (1, 2), (2, 7), (1, 3)]);
+
+        let only_source = Sources { extracted_audio: vec![], source_audio: vec![(0, 1)], extracted_subtitles: vec![], source_subtitles: vec![] };
+        assert_eq!(track_order(&[3, 4], &only_source, 1), [(0, 3), (0, 4), (1, 1)]);
+    }
+
+    #[test]
     fn a_bcp_47_tag_is_kept_only_where_both_tools_agree_on_the_track() {
         let theirs = [(Some("por"), Some("pt-BR")), (Some("por"), Some("pt-PT")), (Some("eng"), Some("en"))];
-        assert_eq!(
-            matched_tags(&[Some("por"), Some("por"), Some("eng")], &theirs),
-            [Some("pt-BR".to_string()), Some("pt-PT".to_string()), None]
-        );
-        assert_eq!(matched_tags(&[Some("ger"), Some("por"), Some("eng")], &theirs), [None, Some("pt-PT".to_string()), None]);
+        let tags = |t: &[&str]| t.iter().map(|t| (!t.is_empty()).then(|| t.to_string())).collect::<Vec<_>>();
+        assert_eq!(matched_tags(&[Some("por"), Some("por"), Some("eng")], &theirs), tags(&["pt-BR", "pt-PT", "en"]));
+        assert_eq!(matched_tags(&[Some("ger"), Some("por"), Some("eng")], &theirs), tags(&["", "pt-PT", "en"]));
         assert_eq!(matched_tags(&[None, Some("por"), Some("eng")], &theirs)[0], None);
         assert_eq!(matched_tags(&[Some("por"), Some("por")], &theirs), [None, None]);
 
+        // Cantonese under the legacy code for all of Chinese.
+        assert_eq!(matched_tags(&[Some("chi")], &[(Some("chi"), Some("yue"))]), tags(&["yue"]));
+
         let ts = [(Some("ger"), Some("de")), (Some("ger"), Some("de")), (Some("eng"), Some("en"))];
-        assert_eq!(
-            matched_tags(&[Some("ger,eng"), Some("ger"), Some("fre,eng")], &ts),
-            [Some("ger".to_string()), None, Some("fre".to_string())]
-        );
-        assert_eq!(matched_tags(&[Some("ger,eng"), Some("eng")], &ts[..1]), [Some("ger".to_string()), None]);
+        assert_eq!(matched_tags(&[Some("ger,eng"), Some("ger"), Some("fre,eng")], &ts), tags(&["de", "de", "fre"]));
+        assert_eq!(matched_tags(&[Some("ger,eng"), Some("eng")], &ts[..1]), tags(&["ger", ""]));
+
+        let unknown_first = [(None, None), (Some("fre"), None)];
+        assert_eq!(matched_tags(&[Some("zzz,eng"), Some("fre,eng")], &unknown_first), tags(&["", "fre"]));
     }
 
     fn sample_set() -> HashSet<String> {
@@ -1088,7 +1326,7 @@ mod tests {
         let set = sample_set();
         assert!(is_lossless("truehd", None, &set));
         assert!(is_lossless("flac", None, &set));
-        assert!(is_lossless("pcm_s24le", None, &set)); // pcm always lossless
+        assert!(is_lossless("pcm_s24le", None, &set));
         assert!(!is_lossless("eac3", None, &set));
         assert!(!is_lossless("aac", None, &set));
     }
@@ -1204,7 +1442,7 @@ mod tests {
         let track = |fmt: &str, bits: u32| AudioTrack {
             audio_index: 0, codec_name: "pcm_bluray".into(), profile: None, channels: Some(2),
             channel_layout: None, sample_rate: 48000, bits_per_raw_sample: bits,
-            sample_fmt: fmt.into(), initial_padding: 0, language: None, title: None,
+            sample_fmt: fmt.into(), initial_padding: 0, stream_id: None, language: None, title: None,
         };
         assert_eq!(pcm_codec(&track("s16", 16)), "pcm_s16le");
         assert_eq!(pcm_codec(&track("s16", 0)), "pcm_s16le");

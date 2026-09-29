@@ -181,6 +181,9 @@ expect_pass "HDR10+ on every frame"  assert_frames_with_side_data "$DV" "SMPTE20
 expect_fail "one frame too few"      assert_frames_with_side_data "$DV" "SMPTE2094-40" 47
 expect_fail "frames carrying none"   assert_frames_with_side_data "$SRC" "SMPTE2094-40" 48
 expect_fail "none without video"     assert_frames_with_side_data "$W/audio_only.mkv" "Dolby Vision" 0
+$FF -i "$DV" -map 0:v -c copy -bsf:v noise=amount=1 "$W/garbled.mkv"
+need "$W/garbled.mkv"
+expect_fail "none in frames that never decode" assert_frames_with_side_data "$W/garbled.mkv" "Dolby Vision" 0
 expect_pass "HDR10+ values as in the source" assert_hdr10plus_matches "$DV" "$DV"
 expect_fail "another sequence of them" assert_hdr10plus_matches "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$DV"
 expect_fail "none at all"            assert_hdr10plus_matches "$SRC" "$DV"
@@ -236,8 +239,6 @@ expect_pass "the video codec"        assert_video_codec "$SRC" h264
 expect_fail "the wrong codec"        assert_video_codec "$SRC" av1
 expect_pass "the video height"       assert_video_height "$SRC" 180
 expect_fail "the wrong height"       assert_video_height "$SRC" 1080
-expect_pass "under the limit"        assert_video_height_lt "$SRC" 181
-expect_fail "not under it"           assert_video_height_lt "$SRC" 180
 expect_pass "the pixel format again" assert_video_pix_fmt "$SRC" yuv420p
 expect_fail "a ten-bit one"          assert_video_pix_fmt "$SRC" yuv420p10le
 
@@ -245,6 +246,19 @@ expect_pass "the HLG transfer"       assert_color_transfer "$FIXTURES_DIR/hlg.mk
 expect_fail "PQ instead"             assert_color_transfer "$FIXTURES_DIR/hlg.mkv" smpte2084
 expect_pass "the BT.2020 primaries"  assert_color_primaries "$FIXTURES_DIR/hlg.mkv" bt2020
 expect_fail "BT.709 instead"         assert_color_primaries "$FIXTURES_DIR/hlg.mkv" bt709
+
+GRAY="color=c=gray:size=64x64:rate=24"
+$FF -f lavfi -i "$GRAY" -frames:v 4 -pix_fmt yuv420p10le -c:v libsvtav1 -preset 12 \
+    -vf setparams=color_trc=arib-std-b67:color_primaries=bt2020:colorspace=bt2020nc "$W/hlg_av1.mkv" 2>/dev/null
+$FF -f lavfi -i "$GRAY" -frames:v 4 -pix_fmt yuv420p10le -c:v libsvtav1 -preset 12 "$W/untagged.ivf" 2>/dev/null
+mkvmerge -q -o "$W/tags_only.mkv" --colour-transfer-characteristics 0:18 --colour-primaries 0:9 \
+    --chromaticity-coordinates 0:0.68,0.32,0.265,0.69,0.15,0.06 --white-colour-coordinates 0:0.31272,0.32902 \
+    --max-luminance 0:1000 --min-luminance 0:0.0005 --max-content-light 0:1017 --max-frame-light 0:391 "$W/untagged.ivf"
+need "$W/hlg_av1.mkv" "$W/tags_only.mkv"
+expect_pass "HLG in the AV1 bitstream too" assert_color_transfer "$W/hlg_av1.mkv" arib-std-b67
+expect_fail "HLG in Matroska alone"  assert_color_transfer "$W/tags_only.mkv" arib-std-b67
+expect_fail "BT.2020 in Matroska alone" assert_color_primaries "$W/tags_only.mkv" bt2020
+expect_fail "HDR10 in Matroska alone" assert_hdr_static_match "$W/tags_only.mkv" "$W/wp15636,16451.mkv"
 
 mkvmerge -q -o "$W/bcp47.mkv" --language 1:en-GB --language 2:de-CH "$SRC"
 need "$W/bcp47.mkv"

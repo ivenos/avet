@@ -44,9 +44,9 @@ impl HdrInfo {
     }
 
     fn color_args(&self) -> Vec<String> {
-        // FFMS2's RGB and gray conversion: BT.470BG matrix, limited range, left siting.
+        // FFMS2's RGB and gray conversion: BT.470BG matrix, limited range.
         let (matrix, chroma, range) = if self.not_yuv {
-            (Some(5), Some(1), None)
+            (Some(5), None, None)
         } else {
             (self.matrix_coefficients, self.chroma_sample_position, self.color_range)
         };
@@ -67,6 +67,15 @@ impl HdrInfo {
             args.extend_from_slice(&["--color-range".into(), cr.to_string()]);
         }
         args
+    }
+
+    /// Where the encoder input's chroma sits, in the names of ffmpeg's scale filter.
+    pub fn chroma_loc(&self) -> &'static str {
+        match (self.chroma_center, self.chroma_sample_position) {
+            (true, _) => "center",
+            (false, Some(2)) => "topleft",
+            _ => "left",
+        }
     }
 
     pub fn ipt_base_layer(&self) -> bool {
@@ -123,10 +132,8 @@ struct ProbeFrame {
 struct SideData {
     #[serde(default)]
     side_data_type: String,
-    // Content Light Level
     max_content: Option<serde_json::Value>,
     max_average: Option<serde_json::Value>,
-    // Mastering Display
     red_x: Option<serde_json::Value>,
     red_y: Option<serde_json::Value>,
     green_x: Option<serde_json::Value>,
@@ -165,14 +172,16 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
 impl HdrInfo {
     fn from_probe(probe: ProbeOutput) -> Self {
         let stream = probe.streams.into_iter().next().unwrap_or_default();
+        // FFMS2 subsamples full-width chroma between two samples, a siting AV1 has no code for.
+        let full_chroma = not_yuv(&stream.pix_fmt) || stream.pix_fmt.contains("444");
 
         let mut info = HdrInfo {
             codec_name: stream.codec_name.clone(),
             color_primaries: map_color_primaries(&stream.color_primaries),
             transfer_characteristics: map_transfer(&stream.color_transfer),
             matrix_coefficients: map_matrix(&stream.color_space),
-            chroma_sample_position: map_chroma(&stream.chroma_location),
-            chroma_center: stream.chroma_location == "center",
+            chroma_sample_position: if full_chroma { None } else { map_chroma(&stream.chroma_location) },
+            chroma_center: full_chroma || stream.chroma_location == "center",
             color_range: map_color_range(&stream.color_range),
             not_yuv: not_yuv(&stream.pix_fmt),
             ..Default::default()
@@ -486,7 +495,7 @@ fn map_chroma(s: &str) -> Option<u32> {
     })
 }
 
-// SVT-AV1: 0=studio, 1=full. Studio is the default, so only full needs signalling.
+// SVT-AV1: 0=studio, 1=full. Studio is the default, so only full needs signaling.
 fn map_color_range(s: &str) -> Option<u32> {
     match s {
         "pc" | "full" => Some(1),
@@ -579,8 +588,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(rgb.encoder_args(), [
-            "--color-primaries", "1", "--transfer-characteristics", "13",
-            "--matrix-coefficients", "5", "--chroma-sample-position", "1",
+            "--color-primaries", "1", "--transfer-characteristics", "13", "--matrix-coefficients", "5",
         ]);
 
         for fmt in ["gbrp", "bgr0", "rgb24", "rgba64le", "x2rgb10le", "pal8", "gray", "gray10le", "ya8", "monow"] {
@@ -635,6 +643,22 @@ mod tests {
 
         let rgb = info(r#"{"streams": [{"pix_fmt": "bgr0", "color_space": "gbr", "color_range": "pc"}]}"#);
         assert!(rgb.not_yuv && !rgb.encoder_args().contains(&"--color-range".to_string()));
+    }
+
+    #[test]
+    fn chroma_that_ffms2_subsamples_is_described_as_centered() {
+        let info = |pix_fmt: &str, location: &str| HdrInfo::from_probe(serde_json::from_str(&format!(
+            r#"{{"streams": [{{"pix_fmt": "{pix_fmt}", "chroma_location": "{location}"}}]}}"#
+        )).unwrap());
+
+        let full = info("yuv444p10le", "left");
+        assert_eq!((full.chroma_loc(), full.chroma_sample_position), ("center", None));
+        assert_eq!(info("gbrp", "unspecified").chroma_loc(), "center");
+
+        assert_eq!(info("yuv420p10le", "topleft").chroma_loc(), "topleft");
+        assert_eq!(info("yuv420p", "unspecified").chroma_loc(), "left");
+        assert_eq!(info("yuv422p", "left").chroma_loc(), "left");
+        assert_eq!(info("yuvj420p", "center").chroma_loc(), "center");
     }
 
     fn geometry(crop: Option<Crop>, scale: Option<(u32, u32)>) -> Geometry {

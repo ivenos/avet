@@ -94,6 +94,7 @@ done > "$RESULTS/suites"
 printf "\n=== avet Integration Test Suite (%s at once) ===\n\n" "$JOBS"
 
 xargs -P "$JOBS" -I {} sh -c '
+    trap "exit 130" INT TERM
     start=$(date +%s)
     sh "$CASES_DIR/$1.sh" > "$RESULTS/$1.out" 2>&1
     echo $? > "$RESULTS/$1.rc"

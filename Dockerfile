@@ -135,8 +135,8 @@ COPY src ./src
 COPY .github/scripts/crate-licenses.sh ./
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
-# The touch is load-bearing: COPY carries host mtimes in, /src/target is a cache mount,
-# and cargo would call the crate fresh and ship a stale binary.
+ARG AVET_VERSION
+# The touch is load-bearing: with host mtimes and a cached /src/target, cargo would ship a stale binary.
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
@@ -148,6 +148,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
 FROM alpine:3.24 AS runtime
 
 ARG TARGETARCH
+# Also here, so every version pulls the Alpine packages current at its build.
+ARG AVET_VERSION
 
 RUN apk add --no-cache \
         ffmpeg \

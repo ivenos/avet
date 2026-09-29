@@ -9,4 +9,5 @@ packaging/
 .dockerignore
 *.md
 proptest-regressions/
+logo/
 

@@ -203,7 +203,7 @@ fn failed_marker(output_dir: &Path, source_file: &Path) -> Option<PathBuf> {
         return None;
     }
     match temp.recorded_id() {
-        Some(prev) if prev != crate::resume::source_id(source_file) => None,
+        Some(prev) if crate::resume::source_id(source_file).is_ok_and(|id| id != prev) => None,
         _ => Some(temp.failed_path),
     }
 }
@@ -461,7 +461,7 @@ mod tests {
         let temp = crate::resume::TempDir::for_video(&output, "film");
         temp.create_dirs().unwrap();
         fs::write(&temp.failed_path, b"boom").unwrap();
-        fs::write(&temp.source_id_path, crate::resume::source_id(&input.join("a").join("film.mkv"))).unwrap();
+        fs::write(&temp.source_id_path, crate::resume::source_id(&input.join("a").join("film.mkv")).unwrap()).unwrap();
 
         // Running b would discard the temp dir the marker of a lives in.
         assert_eq!(scan(&input, &output).unwrap().len(), 0);
@@ -480,7 +480,7 @@ mod tests {
         fs::write(&temp.failed_path, b"boom").unwrap();
 
         // Marker written for this exact file: blocked.
-        fs::write(&temp.source_id_path, crate::resume::source_id(&profile.join("film.mkv"))).unwrap();
+        fs::write(&temp.source_id_path, crate::resume::source_id(&profile.join("film.mkv")).unwrap()).unwrap();
         assert_eq!(scan(&input, &output).unwrap().len(), 0);
 
         // Marker left over from a different file that had the same name: not blocked.

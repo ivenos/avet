@@ -1,15 +1,8 @@
 #!/bin/sh
-# Shared test library. Source this file from each test case.
-#
-# Provides:
-#   run_avet        INPUT OUTPUT EXPECTED_FILE [TIMEOUT_S]
-#   run_avet_timed  INPUT OUTPUT WAIT_S [LOG_PATTERN]
-#   assert_*        various assertion helpers
-#   test_done       call at end of each test case to exit with correct code
-#
 # Environment:
 #   TEST_IMAGE      Docker image to use (default: avet:test)
 #   TEST_CPUS       CPU share for the avet container, e.g. 0.5 to slow a job down
+#   TEST_CPUSET     CPUs the avet container may run on, e.g. 0 for a single one
 #   FIXTURES_DIR    Path to the fixtures run.sh generates
 #   VERBOSE=1       Print Docker logs on failure
 
@@ -63,9 +56,7 @@ test_workdir() {
     mktemp -d -p "$_SCRATCH"
 }
 
-# Run avet and wait until EXPECTED_FILE appears (or TIMEOUT_S elapses).
-# Sets RUN_LOGS with container stdout+stderr.
-# Returns 0 if the file appeared, 1 if timed out.
+# Returns 0 once EXPECTED_FILE appeared; sets RUN_LOGS.
 run_avet() {
     local input="$1" output="$2" expected="$3" timeout="${4:-120}"
     RUN_LOGS=""
@@ -74,16 +65,20 @@ run_avet() {
     cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
+        ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         "${TEST_IMAGE}")
 
-    local elapsed=0
+    local elapsed=0 failed_line
+    # Nothing retries with this poll interval, so a failed job is the end of the run.
+    failed_line=$(printf '[%s] job failed' "$(basename "$expected" .mkv)" | tail -n 1)
     while [ "$elapsed" -lt "$timeout" ]; do
         # -s, not -e: a zero-byte leftover from an earlier run is not this run's output.
         [ -s "$expected" ] && break
+        docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF -e "$failed_line" && break
         local running
         running=$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null) || running="false"
         [ "$running" = "false" ] && break
@@ -115,35 +110,29 @@ run_avet() {
     [ -s "$expected" ] && return 0 || return 1
 }
 
-# Run avet for up to WAIT seconds, then stop. With an optional LOG_PATTERN it
-# returns as soon as that pattern appears in the logs (capped at WAIT); without
-# one it waits the full WAIT. Useful for negative tests where no output is expected.
-# Always returns 0; sets RUN_LOGS.
-run_avet_timed() {
-    local input="$1" output="$2" wait="${3:-15}" pattern="${4:-}"
+# Stops avet once LOG_PATTERN is logged or WAIT_S is up; sets RUN_LOGS.
+run_avet_timed() { # INPUT OUTPUT WAIT_S LOG_PATTERN
+    local input="$1" output="$2" wait="$3" pattern="$4"
     RUN_LOGS=""
 
     local cid
     cid=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
+        ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         "${TEST_IMAGE}")
 
-    if [ -n "$pattern" ]; then
-        local elapsed=0
-        while [ "$elapsed" -lt "$wait" ]; do
-            docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | \
-                grep -qF "$pattern" && break
-            sleep 1
-            elapsed=$((elapsed + 1))
-        done
-    else
-        sleep "$wait"
-    fi
+    local elapsed=0
+    while [ "$elapsed" -lt "$wait" ]; do
+        docker logs "$cid" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | \
+            grep -qF -e "$pattern" && break
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
 
     RUN_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
@@ -156,6 +145,7 @@ start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
     AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
+        ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${1}:/input:z" \
         -v "${2}:/output:z" \
         -e POLL_INTERVAL="${3:-2}" \
@@ -170,7 +160,7 @@ avet_logs() {
 wait_for_log() { # PATTERN TIMEOUT_S
     local elapsed=0
     while [ "$elapsed" -lt "$2" ]; do
-        docker logs "$AVET_CID" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF "$1" && { avet_logs; return 0; }
+        docker logs "$AVET_CID" 2>&1 | sed "s/${_ESC}\[[0-9;]*m//g" | grep -qF -e "$1" && { avet_logs; return 0; }
         sleep 1
         elapsed=$((elapsed + 1))
     done
@@ -343,23 +333,26 @@ assert_audio_title() {
         fail "audio track $idx title: expected '$expected', got '$actual' ($file)"
 }
 
-assert_color_transfer() {
-    local file="$1" expected="$2"
-    local actual
-    actual=$(ffprobe -v quiet -select_streams v:0 \
-        -show_entries stream=color_transfer -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
-    [ "$actual" = "$expected" ] || \
-        fail "color_transfer: expected $expected, got $actual ($file)"
+# ffprobe fills in what the AV1 bitstream lacks from the Matroska elements, so both are read.
+av1_bitstream() { # FILE -> its video as bare OBUs, nothing for another codec
+    local obu
+    [ "$(stream_value "$1" v:0 stream=codec_name)" = av1 ] || return 0
+    obu=$(mktemp -p "$_SCRATCH")
+    ffmpeg -v error -y -i "$1" -map 0:v:0 -c copy -f obu "$obu" && printf '%s' "$obu"
 }
 
-assert_color_primaries() {
-    local file="$1" expected="$2"
-    local actual
-    actual=$(ffprobe -v quiet -select_streams v:0 \
-        -show_entries stream=color_primaries -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
-    [ "$actual" = "$expected" ] || \
-        fail "color_primaries: expected $expected, got $actual ($file)"
+assert_color_value() { # FILE ENTRY EXPECTED
+    local file="$1" entry="$2" expected="$3" actual obu
+    actual=$(ffprobe -v quiet -select_streams v:0 -show_entries "stream=$entry" -of default=nw=1:nk=1 "$file" | tr -d '\n')
+    [ "$actual" = "$expected" ] || fail "$entry: expected $expected, got $actual ($file)"
+    obu=$(av1_bitstream "$file")
+    [ -n "$obu" ] || return 0
+    actual=$(ffprobe -v quiet -f obu -show_entries "stream=$entry" -of default=nw=1:nk=1 "$obu" | tr -d '\n')
+    [ "$actual" = "$expected" ] || fail "$entry in the AV1 bitstream: expected $expected, got $actual ($file)"
 }
+
+assert_color_transfer()  { assert_color_value "$1" color_transfer "$2"; }
+assert_color_primaries() { assert_color_value "$1" color_primaries "$2"; }
 
 assert_video_pix_fmt() {
     local file="$1" expected="$2"
@@ -368,19 +361,6 @@ assert_video_pix_fmt() {
         -show_entries stream=pix_fmt -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
     [ "$actual" = "$expected" ] || \
         fail "pix_fmt: expected $expected, got $actual ($file)"
-}
-
-assert_video_height_lt() {
-    local file="$1" max="$2"
-    local actual
-    actual=$(ffprobe -v quiet -select_streams v:0 \
-        -show_entries stream=height -of default=nw=1:nk=1 "$file" 2>/dev/null | tr -d '\n')
-    # Defaulting to 0 would turn "there is no output file" into a passing assertion.
-    case "$actual" in
-        ''|*[!0-9]*) fail "video height: could not read a height from $file"; return ;;
-    esac
-    [ "$actual" -lt "$max" ] || \
-        fail "video height: expected < $max, got $actual ($file)"
 }
 
 # Starts at frame 0 and is gapless; a gap is source no chunk ever encodes. Not the tail -
@@ -862,8 +842,15 @@ frames_with_side_data() {
 }
 
 assert_frames_with_side_data() {
-    local file="$1" pattern="$2" expected="$3" actual
+    local file="$1" pattern="$2" expected="$3" actual decoded
     assert_has_stream "$file" v:0 || return
+    # "None of the frames" holds for a file that decodes no frame at all.
+    decoded=$(ffprobe -v error -select_streams v:0 -count_frames -count_packets \
+        -show_entries stream=nb_read_frames,nb_read_packets -of csv=p=0 "$file" 2>/dev/null | cut -d, -f1,2)
+    [ "${decoded%,*}" = "${decoded#*,}" ] && [ "${decoded%,*}" -gt 0 ] 2>/dev/null || {
+        fail "frames with '$pattern': $file decodes $decoded (frames,packets)"
+        return
+    }
     actual=$(frames_with_side_data "$file" "$pattern")
     [ "$actual" = "$expected" ] || \
         fail "frames with '$pattern': expected $expected, got $actual ($file)"
@@ -895,8 +882,8 @@ assert_dovi_record() {
 }
 
 # Mastering display and content light level of the first frame, as plain numbers.
-hdr_static() {
-    ffprobe -v error -select_streams v:0 -read_intervals '%+#1' \
+hdr_static() { # FILE [FORMAT]
+    ffprobe -v error ${2:+-f "$2"} -select_streams v:0 -read_intervals '%+#1' \
         -show_entries frame_side_data=red_x,red_y,green_x,green_y,blue_x,blue_y,white_point_x,white_point_y,min_luminance,max_luminance,max_content,max_average \
         -of default=nw=1 "$1" | awk -F= 'NF == 2 { split($2, r, "/"); printf "%s %.8f\n", $1, (r[2] + 0 ? r[1] / r[2] : r[1]) }' | sort
 }
@@ -904,13 +891,16 @@ hdr_static() {
 # Chromaticity to 1/65536 and minimum luminance to 1/16384, what AV1 can store;
 # anything coarser is a loss avet caused.
 assert_hdr_static_match() {
-    local diff
-    diff=$(paste -d ' ' "$(_tmp_file hdr_static "$1")" "$(_tmp_file hdr_static "$2")" | awk '
-        NF != 4 || $1 != $3 { print "fields differ: " $0; exit }
-        { d = $2 - $4; if (d < 0) d = -d
-          tol = ($1 ~ /_x$|_y$/) ? 1 / 65536 : ($1 == "min_luminance") ? 1 / 16384 : 0.5
-          if (d > tol) { printf "%s is %s, the source %s", $1, $2, $4; exit } }')
-    [ -z "$diff" ] && [ -n "$(hdr_static "$2")" ] || fail "HDR static metadata of $1: ${diff:-source has none}"
+    local obu diff got
+    obu=$(av1_bitstream "$1")
+    for got in "$(_tmp_file hdr_static "$1")" ${obu:+"$(_tmp_file hdr_static "$obu" obu)"}; do
+        diff=$(paste -d ' ' "$got" "$(_tmp_file hdr_static "$2")" | awk '
+            NF != 4 || $1 != $3 { print "fields differ: " $0; exit }
+            { d = $2 - $4; if (d < 0) d = -d
+              tol = ($1 ~ /_x$|_y$/) ? 1 / 65536 : ($1 == "min_luminance") ? 1 / 16384 : 0.5
+              if (d > tol) { printf "%s is %s, the source %s", $1, $2, $4; exit } }')
+        [ -z "$diff" ] && [ -n "$(hdr_static "$2")" ] || { fail "HDR static metadata of $1${obu:+ or its AV1 bitstream}: ${diff:-source has none}"; return; }
+    done
 }
 
 test_done() {

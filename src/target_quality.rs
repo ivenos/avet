@@ -28,7 +28,7 @@ pub struct DisplayModel {
     hdr: bool,
 }
 
-/// 30 inches at twice the display height, the geometry of Vship's own standard models.
+/// A 16:9 panel of 30 inches at twice its height, the geometry of Vship's own standard models.
 const DISPLAY_INCHES: f64 = 30.0;
 const DISPLAY_DISTANCE_M: &str = "0.7472";
 
@@ -59,16 +59,17 @@ impl DisplayModel {
     }
 }
 
-/// HDR by the signalled transfer, at the resolution the two files are compared at. A crop
-/// of `frame` shrinks the display with it, so the pixels keep their size.
+/// HDR by the signaled transfer, at the resolution the two files are compared at. `frame`
+/// fills the panel as far as its shape allows, and a crop of it keeps the pixel size.
 pub fn display_model_for(width: u32, height: u32, frame: (u32, u32), hdr_args: &[String]) -> DisplayModel {
-    let hdr = matches!(signalled_transfer(hdr_args), Some("16" | "18"));
-    let diagonal = |w: u32, h: u32| f64::from(w).hypot(f64::from(h));
-    let diagonal_inches = DISPLAY_INCHES * diagonal(width, height) / diagonal(frame.0, frame.1);
+    let hdr = matches!(signaled_transfer(hdr_args), Some("16" | "18"));
+    let unit = DISPLAY_INCHES / 16f64.hypot(9.0);
+    let pitch = (16.0 * unit / f64::from(frame.0)).min(9.0 * unit / f64::from(frame.1));
+    let diagonal_inches = pitch * f64::from(width).hypot(f64::from(height));
     DisplayModel { width, height, diagonal_inches, hdr }
 }
 
-fn signalled_transfer(hdr_args: &[String]) -> Option<&str> {
+fn signaled_transfer(hdr_args: &[String]) -> Option<&str> {
     hdr_args
         .windows(2)
         .find(|w| w[0] == "--transfer-characteristics")
@@ -304,7 +305,6 @@ fn solve(
         let probe = probe_at(crf, Phase::Search)?;
         pts.push(probe);
 
-        // early stop: just above the floor, within the size cap, after min_probes
         if i + 1 >= tq.min_probes
             && floor.holds(&probe) && probe.jod <= floor.jod + tol && probe.size_pct <= cap
         {
@@ -312,8 +312,10 @@ fn solve(
         }
         // Size falls as the CRF rises, so nothing below a probe over the cap can be picked.
         let pickable = pts.iter().filter(|p| p.size_pct > cap).map(|p| p.crf + CRF_STEP).fold(lo, f64::max);
-        match next_crf(&pts, &floor, lo, hi) {
-            Some(next) if (next - crf).abs() > 1e-9 && next >= pickable - 1e-9 => crf = next,
+        let last_probe = pts.len() as u32 + 1 >= tq.max_probes;
+        let next = next_crf(&pts, &floor, lo, hi, last_probe).map(|next| cap_crossing(&pts, cap).map_or(next, |c| next.max(c)));
+        match next {
+            Some(next) if (next - crf).abs() > 1e-9 && next >= pickable - 1e-9 && !already(&pts, next) => crf = next,
             _ => break,
         }
     }
@@ -439,7 +441,7 @@ pub fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
 }
 
 /// None once the crossing is bracketed to one step, a bound is hit, or the grid is used.
-fn next_crf(pts: &[Probe], floor: &Floor, lo: f64, hi: f64) -> Option<f64> {
+fn next_crf(pts: &[Probe], floor: &Floor, lo: f64, hi: f64, last_probe: bool) -> Option<f64> {
     let target = floor.jod;
     let pass: Vec<f64> = pts.iter().filter(|p| floor.holds(p)).map(|p| p.crf).collect();
     let fail: Vec<f64> = pts.iter().filter(|p| !floor.holds(p)).map(|p| p.crf).collect();
@@ -447,30 +449,35 @@ fn next_crf(pts: &[Probe], floor: &Floor, lo: f64, hi: f64) -> Option<f64> {
     let by_jod = pts.iter().filter(|p| !floor.holds(p)).all(|p| p.jod < target);
 
     if !pass.is_empty() && !fail.is_empty() {
-        let p = pass.iter().copied().fold(f64::MIN, f64::max); // highest CRF still passing
-        let f = fail.iter().copied().fold(f64::MAX, f64::min); // lowest CRF failing
+        let p = pass.iter().copied().fold(f64::MIN, f64::max);
+        let f = fail.iter().copied().fold(f64::MAX, f64::min);
         if f - p <= CRF_STEP + 1e-9 {
-            return None; // bracketed to adjacent grid steps
+            return None;
         }
-        let guess = if by_jod { interpolate_crf(pts, target) } else { (p + f) / 2.0 };
+        // The secant keeps a far end while the near one creeps in; two probes on one side halve
+        // instead, unless no probe would be left to recover from the jump.
+        let last = &pts[pts.len().saturating_sub(2)..];
+        let creeping = !last_probe && last.len() == 2 && floor.holds(&last[0]) == floor.holds(&last[1]);
+        let guess = if by_jod && !creeping { interpolate_crf(pts, target) } else { (p + f) / 2.0 };
         let mut cand = round_to_step(guess, p, f);
         if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
-            cand = round_to_step((p + f) / 2.0, p, f); // bisection fallback
+            cand = round_to_step((p + f) / 2.0, p, f);
         }
         if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
             return None;
         }
         Some(cand)
     } else if !pass.is_empty() {
-        // everything passes: compress harder (toward max_crf)
         let hp = pass.iter().copied().fold(f64::MIN, f64::max);
         if hp >= hi - 1e-9 {
             return None;
         }
-        let cand = round_to_step(interpolate_crf(pts, target).max(hp + CRF_STEP), hp + CRF_STEP, hi);
+        let guess = interpolate_crf(pts, target);
+        // No slope to follow, as on a black chunk every CRF scores alike.
+        let guess = if guess > hp { guess } else { hi };
+        let cand = round_to_step(guess.max(hp + CRF_STEP), hp + CRF_STEP, hi);
         if already(pts, cand) { None } else { Some(cand) }
     } else {
-        // everything fails: raise quality (toward min_crf)
         let lf = fail.iter().copied().fold(f64::MAX, f64::min);
         if lf <= lo + 1e-9 {
             return None;
@@ -479,6 +486,19 @@ fn next_crf(pts: &[Probe], floor: &Floor, lo: f64, hi: f64) -> Option<f64> {
         let cand = round_to_step(guess, lo, lf - CRF_STEP);
         if already(pts, cand) { None } else { Some(cand) }
     }
+}
+
+/// The lowest CRF estimated to fit the cap, between the probes on either side of it. Size
+/// falls about exponentially with the CRF, so the estimate is taken on its logarithm.
+fn cap_crossing(pts: &[Probe], cap: f64) -> Option<f64> {
+    let over = pts.iter().filter(|p| p.size_pct > cap).max_by(|a, b| a.crf.total_cmp(&b.crf))?;
+    let fit = pts.iter().filter(|p| p.size_pct <= cap && p.crf > over.crf).min_by(|a, b| a.crf.total_cmp(&b.crf))?;
+    if fit.crf - over.crf <= CRF_STEP + 1e-9 || fit.size_pct <= 0.0 {
+        return None;
+    }
+    let t = (over.size_pct.ln() - cap.ln()) / (over.size_pct.ln() - fit.size_pct.ln());
+    let crf = over.crf + t.clamp(0.0, 1.0) * (fit.crf - over.crf);
+    Some(((crf / CRF_STEP).ceil() * CRF_STEP).clamp(over.crf + CRF_STEP, fit.crf))
 }
 
 /// Linear (secant) estimate of the CRF that yields `target` JOD.
@@ -600,6 +620,12 @@ fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyh
         "Failed to Allocate Memory",
         "device lost",
         "Failed to synchronize to Fence",
+        "Failed to Create Fence",
+        "Failed to reset Fence",
+        "Failed to create semaphore",
+        "command pool",
+        "command buffers",
+        "BadDeviceCode",
         "Failed to Submit commandBuffer",
         "Pinned buffer allocation failed",
         "OutOfRAM",
@@ -783,7 +809,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
 
 /// CAMBI's visibility thresholds come in BT.1886 and PQ; HLG is measured as BT.1886.
 fn cambi_feature(hdr_args: &[String]) -> &'static str {
-    match signalled_transfer(hdr_args) {
+    match signaled_transfer(hdr_args) {
         Some("16") => "cambi=full_ref=true:eotf=pq",
         _ => "cambi=full_ref=true",
     }
@@ -864,7 +890,18 @@ mod tests {
     }
 
     #[test]
-    fn display_model_follows_the_signalled_transfer() {
+    fn a_gpu_that_breaks_mid_job_is_retried_and_a_bad_file_is_not() {
+        use std::os::unix::process::ExitStatusExt;
+        let (aborted, exit1) = (std::process::ExitStatus::from_raw(6), std::process::ExitStatus::from_raw(1 << 8));
+        let transient = |status, stderr| gpu_error("FFVship", status, stderr).downcast_ref::<crate::job::Transient>().is_some();
+
+        assert!(transient(aborted, "terminate called after throwing an instance of 'std::runtime_error'\n  what():  Failed to Create Fence"));
+        assert!(transient(exit1, "BadDeviceCode: Vship was unable to run a simple GPU Kernel."));
+        assert!(!transient(exit1, "Error: could not open the distorted file"));
+    }
+
+    #[test]
+    fn display_model_follows_the_signaled_transfer() {
         let args = |t: &str| vec!["--transfer-characteristics".to_string(), t.to_string()];
 
         assert_eq!(display_model_for(3840, 2160, (3840, 2160), &args("16")).describe(), "3840x2160 HDR");
@@ -903,12 +940,18 @@ mod tests {
     fn a_crop_keeps_the_pixels_of_the_uncropped_frame() {
         let pitch = |m: DisplayModel| m.diagonal_inches / f64::from(m.width).hypot(f64::from(m.height));
         let full = display_model_for(1920, 1080, (1920, 1080), &[]);
-        assert_eq!(full.diagonal_inches, 30.0);
+        assert!((full.diagonal_inches - 30.0).abs() < 1e-9);
         assert!(full.config_json().contains("\"diagonal_size_inches\":30.000"), "{}", full.config_json());
 
         for (w, h) in [(1920, 800), (1440, 1080), (1440, 800)] {
             let cropped = display_model_for(w, h, (1920, 1080), &[]);
             assert!((pitch(cropped) - pitch(full)).abs() < 1e-12, "{w}x{h}");
+        }
+
+        // The same picture without the bars a crop would have removed.
+        for (w, h) in [(1440, 1080), (1920, 800)] {
+            let native = display_model_for(w, h, (w, h), &[]);
+            assert!((pitch(native) - pitch(full)).abs() < 1e-12, "{w}x{h}");
         }
     }
 
@@ -1078,17 +1121,17 @@ mod tests {
         let floor = cambi(Some(5.0), None);
 
         // JOD is far above the floor, so its secant would step one grid point at a time.
-        assert_eq!(next_crf(&[pc(35.0, 9.88, 8.0, 8.0)], &floor, 1.0, 70.0), Some(18.0));
+        assert_eq!(next_crf(&[pc(35.0, 9.88, 8.0, 8.0)], &floor, 1.0, 70.0, false), Some(18.0));
 
         let pts = [pc(20.0, 9.90, 4.5, 0.5), pc(40.0, 9.85, 7.0, 3.0)];
-        assert_eq!(next_crf(&pts, &floor, 1.0, 70.0), Some(30.0));
+        assert_eq!(next_crf(&pts, &floor, 1.0, 70.0, false), Some(30.0));
     }
 
     #[test]
     fn a_jod_failure_still_interpolates_with_a_cambi_floor_set() {
         // Both bracket ends are clean on CAMBI, so the JOD secant places 35.
         let pts = vec![pc(30.0, 9.7, 0.2, 0.2), pc(40.0, 9.3, 0.6, 0.6)];
-        assert_eq!(next_crf(&pts, &cambi(Some(5.0), Some(1.0)), 1.0, 70.0), Some(35.0));
+        assert_eq!(next_crf(&pts, &cambi(Some(5.0), Some(1.0)), 1.0, 70.0, false), Some(35.0));
     }
 
     #[test]
@@ -1185,10 +1228,34 @@ mod tests {
         assert_eq!(two.len(), 2);
 
         let cfg = TargetQualityConfig { min_probes: 5, ..tq(9.5) };
-        let (res, five) = run_solve(&cfg, 30.0, flat);
-        check_probes(&cfg, &five);
-        assert_eq!(five.len(), 5);
+        let (res, more) = run_solve(&cfg, 30.0, flat);
+        check_probes(&cfg, &more);
+        assert_eq!(more, [30.0, 30.75, 70.0]);
         assert!(matches!(res.outcome, SolveOutcome::Met));
+    }
+
+    #[test]
+    fn a_black_chunk_goes_straight_to_max_crf() {
+        let cfg = tq(9.5);
+        let (res, calls) = run_solve(&cfg, 35.5, |crf| p(crf, 10.0, 5.0));
+        assert_eq!(calls, [35.5, 55.5, 70.0]);
+        assert_eq!(res.crf, 70.0);
+    }
+
+    #[test]
+    fn a_binding_size_cap_does_not_leave_the_chunk_at_a_far_probe() {
+        // A clip's measured curve: the second probe overshoots to max_crf, the rest creep in from below.
+        let curve = [(1.0, 9.995), (20.0, 9.9427), (30.0, 9.9162), (40.0, 9.8553), (50.0, 9.7599), (60.0, 9.533), (70.0, 9.2)];
+        let jod = |crf: f64| {
+            let i = curve.windows(2).position(|w| crf <= w[1].0).unwrap_or(curve.len() - 2);
+            let ((c0, j0), (c1, j1)) = (curve[i], curve[i + 1]);
+            j0 + (crf - c0) / (c1 - c0) * (j1 - j0)
+        };
+        let cfg = TargetQualityConfig { max_encoded_percent: 50.0, ..tq(9.8) };
+        let (res, calls) = run_solve(&cfg, 25.0, |crf| p(crf, jod(crf), 120.0 * (-0.1 * (crf - 35.5)).exp()));
+        check_probes(&cfg, &calls);
+        assert!(matches!(res.outcome, SolveOutcome::Met), "settled on crf {} via {calls:?}", res.crf);
+        assert!(res.jod <= cfg.jod + cfg.tolerance, "settled on crf {} via {calls:?}", res.crf);
     }
 
     #[test]

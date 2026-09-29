@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version for the artifact names, e.g. v1.0.0. Empty uses dev-<sha>."
+        description: "Version for the artifact names and avet --version, e.g. v1.0.0. Empty uses dev-<sha>."
         required: false
   pull_request:
     paths: [".github/workflows/appimage.yml", ".github/scripts/crate-licenses.sh", "packaging/**"]
@@ -32,7 +32,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # A release can be cut from any commit, including one whose tests never ran.
@@ -196,7 +196,7 @@ jobs:
           sudo install -m755 /tmp/vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf
 
       - name: Build avet
-        run: cargo build --release --locked
+        run: AVET_VERSION="$APP_VERSION" cargo build --release --locked
 
       - name: Stage AppDir
         run: |
@@ -250,14 +250,13 @@ jobs:
           set -e
           grep -q "avet started" smoke.log
 
-      # avet logs "avet started" before touching a tool, so the smoke test above passes
-      # on an AppImage with nothing bundled. On this runner /usr/local/lib has every library.
+      # The smoke test above passes with no tool bundled, and this runner has every library in /usr/local/lib.
       - name: Every bundled tool starts
         run: |
           set -eux
           cd /tmp
           "$GITHUB_WORKSPACE/avet-${APP_VERSION}-${{ matrix.arch }}.AppImage" --appimage-extract >/dev/null
-          docker run --rm -v /tmp/squashfs-root:/app:ro -w /tmp ubuntu:24.04 sh -eux -c '
+          docker run --rm -e APP_VERSION -v /tmp/squashfs-root:/app:ro -w /tmp ubuntu:24.04 sh -eux -c '
             BIN=/app/usr/bin
             "$BIN/ffmpeg"           -hide_banner -version >/dev/null
             "$BIN/ffprobe"          -hide_banner -version >/dev/null
@@ -266,8 +265,7 @@ jobs:
             "$BIN/SvtAv1EncApp-hdr" --version             >/dev/null
             "$BIN/vmaf"             --version             >/dev/null
             "$BIN/ffmsindex" 2>&1 | grep -qi usage
-            timeout -s KILL 5 "$BIN/avet" >start.log 2>&1 || true
-            grep -q "avet started" start.log
+            [ "$("$BIN/avet" --version)" = "avet $APP_VERSION" ]
             # No GPU here, so "no device" is success and only a loader error is a failure.
             "$BIN/FFVship" --list-gpu >ffvship.log 2>&1 || true
             if grep -qiE "error while loading|symbol lookup error|cannot open shared object|error relocating|symbol not found" ffvship.log; then

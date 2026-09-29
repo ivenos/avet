@@ -1,5 +1,4 @@
 #!/bin/sh
-# Tests for audio.rs: track selection, codec rules, language whitelist, channel preservation.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -353,7 +352,7 @@ assert_audio_language       "$O/test.mkv" 0 ger
 assert_subtitle_track_count "$O/test.mkv" 1
 assert_subtitle_language    "$O/test.mkv" 0 ger
 
-# -- a video language mkvmerge does not know leaves the video untagged, not the job failed -
+# a video language mkvmerge does not know leaves the video untagged, not the job failed
 I="$WORKDIR/22/in"; O="$WORKDIR/22/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/lang_video.mkv" "$I/p/test.mkv"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
@@ -379,7 +378,7 @@ assert_file_not_exists "$O/test.mkv"
 assert_file_not_exists "$O/.avet_test/.failed"
 assert_file_exists     "$I/p/test.mkv"
 
-# an encoder ffmpeg refuses to open stops the job before the video is encoded
+# an encoder ffmpeg refuses stops the job before the video, retried for an option, failed for a track
 I="$WORKDIR/19/in"; O="$WORKDIR/19/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -412,6 +411,33 @@ options = { compression_level = 13 }
 EOF
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_log_contains     "try the audio encoders on the first second"
+assert_log_contains     "retrying on the next scan"
 assert_log_not_contains "scene detection"
+assert_file_not_exists  "$O/.avet_test/.failed"
+
+I="$WORKDIR/24/in"; O="$WORKDIR/24/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/tones_714.mov" "$I/p/test.mov"
+printf '[avet]\nvideo = "copy"\n[audio]\nmode = "encode"\ncodec = "flac"\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains "channels not supported"
+assert_file_exists  "$O/.avet_test/.failed"
+
+# a track that turns from a stereo lead-in to 5.1 keeps all six channels
+I="$WORKDIR/25/in"; O="$WORKDIR/25/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/layout_switch.ts" "$I/p/test.ts"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[audio]\nmode = "encode"\ncodec = "libopus"\nbitrate = "256k"\n' \
+    > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "layout switch: no output"
+assert_log_contains   "changes its channel layout midway"
+assert_audio_channels "$O/test.mkv" 0 6
+ffmpeg -v error -ss 4 -i "$O/test.mkv" -map 0:a:0 -c copy "$WORKDIR/25/film.mka"
+assert_channel_frequencies "$WORKDIR/25/film.mka" 0 "300 500 700 90 1100 1300"
+
+# a TS descriptor whose first code mkvmerge does not know leaves the track untagged
+I="$WORKDIR/26/in"; O="$WORKDIR/26/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/lang_bad.ts" "$I/p/test.ts"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "unknown TS language: no output"
+assert_stream_value "$O/test.mkv" a:0 stream_tags=language -
 
 test_done

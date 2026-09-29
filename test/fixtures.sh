@@ -4,7 +4,7 @@
 set -u
 : "${FIXTURES_DIR:?}" "${TEST_IMAGE:?}" "${TOOLS_IMAGE:?}"
 
-docker run --rm -i \
+docker run --rm -i --init \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     --entrypoint sh \
@@ -163,7 +163,7 @@ fi
 # fel_orig.bin is a test asset from quietvoid/dovi_tool 2.3.4, MIT.
 cp "$(dirname "$0")/assets/fel_orig.bin" "$FIXTURES_DIR/fel.bin" || exit 1
 
-docker run --rm -i \
+docker run --rm -i --init \
     -e OWNER="$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     "$TOOLS_IMAGE" sh << 'GEN'
@@ -244,7 +244,7 @@ if [ "$GEN_RC" -ne 0 ]; then
     exit 1
 fi
 
-docker run --rm -i \
+docker run --rm -i --init \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     --entrypoint sh \
@@ -272,7 +272,7 @@ fi
 # Content fixtures. Every frame's luma differs completely from its neighbors, chroma is
 # smooth enough for a fast preset, every 48th frame (from frame 12) is white, and a 50 ms
 # beep starts under each white frame.
-docker run --rm -i \
+docker run --rm -i --init \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     --entrypoint sh \
@@ -331,8 +331,9 @@ echo "  pattern_offset_vtt.mkv"
 printf 'WEBVTT\n\n00:00:01.000 --> 00:00:02.500\nFirst line.\n' > eng.vtt
 mkvmerge -q -o pattern_offset_vtt.mkv --sync -1:5000 pattern_av.mkv --sync 0:5000 --language 0:eng eng.vtt
 
-echo "  pattern_offset.m2ts"
+echo "  pattern_offset.m2ts, pattern_late_audio.ts"
 $FF -itsoffset 0.321 -i pattern_av.mkv -i pattern_av.mkv -map 0:v -map 1:a:1 -c copy -f mpegts pattern_offset.m2ts
+$FF -i pattern_av.mkv -itsoffset 0.5 -i pattern_av.mkv -map 0:v -map 1:a:1 -c copy -f mpegts pattern_late_audio.ts
 
 echo "  pattern_vfr.mkv"
 $FF -f lavfi -i "$(pattern 320x180 48 yuv420p)" -frames:v 480 \
@@ -345,7 +346,7 @@ $FF -f lavfi -i "$(pattern 320x180 24000/1001 yuv420p)" \
     -frames:v 240 -map 0:v -map 1:a -shortest \
     -c:v libx264 -qp 0 -preset ultrafast -c:a flac pattern_ntsc.mkv
 
-echo "  pattern_interlaced.mkv, pattern_interlaced_bff.mkv, pattern_flagged.mkv, pattern_300fps.mkv"
+echo "  pattern_interlaced.mkv, pattern_interlaced_bff.mkv, pattern_flagged.mkv, pattern_300fps.mkv, pattern_500fps.mkv"
 $FF -f lavfi -i "$(pattern 320x180 50 yuv420p)" -frames:v 120 -vf "tinterlace=mode=interleave_top,setfield=tff" \
     -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 pattern_interlaced.mkv
 $FF -f lavfi -i "$(pattern 320x180 50 yuv420p)" -frames:v 120 -vf "tinterlace=mode=interleave_bottom,setfield=bff" \
@@ -354,6 +355,8 @@ $FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -frames:v 120 \
     -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 pattern_flagged.mkv
 $FF -f lavfi -i "$(pattern 320x180 300 yuv420p)" -frames:v 300 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_300fps.mkv
+$FF -f lavfi -i "$(pattern 320x180 500 yuv420p)" -frames:v 250 \
+    -c:v libx264 -qp 0 -preset ultrafast pattern_500fps.mkv
 
 echo "  pattern_interlaced_yuyv.mkv, pattern_dv.avi"
 FIELDS="geq=lum=128+60*sin(X/9+N*1.7)+50*cos(Y/7-N*1.1):cb=128+60*sin(X/40+Y/9+N*1.3):cr=128+60*cos(Y/7-X/70-N*1.1)"
@@ -391,6 +394,15 @@ echo "  pattern_dark.mkv"
 $FF -f lavfi -i "color=c=black:size=320x180:rate=24" -frames:v 48 \
     -vf "drawbox=x=40:y=30:w=100:h=50:color=white:t=fill" \
     -c:v libx264 -qp 0 -preset ultrafast pattern_dark.mkv
+
+echo "  chroma_edges.mkv"
+$FF -f lavfi -i "testsrc2=size=640x360:rate=24" -frames:v 24 -pix_fmt yuv420p -chroma_sample_location left \
+    -c:v libx264 -qp 0 -preset ultrafast chroma_edges.mkv
+
+echo "  crop_imax.mkv"
+$FF -f lavfi -i "testsrc2=size=320x180:rate=5:duration=120" \
+    -vf "drawbox=y=0:h=22:color=black:t=fill:enable='not(between(t,36,46))',drawbox=y=158:h=22:color=black:t=fill:enable='not(between(t,36,46))'" \
+    -c:v libx264 -g 10 -preset ultrafast crop_imax.mkv
 
 echo "  pattern_odd.mkv, pattern_422.mkv, pattern_444.mkv"
 $FF -f lavfi -i "$(pattern 321x181 24 yuv420p)" -frames:v 48 -c:v ffv1 pattern_odd.mkv
@@ -433,7 +445,7 @@ fi
 
 # The pattern as real sources carry it: GOP structures and containers, audio codecs and
 # channel layouts, bitmap and text subtitles, color descriptions.
-docker run --rm -i \
+docker run --rm -i --init \
     --user "$(id -u):$(id -g)" \
     -v "${FIXTURES_DIR}:/out:z" \
     --entrypoint sh \
@@ -515,6 +527,8 @@ $FF -i pattern.mkv -map 0:v -c:v copy \
     -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 \
     -c:a:0 pcm_bluray -sample_fmt:a:0 s32 -c:a:1 truehd -c:a:2 dca -c:a:3 ac3 -c:a:4 s302m \
     -c:a:5 aac -strict -2 -mpegts_m2ts_mode 1 -mpegts_flags latm audio_codecs.m2ts
+$FF -i pattern.mkv -map 0:v -c:v copy -map 0:a:0 -map 0:a:0 -c:a:0 aac -c:a:1 ac3 \
+    -metadata:s:a:0 language=ger -metadata:s:a:1 language=eng -mpegts_flags latm audio_latm.ts
 $FF -i pattern.mkv -map 0:v -c:v copy -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 \
     -c:a:0 aac -c:a:1 aac -ar:a:1 44100 -c:a:2 alac -c:a:3 libmp3lame -c:a:4 ac3 audio_codecs.mp4
 
@@ -587,9 +601,19 @@ $FF -f lavfi -i "smptebars=size=320x180:rate=25" -f lavfi -i "rgbtestsrc=size=32
 pos=$(ffprobe -v error -select_streams v:0 -show_entries packet=pos -of default=nw=1:nk=1 gop.ts | sed -n 80p)
 tail -c +$((pos / 188 * 188 + 1)) gop.ts > cut_gop.ts
 
-echo "  lang_multi.ts, lang_video.mkv"
+echo "  lang_multi.ts, lang_bad.ts, lang_video.mkv"
 $FF -i subs_dvb.ts -map 0 -c copy -metadata:s:a:0 language=ger,eng -metadata:s:s:0 language=ger,ger lang_multi.ts
+$FF -i subs_dvb.ts -map 0 -c copy -metadata:s:a:0 language=zzz,eng lang_bad.ts
 $FF -i pattern.mkv -map 0 -c copy -metadata:s:v:0 language=english lang_video.mkv
+
+echo "  layout_switch.ts"
+tone() { printf '0.4*sin(2*PI*%s*t)' "$1"; }
+$FF -f lavfi -i "aevalsrc=exprs=$(tone 300)|$(tone 500):c=stereo:s=48000:d=3" -c:a ac3 -b:a 192k -f ac3 switch_stereo.ac3
+$FF -f lavfi -i "aevalsrc=exprs=$(tone 300)|$(tone 500)|$(tone 700)|$(tone 90)|$(tone 1100)|$(tone 1300):c=5.1(side):s=48000:d=5" \
+    -c:a ac3 -b:a 448k -f ac3 switch_51.ac3
+cat switch_stereo.ac3 switch_51.ac3 > switch.ac3
+$FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -f ac3 -i switch.ac3 -map 0:v -map 1:a -frames:v 200 \
+    -c:v mpeg2video -q:v 2 -c:a copy -metadata:s:a:0 language=ger -f mpegts layout_switch.ts
 
 echo "  one_frame.mkv, audio_only.mkv"
 $FF -f lavfi -i "$(pattern 320x180 24 yuv420p)" -frames:v 1 -c:v libx264 -qp 0 -preset ultrafast one_picture.mkv
@@ -597,7 +621,7 @@ $FF -i one_picture.mkv -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:
     -map 0:v -map 1:a -c:v copy -c:a flac one_frame.mkv
 $FF -i pattern.mkv -map 0:a:0 -c:a copy audio_only.mkv
 
-rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts
+rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts switch*.ac3
 GEN
 
 GEN_RC=$?

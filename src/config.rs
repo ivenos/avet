@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -144,7 +144,6 @@ pub enum AudioMode {
     Encode,
 }
 
-/// Layout name for a channel count (per-layout bitrate key).
 pub fn layout_name(channels: u32) -> &'static str {
     match channels {
         0 | 1 => "mono",
@@ -251,7 +250,6 @@ impl AudioConfig {
         }
     }
 
-    /// Apply an override over [audio], inheriting unset fields.
     fn overlay<'a>(&'a self, ov: &'a AudioProfile) -> ResolvedAudio<'a> {
         ResolvedAudio {
             mode: ov.mode.unwrap_or(self.mode),
@@ -262,7 +260,7 @@ impl AudioConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum SceneDetectionSpeedConfig {
     #[default]
@@ -270,19 +268,14 @@ pub enum SceneDetectionSpeedConfig {
     Fast,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct SceneDetectionConfig {
-    /// Minimum number of frames between scene cuts.
     pub min_scene_len: usize,
-    /// Max chunk length in seconds; 0 disables it, `extra_split` > 0 overrides it.
     pub extra_split_sec: u32,
-    /// Maximum scene length in frames. Overrides `extra_split_sec` when > 0. Set to 0 to disable.
     pub extra_split: u32,
-    /// Scene detection algorithm speed.
     pub speed: SceneDetectionSpeedConfig,
-    /// Downscale height for scene detection only (e.g. 720). None = no extra downscale.
     pub downscale_height: Option<u32>,
 }
 
@@ -325,7 +318,6 @@ impl SceneDetectionConfig {
         Ok(())
     }
 
-    /// Returns the effective max chunk size in frames, or None if extra splitting is disabled.
     pub fn effective_extra_split_frames(&self, fps: f64) -> Option<usize> {
         if self.extra_split > 0 {
             Some(self.extra_split as usize)
@@ -339,22 +331,18 @@ impl SceneDetectionConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct TargetQualityConfig {
-    /// CVVDP JOD score to hold as a hard minimum per chunk. NaN until set.
+    /// NaN until the profile sets it.
     pub jod: f64,
-    /// CRF search bounds.
     pub min_crf: u32,
     pub max_crf: u32,
-    /// Probe budget per chunk. The search stops early once it converges.
     pub min_probes: u32,
     pub max_probes: u32,
-    /// Stop early when a probe lands at most this far above the floor.
     pub tolerance: f64,
     pub probe_preset: u32,
-    /// Encoded size ceiling as a percent of the source over the chunk duration.
     pub max_encoded_percent: f64,
     pub max_cambi: Option<f64>,
     pub max_cambi_diff: Option<f64>,
@@ -545,7 +533,6 @@ fn validate_languages(key: &str, whitelist: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Encode needs a codec; lossy codecs also need a bitrate.
 fn validate_audio(ctx: &str, mode: AudioMode, codec: Option<&str>, bitrate: Option<&Bitrate>) -> Result<()> {
     validate_bitrate_keys(ctx, bitrate)?;
     validate_bitrate_values(ctx, bitrate)?;

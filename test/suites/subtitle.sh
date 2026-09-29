@@ -133,6 +133,7 @@ for fixture in subs_bitmap.m2ts subs_dvb.ts subs_text.mp4; do
 done
 assert_subtitle_language "$O/test.mkv" 0 eng
 assert_subtitle_language "$O/test.mkv" 1 ger
+assert_stream_value "$O/test.mkv" s stream=codec_name "subrip subrip"
 
 run_subs whitelist_dvb subs_dvb.ts '[subtitles]\nlanguage_whitelist = ["deu"]\n'
 assert_subtitle_track_count "$O/test.mkv" 1

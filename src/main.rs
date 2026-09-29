@@ -18,7 +18,7 @@ mod target_quality;
 mod workers;
 
 use anyhow::{Context, Result};
-use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +26,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
+const VERSION: &str = match option_env!("AVET_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => "dev",
+};
+
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
+        println!("avet {VERSION}");
+        return Ok(());
+    }
     init_logging();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -40,6 +49,7 @@ fn main() -> Result<()> {
     let poll_interval = env_u64("POLL_INTERVAL", 60).max(1);
 
     tracing::info!(
+        version = %VERSION,
         input = %input_dir.display(),
         output = %output_dir.display(),
         poll_s = poll_interval,
@@ -54,6 +64,7 @@ fn main() -> Result<()> {
     };
 
     let shutdown = shutdown_signal();
+    let Some(_lock) = lock_output(&output_dir, &shutdown)? else { return Ok(()) };
 
     loop {
         match scanner::scan(&input_dir, &output_dir) {
@@ -97,7 +108,7 @@ fn main() -> Result<()> {
 fn shutdown_signal() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
 
-    let mut signals = match Signals::new([SIGTERM, SIGINT]) {
+    let mut signals = match Signals::new([SIGTERM, SIGINT, SIGHUP]) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("could not install signal handlers ({e}) - avet will keep running on SIGTERM until it is killed");
@@ -113,11 +124,40 @@ fn shutdown_signal() -> Arc<AtomicBool> {
                 tracing::warn!("second signal - stopping now, the current file stays unfinished");
                 std::process::exit(130);
             }
+            job::ATTEMPTS.stop_requested();
             tracing::info!("signal received - finishing the current job, then stopping");
         }
     });
 
     flag
+}
+
+/// A second instance would encode the same files into the same chunks, so it waits.
+fn lock_output(output_dir: &std::path::Path, shutdown: &AtomicBool) -> Result<Option<std::fs::File>> {
+    let path = output_dir.join(".avet.lock");
+    let file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if !announced => {
+                tracing::warn!("another avet works on {} - waiting until it stops", output_dir.display());
+                announced = true;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                tracing::warn!("cannot lock {} ({e}) - a second avet on this folder would go unnoticed", path.display());
+                return Ok(Some(file));
+            }
+        }
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_secs(1));
+            if shutdown.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+        }
+    }
 }
 
 pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -164,4 +204,19 @@ fn ensure_dirs(input_dir: &std::path::Path, output_dir: &std::path::Path) -> Res
             .with_context(|| format!("create directory: {}", dir.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_instance_on_the_same_output_waits_and_stops_on_a_signal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = lock_output(dir.path(), &AtomicBool::new(false)).unwrap();
+        assert!(first.is_some());
+        assert!(lock_output(dir.path(), &AtomicBool::new(true)).unwrap().is_none());
+        drop(first);
+        assert!(lock_output(dir.path(), &AtomicBool::new(true)).unwrap().is_some());
+    }
 }

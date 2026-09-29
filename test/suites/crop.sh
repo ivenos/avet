@@ -1,5 +1,4 @@
 #!/bin/sh
-# Tests for crop.rs: cropdetect, cache, crop+scale interaction.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -123,5 +122,13 @@ assert_log_contains    "ignoring implausible"
 assert_video_height    "$O/test.mkv" 180
 assert_stream_value    "$O/test.mkv" v:0 stream=width,height "320 180"
 assert_file_not_exists "$O/.avet_test/crop.cache"
+
+# a full-frame scene between the cropdetect windows, as in a film with IMAX scenes, keeps its picture
+I="$WORKDIR/9/in"; O="$WORKDIR/9/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/crop_imax.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\ncrop = true\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 180 || fail "full-frame scene: no output"
+assert_log_contains "no black bars detected"
+assert_stream_value "$O/test.mkv" v:0 stream=width,height "320 180"
 
 test_done

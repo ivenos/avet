@@ -228,12 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn a_signalled_tool_is_retried_even_under_a_caller_context() {
+    fn a_signaled_tool_is_retried_even_under_a_caller_context() {
         use anyhow::Context as _;
 
         // How the OOM killer and a Ctrl-C to the process group arrive.
         let out = output_with_timeout(Command::new("sh").args(["-c", "kill -TERM $$"]), 30, "sh").unwrap();
-        assert_eq!(out.status.code(), None, "the shell was not signalled");
+        assert_eq!(out.status.code(), None, "the shell was not signaled");
 
         let err = tool_error("mkvmerge", out.status, "");
         assert!(err.downcast_ref::<crate::job::Transient>().is_some(), "got: {err:#}");

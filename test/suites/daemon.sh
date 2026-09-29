@@ -1,6 +1,6 @@
 #!/bin/sh
 # The scan loop itself: files that arrive later, a job that fails beside a good one, a
-# copy still running, and a signalled stop. Every other suite runs avet exactly once.
+# copy still running, a signaled stop and a crash.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -68,6 +68,26 @@ kill_avet
 assert_video_frames "$O/test.mkv" 240
 assert_frames_match "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 
+# a signal while a copy is still running starts no encode
+setup waiting
+start_avet "$I" "$O" 2
+wait_for_log "no jobs" 30 || fail "waiting: avet never reported an idle scan"
+(
+    n=0
+    while [ ! -f "$WORKDIR/waiting.done" ] && [ "$n" -lt 90 ]; do
+        head -c 30000 /dev/urandom >> "$I/p/test.mkv"
+        n=$((n + 1))
+        sleep 1
+    done
+) &
+wait_for_log "still being written" 90 || fail "waiting: avet did not wait for the copy"
+touch "$WORKDIR/waiting.done"
+stop_avet 60
+wait
+[ "$AVET_RC" = 0 ] || fail "waiting: avet exited with $AVET_RC, expected 0"
+assert_log_contains   "not starting, avet is stopping"
+assert_dir_not_exists "$O/.avet_test"
+
 # SIGTERM mid-encode: the job is finished, then the loop ends
 setup sigterm 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
 cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
@@ -84,6 +104,32 @@ assert_log_not_contains "job failed"
 assert_dir_not_exists   "$O/.avet_test"
 assert_frames_match     "$O/test.mkv" "$FIXTURES_DIR/pattern.mkv"
 assert_decodes_cleanly  "$O/test.mkv"
+[ -n "$(log_capture 's/.*\] chunk 1\/[0-9]* - .* MB - \([0-9hms]*\) left$/\1/p')" ] || \
+    fail "sigterm: the first chunk line tells no time left"
+
+# avet dying mid-job three times in a row locks the file out; a hangup it was told about is no such death
+setup crashes 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
+cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+crash() { # what the OOM killer or an abort in FFMS2 leaves: no signal avet could act on
+    TEST_CPUS=0.5 start_avet "$I" "$O" 2
+    wait_for_log "] encoding:" 240 || fail "crashes: the job did not get to the encode"
+    kill_avet
+}
+crash
+crash
+TEST_CPUS=0.5 start_avet "$I" "$O" 2
+wait_for_log "] encoding:" 240 || fail "crashes: the job did not get to the encode before the stop"
+docker kill --signal=HUP "$AVET_CID" >/dev/null 2>&1
+wait_for_log "signal received" 30 || fail "crashes: the hangup was not logged"
+kill_avet
+# Had the stop counted, this start would be refused before the encode.
+crash
+assert_file_not_exists "$O/.avet_test/.failed"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains    "stopped 3 times in a row"
+assert_file_exists     "$O/.avet_test/.failed"
+assert_file_not_exists "$O/test.mkv"
+assert_file_exists     "$I/p/test.mkv"
 
 # a second signal stops it there and then
 setup twice 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
@@ -96,6 +142,22 @@ stop_avet 60
 [ "$AVET_RC" = 130 ] || fail "twice: expected exit 130 after the second signal, got $AVET_RC"
 assert_log_contains    "second signal"
 assert_file_not_exists "$O/test.mkv"
+
+# a second avet on the same folders waits, takes over once the first stops, and stops on a signal
+setup twin
+start_avet "$I" "$O" 2
+FIRST=$AVET_CID
+wait_for_log "no jobs" 30 || fail "twin: the first avet never reported an idle scan"
+start_avet "$I" "$O" 2
+wait_for_log "another avet works on /output" 30 || fail "twin: the second avet did not wait"
+assert_log_not_contains "no jobs"
+SECOND=$AVET_CID
+AVET_CID=$FIRST
+kill_avet
+AVET_CID=$SECOND
+wait_for_log "no jobs" 30 || fail "twin: the second avet did not take over"
+stop_avet 20
+[ "$AVET_RC" = 0 ] || fail "twin: the second avet exited with $AVET_RC"
 
 # SIGTERM while idle: the poll sleep ends with it, it is not slept out
 setup idle

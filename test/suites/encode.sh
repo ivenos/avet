@@ -1,5 +1,4 @@
 #!/bin/sh
-# Tests for encode.rs: output codec, encoder param injection, keyint and HDR override logic.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -155,5 +154,12 @@ PTS=$(ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv
     "$O/test.mkv" 2>/dev/null | sort -n | sed -n '61p;180p' | tr '\n' ' ')
 echo "$PTS" | awk '{ exit !($1 > 1.99 && $1 < 2.01 && $2 > 3.97 && $2 < 3.99) }' || \
     fail "vfr: frames 60 and 179 at ${PTS}s, expected 2.0 and 3.983"
+
+# on a single CPU SvtAv1EncApp needs a level of parallelism, or it crashes
+I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+TEST_CPUSET=0 run_avet "$I" "$O" "$O/test.mkv" 180 || fail "single CPU: no output"
+assert_log_contains "lp=1"
 
 test_done

@@ -20,10 +20,17 @@ assert_frames_match "$O/test.mkv" "$SRC"
 assert_hdr_static_match "$O/test.mkv" "$SRC"
 assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,color_transfer,color_primaries "tv bt2020nc smpte2084 bt2020"
 
-# full range and top-left chroma siting survive
+# full range and top-left chroma siting survive, and a downscale keeps the chroma where the source has it
 encode fullrange pattern_fullrange.mkv
 assert_frames_match "$O/test.mkv" "$SRC"
 assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,color_transfer,color_primaries,chroma_location "pc bt709 bt709 bt709 topleft"
+I="$WORKDIR/scaled_chroma/in"; O="$WORKDIR/scaled_chroma/out"; mkdir -p "$I/p" "$O"
+SRC="$FIXTURES_DIR/chroma_edges.mkv"
+cp "$SRC" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 1\n[avet]\nscale = 180\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 180 || fail "scaled chroma: no output"
+assert_frames_match "$O/test.mkv" "$SRC" "scale=320:180:flags=lanczos:in_chroma_loc=left:out_chroma_loc=left" 50
+assert_stream_value "$O/test.mkv" v:0 stream=chroma_location left
 
 # 4:2:2, 4:4:4, RGB and gray are brought to 4:2:0 instead of failing
 for sub in 422 444; do
@@ -33,10 +40,11 @@ for sub in 422 444; do
 done
 assert_video_pix_fmt "$WORKDIR/chroma422/out/test.mkv" yuv420p10le
 assert_video_pix_fmt "$WORKDIR/chroma444/out/test.mkv" yuv420p
+assert_stream_value "$WORKDIR/chroma444/out/test.mkv" v:0 stream=chroma_location center
 for fmt in rgb gray; do
     encode "$fmt" "pattern_$fmt.mkv"
     assert_frames_match "$O/test.mkv" "$SRC"
-    assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,chroma_location "tv bt470bg left"
+    assert_stream_value "$O/test.mkv" v:0 stream=color_range,color_space,chroma_location "tv bt470bg center"
     assert_video_pix_fmt "$O/test.mkv" yuv420p
 done
 
@@ -68,7 +76,7 @@ assert_frames_match "$O/test.mkv" "$SRC"
 # 8-bit chroma, dithered differently by FFMS2 and by the reference conversion.
 encode down12to8 pattern_hdr12.mkv 'bit_depth = 8'
 assert_video_pix_fmt "$O/test.mkv" yuv420p
-assert_frames_match "$O/test.mkv" "$SRC" null 22
+assert_frames_match "$O/test.mkv" "$SRC" null 26
 
 # the color description stays: SD primaries, full range, HLG, JPEG siting
 for fixture in color_pal.mkv color_ntsc.mkv color_full8.mkv color_center.avi hlg.mkv; do

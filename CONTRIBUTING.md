@@ -43,6 +43,7 @@ cargo test --locked           # unit tests
 - Write output and state files under a scratch name, then rename them into place.
 - A comment only earns its place when it records something the code cannot. One or two lines.
 - Rust 2024, no formatter in CI: match the file you edit.
+- `rust-version` is 1.95, and CI checks that the code builds with it.
 
 ## External tools
 

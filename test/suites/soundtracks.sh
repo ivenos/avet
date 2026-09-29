@@ -54,6 +54,20 @@ for track; do
     assert_av_sync "$O/test.mkv" "$SRC" "$1" "$2"
 done
 
+# DVB-T2's LATM AAC as plain AAC, in its place before the AC-3, with the video encoded and copied
+for mode in encode copy; do
+    run "latm_$mode" audio_latm.ts "[avet]\nvideo = \"$mode\"\n"
+    assert_log_contains "copy as AAC"
+    set -- "0 aac ger" "1 ac3 eng"
+    for track; do
+        set -- $track
+        assert_audio_codec "$O/test.mkv" "$1" "$2"
+        assert_audio_language "$O/test.mkv" "$1" "$3"
+        assert_audio_samples_identical "$O/test.mkv" "$SRC" "$1"
+        assert_av_sync "$O/test.mkv" "$SRC" "$1"
+    done
+done
+
 # MP4: AAC and MP3 lose their priming, which Matroska cannot mark, and stay in sync
 run mp4 audio_codecs.mp4
 i=0

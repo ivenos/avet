@@ -19,19 +19,16 @@ pub struct EncodeOverrides {
 
 #[derive(Clone, Default)]
 pub struct EncodeOptions {
-    /// SVT-AV1 HDR args (color-primaries, transfer, etc.)
     pub hdr_args: Vec<String>,
-    /// Auto-keyint; skipped if user set "keyint" in encoder_params.
     pub keyint: Option<u32>,
-    /// Output scale target; applied by ffmpeg after the crop (crop before scale).
     pub scale: Option<(u32, u32)>,
     /// Crop in source space, applied in the Y4M pipe before scaling.
     pub crop: Option<Crop>,
     pub deinterlace: Option<crate::interlace::FieldOrder>,
+    pub chroma_loc: Option<&'static str>,
     /// FPS from ffprobe; FFMS2 reports 0/0 for some exotic containers (e.g. DV) which breaks IVF timestamps.
     pub fps_num: u32,
     pub fps_den: u32,
-    /// Forced encoder input bit depth (8 or 10); None = pass source through.
     pub target_bit_depth: Option<u8>,
     pub dynamic_hdr: DynamicHdr,
     /// Replaces what FFMS2 decodes, which loses a carried HDR10+ value at every seek.
@@ -70,12 +67,18 @@ pub fn encode_chunk(
     let mut hdr_metadata = Vec::new();
     let capture = opts.dynamic_hdr.any().then_some(&mut hdr_metadata);
     let format = &vs.info.pixel_format;
-    let to_420 = (format.subsampling != PixelSubsampling::Yuv420)
-        .then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
+    let subsample = format.subsampling != PixelSubsampling::Yuv420;
+    // Left to its default, swscale shifts left and center sited chroma alike.
+    let siting = opts.chroma_loc.map_or_else(String::new, |loc| format!(":in_chroma_loc={loc}:out_chroma_loc={loc}"));
+    let resample = match opts.scale {
+        Some((w, h)) => Some(format!("scale={w}:{h}:flags=lanczos{siting}")),
+        None => subsample.then(|| format!("scale=iw:ih{siting}")),
+    };
+    let to_420 = subsample.then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
     let filters: Vec<String> = [
         opts.deinterlace.map(|d| d.filter().to_string()),
+        resample,
         to_420,
-        opts.scale.map(|(w, h)| format!("scale={w}:{h}:flags=lanczos")),
     ]
     .into_iter()
     .flatten()
@@ -165,7 +168,6 @@ fn insert_hdr_metadata(
         .with_context(|| format!("add HDR metadata to chunk {:05}", scene.index + 1))
 }
 
-/// Ctrl-C reaches the whole process group, so a signalled tool is no verdict on the source.
 fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> anyhow::Error {
     crate::ext::tool_error(&format!("{what} (chunk {:05})", index + 1), status, stderr)
 }
@@ -198,7 +200,6 @@ pub(crate) fn feed_failure(write_res: Result<()>) -> Option<String> {
     (!broken_pipe(&err)).then(|| format!("{err:#}"))
 }
 
-/// FFMS2 Y4M piped straight into the encoder.
 fn encode_direct(
     encoder_bin: &OsStr,
     encoder_name: &str,
@@ -238,7 +239,6 @@ fn encode_direct(
     Ok(())
 }
 
-/// FFMS2 Y4M (cropped) piped through ffmpeg for deinterlacing and scaling, then into the encoder.
 fn encode_filtered(
     encoder_bin: &OsStr,
     encoder_name: &str,
@@ -337,7 +337,6 @@ fn encoder_binary(enc: Encoder) -> &'static str {
     }
 }
 
-/// Replace a `--flag value` pair in place, or append it if absent.
 fn set_arg(args: &mut Vec<String>, flag: &str, value: String) {
     match args.iter().position(|a| a == flag) {
         Some(i) if i + 1 < args.len() => args[i + 1] = value,

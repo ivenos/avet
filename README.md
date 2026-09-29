@@ -44,7 +44,7 @@ services:
     restart: unless-stopped
 ```
 
-Create `input/` and `output/` before the first start, otherwise Docker creates them owned by root. Without `user:` the container runs as root and its files on the host belong to root.
+Create `input/` and `output/` before the first start, otherwise Docker creates them owned by root. Without `user:` the container runs as root and its files on the host belong to root. On a host with SELinux, such as Fedora or openSUSE, add `security_opt: [label=disable]` so the container can read the folders.
 
 `[target_quality]` needs a GPU, nothing else does:
 
@@ -87,7 +87,10 @@ output/
 - Output files keep the source's name with `.mkv`, so queued files that would end up at the same output path, such as `film.mkv` and `film.mp4`, wait until one is renamed.
 - Work in progress lives in `.avet_<name>/` next to the output file. Delete that folder to encode a file from scratch.
 - A failure that can clear on its own, such as a typo in the profile, a timeout or a full disk, is retried on the next scan. Any other failure writes a `.failed` file into that folder, and the video is skipped until you delete it.
-- On `SIGTERM` or `SIGINT` avet exits after the current file, on a second signal at once. A file stopped mid-encode, e.g. by Ctrl-C in a terminal or by `docker stop` after its timeout, resumes from its last finished chunk.
+- A file during which avet itself dies three times in a row, as a crash in FFMS2 or the out-of-memory killer would cause, gets a `.failed` file as well. A stop by signal does not count.
+- On `SIGTERM`, `SIGINT` or `SIGHUP` avet exits after the current file, on a second signal at once. A file stopped mid-encode, e.g. by Ctrl-C in a terminal or by `docker stop` after its timeout, resumes from its last finished chunk.
+- A second avet on the same output folder waits until the first one stops. It checks the `.avet.lock` file there.
+- The `avet started` log line names the version, and `avet --version` prints it.
 
 ## Environment variables
 
@@ -189,7 +192,8 @@ jod = 9.5
 - The whitelist matches both spellings (`deu` and `ger`). Tracks without a language or tagged `und` are always kept.
 - Language tags keep their region and script, such as `pt-BR` or `zh-Hant`.
 - Re-encoded tracks get the codec added to their title, e.g. `English 5.1 (Opus)`.
-- Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM. A track ffmpeg can neither copy into Matroska nor decode, such as AC-4, is left out with a warning.
+- Copied tracks Matroska has no codec ID for, such as Blu-ray LPCM, are stored as PCM. Copied LATM AAC, as DVB-T2 sends it, is stored as plain AAC. A track ffmpeg can neither copy into Matroska nor decode, such as AC-4, is left out with a warning.
+- A track that changes its channel layout midway, such as DVB audio with a stereo lead-in, is encoded in its widest layout.
 - Opus gets every channel of a layout it has no mapping for by using the next larger one, e.g. 2.1 as 5.1, and the bitrate of that layout. A layout none of them holds, such as 7.1(wide) or 7.1.4, is mixed to the one with its channel count, at most 7.1.
 
 `[audio.lossless]` applies to tracks with a lossless source (`dts` only as DTS-HD MA). FLAC stores floating-point PCM as 24-bit integers. `[audio.codec_rules]` applies by source codec as ffprobe names it. Both take the keys above except `language_whitelist`. Unset keys come from `[audio]`, except a non-empty `options`, which replaces it. A matching codec rule wins over `[audio.lossless]`.

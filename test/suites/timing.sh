@@ -25,10 +25,24 @@ assert_log_contains "variable frame rate"
 assert_frames_match      "$O/test.mkv" "$SRC"
 assert_frame_times_match "$O/test.mkv" "$SRC"
 
-# 23.976 fps without drift, 300 fps past SvtAv1EncApp's limit of 240
+# 23.976 fps without drift, 300 fps past SvtAv1EncApp's limit of 240 and 500 past SvtAv1EncApp-hdr's of 480
+encode ntsc pattern_ntsc.mkv
+assert_frames_match      "$O/test.mkv" "$SRC"
+assert_frame_times_match "$O/test.mkv" "$SRC"
+assert_av_sync           "$O/test.mkv" "$SRC"
+
 encode fps300 pattern_300fps.mkv
 assert_log_contains "encoding at a 1/2 rate"
 assert_frames_match      "$O/test.mkv" "$SRC"
+assert_frame_times_match "$O/test.mkv" "$SRC"
+
+I="$WORKDIR/fps500/in"; O="$WORKDIR/fps500/out"; mkdir -p "$I/p" "$O"
+SRC="$FIXTURES_DIR/pattern_500fps.mkv"
+cp "$SRC" "$I/p/test.mkv"
+printf 'encoder = "svt-av1-hdr"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 180 || fail "fps500: no output"
+assert_log_contains      "encoding at a 1/2 rate"
+assert_video_frames      "$O/test.mkv" 250
 assert_frame_times_match "$O/test.mkv" "$SRC"
 
 # 119.88 fps through the filter stage, which rounds a rate near 120 on its own
@@ -40,10 +54,6 @@ run_avet "$I" "$O" "$O/test.mkv" 180 || fail "fps119: no output"
 assert_video_frames      "$O/test.mkv" 1199
 assert_frame_times_match "$O/test.mkv" "$SRC"
 
-encode ntsc pattern_ntsc.mkv
-assert_frames_match      "$O/test.mkv" "$SRC"
-assert_frame_times_match "$O/test.mkv" "$SRC"
-assert_av_sync           "$O/test.mkv" "$SRC"
 
 # video that starts after the audio, and audio that starts after the video
 for case in video_delay audio_delay; do
@@ -86,17 +96,18 @@ for mode in copy encode; do
         || fail "offset $mode: the WebVTT cue is not 1 s after the first frame: $(cat "$WORKDIR/offset_$mode/eng.vtt" 2>/dev/null)"
 done
 
-# MPEG-TS: a start time far from zero, audio 321 ms ahead of the video
-encode ts_offset pattern_offset.m2ts
-assert_frames_match "$O/test.mkv" "$SRC"
-assert_av_sync      "$O/test.mkv" "$SRC" 0
-assert_audio_codec  "$O/test.mkv" 0 aac
+# MPEG-TS: a start time far from zero, audio 321 ms ahead of the video or 500 ms behind it
+for fixture in pattern_offset.m2ts pattern_late_audio.ts; do
+    encode "ts_${fixture%%.*}" "$fixture"
+    assert_frames_match "$O/test.mkv" "$SRC"
+    assert_av_sync      "$O/test.mkv" "$SRC" 0
+    assert_audio_codec  "$O/test.mkv" 0 aac
 
-# the same, video passed through
-I="$WORKDIR/ts_copy/in"; O="$WORKDIR/ts_copy/out"; mkdir -p "$I/p" "$O"
-cp "$SRC" "$I/p/test.m2ts"
-printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
-run_avet "$I" "$O" "$O/test.mkv" 120 || fail "ts copy: no output"
-assert_av_sync "$O/test.mkv" "$SRC" 0
+    I="$WORKDIR/ts_copy_${fixture%%.*}/in"; O="$WORKDIR/ts_copy_${fixture%%.*}/out"; mkdir -p "$I/p" "$O"
+    cp "$SRC" "$I/p/test.${fixture##*.}"
+    printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+    run_avet "$I" "$O" "$O/test.mkv" 120 || fail "ts copy $fixture: no output"
+    assert_av_sync "$O/test.mkv" "$SRC" 0
+done
 
 test_done

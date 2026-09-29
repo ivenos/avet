@@ -42,6 +42,6 @@ body:
     id: version
     attributes:
       label: avet version
-      placeholder: "image tag or AppImage name, e.g. latest, dev, v1.0.0"
+      placeholder: "from the avet started log line or avet --version, e.g. v2.0.0 or dev-1a2b3c4"
     validations:
       required: true

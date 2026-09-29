@@ -1,5 +1,4 @@
 #!/bin/sh
-# Tests for hdr.rs: HDR type detection, static and dynamic metadata, encoder arg generation.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -59,7 +58,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "SDR: no output"
 assert_log_not_contains "HDR:"
 assert_file_nonempty "$O/test.mkv"
 
-# -- Dolby Vision 8.1 + HDR10+: both carried per frame, across chunks and a crop -
+# Dolby Vision 8.1 + HDR10+: both carried per frame, across chunks and a crop
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/dv81_hdr10plus.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -134,7 +133,7 @@ assert_color_transfer "$O/test.mkv" "arib-std-b67"
 assert_dovi_record    "$O/test.mkv" "10,4"
 assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 48
 
-# -- Dolby Vision 7 FEL, base and enhancement layer in one track: profile 10.1 --
+# Dolby Vision 7 FEL, base and enhancement layer in one track: profile 10.1
 I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/dv7_fel.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -186,7 +185,7 @@ EOF
     assert_hdr10plus_matches "$O/test.mkv" "$FIXTURES_DIR/dv81_hdr10plus.$ext"
 done
 
-# -- video = copy: the source's Dolby Vision and HDR10+ pass through untouched --
+# video = copy: the source's Dolby Vision and HDR10+ pass through untouched
 I="$WORKDIR/14/in"; O="$WORKDIR/14/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/dv81_hdr10plus.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -200,7 +199,7 @@ assert_video_codec  "$O/test.mkv" hevc
 assert_dovi_record  "$O/test.mkv" "8,1"
 assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" 48
 
-# -- HDR10+ that stops: the last value carries on behind a seek and past an MP4 cut -
+# HDR10+ that stops: the last value carries on behind a seek and past an MP4 cut
 I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -243,7 +242,7 @@ expected=$(awk 'BEGIN { for (i = 112; i <= 123; i++) printf "%d ", i; for (i = 2
 got=$(hdr10plus_average_rgb "$O/test.mkv")
 [ "$got" = "$expected" ] || fail "HDR10+ from a cut MP4: expected AverageRGB '$expected', got '$got'"
 
-# -- No RPU on the very first picture: the output still carries a Dolby Vision record -
+# No RPU on the very first picture: the output still carries a Dolby Vision record
 I="$WORKDIR/17/in"; O="$WORKDIR/17/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/dv81_late_rpu.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -261,5 +260,14 @@ assert_log_contains "the first frame has no readable Dolby Vision RPU"
 assert_video_frames "$O/test.mkv" 49
 assert_dovi_record  "$O/test.mkv" "10,1"
 assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 49
+
+# a damaged HDR10+ cache is read from the bitstream again, not swapped for the decoder's values
+I="$WORKDIR/18/in"; O="$WORKDIR/18/out"; mkdir -p "$I/p" "$O/.avet_test"
+cp "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$I/p/test.mkv"
+printf '{"frames": [' > "$O/.avet_test/hdr10plus.json"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[scene_detection]\nextra_split = 24\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "damaged HDR10+ cache: no output"
+assert_log_contains "reading HDR10+ from the bitstream again"
+assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" 96
 
 test_done

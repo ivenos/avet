@@ -15,7 +15,7 @@ run() { # NAME FIXTURE PROFILE
     run_avet "$I" "$O" "$O/test.mkv" 300 || fail "$1: no output"
 }
 
-# -- chunks start inside open GOPs, B-frame pyramids and CRA pictures, in every container --
+# chunks start inside open GOPs, B-frame pyramids and CRA pictures, in every container
 for fixture in gop_h264.mkv gop_h264.mp4 gop_h264.ts gop_h264.flv gop_h264.mov gop_hevc.ts \
                gop_mpeg2.m2ts gop_mpeg4.avi gop_vp9.webm; do
     run "$fixture" "$fixture" "$ENCODE"

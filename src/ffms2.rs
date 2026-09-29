@@ -512,7 +512,6 @@ impl Drop for VideoSource {
 
 #[derive(Default, Clone, Copy)]
 pub struct OpenOpts {
-    /// Force input bit depth (8 or 10); None = match source.
     pub target_bit_depth: Option<u8>,
     /// Leaves 4:2:2 and 4:4:4 as they are, for a deinterlacer that needs the fields apart.
     pub keep_subsampling: bool,

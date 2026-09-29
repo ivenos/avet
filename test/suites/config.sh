@@ -177,6 +177,8 @@ EOF
 run_avet_timed "$I" "$O" 15 "ERROR"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "avet.scale must be at least 64"
+# The profile is broken, not the file, so the next scan has to pick it up after the fix.
+assert_dir_not_exists  "$O/.avet_test"
 
 # a key or value only the encoder checks is retried, not marked failed
 I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
@@ -213,9 +215,5 @@ assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "Option not found"
 assert_log_contains    "retrying on the next scan"
 assert_file_not_exists "$O/.avet_test/.failed"
-
-# a transient failure leaves no .failed marker
-# The profile is broken, not the file, so the next scan has to pick it up after the fix.
-assert_dir_not_exists "$WORKDIR/12/out/.avet_test"
 
 test_done

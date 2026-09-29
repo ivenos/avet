@@ -14,7 +14,8 @@ const MATROSKA_SUBTITLES: &[&str] = &[
 #[derive(Default)]
 pub struct SubtitlePlan {
     pub extract: Vec<(usize, Option<&'static str>)>,
-    pub from_source: Vec<u64>,
+    /// Stream index and mkvmerge track ID.
+    pub from_source: Vec<(usize, u64)>,
 }
 
 pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
@@ -59,12 +60,12 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
         }
     }
     if !unsupported.is_empty() {
-        let tracks = identify_subtitles(source)?;
+        let tracks = identify(source, "subtitles")?;
         for (index, id, codec) in unsupported {
             let matched = match_track(&tracks, index, id.as_deref());
             for track in &matched {
-                if selected(track.2.as_deref()) {
-                    plan.from_source.push(track.0);
+                if selected(track.language.as_deref()) {
+                    plan.from_source.push((index, track.id));
                 }
             }
             if matched.is_empty() {
@@ -74,8 +75,6 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
         }
     }
 
-    // Filtering every track away is a plausible profile, but rarely the intent: a
-    // whitelist in ISO 639-1 ("en") never matches a three-letter tag.
     if !config.language_whitelist.is_empty() && total > 0 && plan.extract.is_empty() && plan.from_source.is_empty() {
         tracing::warn!(
             "subtitles: the language whitelist {:?} matched none of the {total} subtitle track(s) - the output has none",
@@ -87,14 +86,10 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
 
 /// By mkvmerge's track number where ffprobe reports one. The matroska demuxer does not,
 /// so there the Nth subtitle stream is the Nth subtitle track.
-fn match_track<'a>(
-    tracks: &'a [(u64, Option<u64>, Option<String>)],
-    index: usize,
-    id: Option<&str>,
-) -> Vec<&'a (u64, Option<u64>, Option<String>)> {
+pub fn match_track<'a>(tracks: &'a [Identified], index: usize, id: Option<&str>) -> Vec<&'a Identified> {
     let number = id.and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok());
     if let Some(number) = number {
-        return tracks.iter().filter(|(_, n, _)| *n == Some(number)).collect();
+        return tracks.iter().filter(|t| t.number == Some(number)).collect();
     }
     tracks.get(index).into_iter().collect()
 }
@@ -113,7 +108,13 @@ fn route(codec: &str) -> Route {
     }
 }
 
-fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<String>)>> {
+pub struct Identified {
+    pub id: u64,
+    pub number: Option<u64>,
+    pub language: Option<String>,
+}
+
+pub fn identify(source: &Path, track_type: &str) -> Result<Vec<Identified>> {
     let mut cmd = Command::new(external_bin("mkvmerge"));
     cmd.args(["--identify", "--identification-format", "json"]).arg(source);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
@@ -139,8 +140,8 @@ fn identify_subtitles(source: &Path) -> Result<Vec<(u64, Option<u64>, Option<Str
         .context("parse mkvmerge identify output")?;
 
     Ok(identified.tracks.into_iter()
-        .filter(|t| t.track_type == "subtitles")
-        .map(|t| (t.id, t.properties.number, t.properties.language))
+        .filter(|t| t.track_type == track_type)
+        .map(|t| Identified { id: t.id, number: t.properties.number, language: t.properties.language })
         .collect())
 }
 
@@ -150,18 +151,16 @@ mod tests {
 
     #[test]
     fn a_matroska_track_is_matched_by_position_because_ffprobe_reports_no_id() {
-        let tracks = vec![
-            (2u64, Some(3u64), Some("eng".to_string())),
-            (3u64, Some(4u64), Some("jpn".to_string())),
-        ];
+        let track = |id, number| Identified { id, number: Some(number), language: None };
+        let tracks = vec![track(2, 3), track(3, 4)];
 
         // MP4 and MPEG-TS: ffprobe prints the id, and the number decides.
-        assert_eq!(match_track(&tracks, 0, Some("0x4"))[0].0, 3);
-        assert_eq!(match_track(&tracks, 1, Some("0x3"))[0].0, 2);
+        assert_eq!(match_track(&tracks, 0, Some("0x4"))[0].id, 3);
+        assert_eq!(match_track(&tracks, 1, Some("0x3"))[0].id, 2);
 
         // Matroska: no id at all, so the second subtitle stream is the second track.
-        assert_eq!(match_track(&tracks, 1, None)[0].0, 3);
-        assert_eq!(match_track(&tracks, 0, None)[0].0, 2);
+        assert_eq!(match_track(&tracks, 1, None)[0].id, 3);
+        assert_eq!(match_track(&tracks, 0, None)[0].id, 2);
         assert!(match_track(&tracks, 2, None).is_empty());
 
         // An id mkvmerge does not list stays unmatched rather than falling back.

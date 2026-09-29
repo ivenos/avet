@@ -99,7 +99,6 @@ impl DoneFile {
             Some(info) if info.frames == frames => info.size_bytes,
             _ => return false,
         };
-        // Recorded size must match on-disk size; truncated/missing files are not "done".
         matches!(std::fs::metadata(chunk_path), Ok(m) if m.len() == expected && expected > 0)
     }
 
@@ -110,10 +109,18 @@ impl DoneFile {
     }
 }
 
+/// A bare number: solved before the score was kept, or scored NaN, which serde_json cannot read back.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(untagged)]
+enum Solved {
+    Scored { crf: f64, jod: f64 },
+    Crf(f64),
+}
+
 /// Per-chunk solved CRF cache for target quality, so a resume skips re-probing.
 pub struct CrfCache {
     pub path: PathBuf,
-    state: Mutex<HashMap<String, f64>>,
+    state: Mutex<HashMap<String, Solved>>,
 }
 
 impl CrfCache {
@@ -123,12 +130,22 @@ impl CrfCache {
     }
 
     pub fn get(&self, chunk_key: &str) -> Option<f64> {
-        self.state.lock().unwrap().get(chunk_key).copied()
+        self.state.lock().unwrap().get(chunk_key).map(|s| match *s {
+            Solved::Scored { crf, .. } | Solved::Crf(crf) => crf,
+        })
     }
 
-    pub fn insert(&self, chunk_key: &str, crf: f64) -> Result<()> {
+    pub fn jod(&self, chunk_key: &str) -> Option<f64> {
+        match self.state.lock().unwrap().get(chunk_key) {
+            Some(Solved::Scored { jod, .. }) => Some(*jod),
+            _ => None,
+        }
+    }
+
+    pub fn insert(&self, chunk_key: &str, crf: f64, jod: f64) -> Result<()> {
+        let solved = if jod.is_finite() { Solved::Scored { crf, jod } } else { Solved::Crf(crf) };
         let mut state = self.state.lock().unwrap();
-        state.insert(chunk_key.to_owned(), crf);
+        state.insert(chunk_key.to_owned(), solved);
         write_json_atomic(&self.path, &*state)
     }
 }
@@ -169,6 +186,7 @@ pub struct TempDir {
     pub fingerprint_path: PathBuf,
     pub source_id_path: PathBuf,
     pub failed_path: PathBuf,
+    pub attempts_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
     pub interlace_cache: PathBuf,
@@ -190,6 +208,7 @@ impl TempDir {
         let fingerprint_path = path.join("profile.fingerprint");
         let source_id_path   = path.join("source.path");
         let failed_path      = path.join(".failed");
+        let attempts_path    = path.join("attempts");
         let chunks_dir       = path.join("chunks");
         let crop_cache       = path.join("crop.cache");
         let interlace_cache  = path.join("interlace.cache");
@@ -201,7 +220,7 @@ impl TempDir {
         let hdr10plus_path   = path.join("hdr10plus.json");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
-            fingerprint_path, source_id_path, failed_path, chunks_dir, crop_cache, interlace_cache,
+            fingerprint_path, source_id_path, failed_path, attempts_path, chunks_dir, crop_cache, interlace_cache,
             tracks_path, remux_path, video_path, mux_path, timestamps_path, hdr10plus_path,
         }
     }
@@ -225,7 +244,7 @@ impl TempDir {
 
     /// A different source with the same stem wipes the dir; it describes the old video.
     pub fn claim_source(&self, source: &Path, stem: &str) -> Result<()> {
-        let id = source_id(source);
+        let id = source_id(source)?;
         let recorded = self.recorded_id();
         if recorded.as_ref().is_some_and(|prev| *prev != id) {
             tracing::warn!("[{stem}] temp dir belongs to a different source - discarding it");
@@ -239,17 +258,16 @@ impl TempDir {
         write_atomic(&self.source_id_path, id.as_bytes())
     }
 
-    /// Whether the source is still the file `claim_source` recorded.
     pub fn source_unchanged(&self, source: &Path) -> bool {
-        self.recorded_id().is_some_and(|id| id == source_id(source))
+        self.recorded_id().is_some_and(|id| source_id(source).is_ok_and(|now| now == id))
     }
 }
 
 /// The size below the path, so a file replaced under the same name is a new job. Not the
 /// mtime: a copy that only touched it would throw away hours of encoding.
-pub fn source_id(source: &Path) -> String {
-    let size = std::fs::metadata(source).map_or(0, |m| m.len());
-    format!("{}\n{size}", source.display())
+pub fn source_id(source: &Path) -> Result<String> {
+    let size = std::fs::metadata(source).with_context(|| format!("read the size of {}", source.display()))?.len();
+    Ok(format!("{}\n{size}", source.display()))
 }
 
 #[cfg(test)]
@@ -300,7 +318,25 @@ mod tests {
         std::fs::write(&source, b"a different video of another length").unwrap();
         temp.claim_source(&source, "Film").unwrap();
         assert!(!chunk.exists(), "chunks of the old video survived the replacement");
-        assert_eq!(temp.recorded_id(), Some(source_id(&source)));
+        assert_eq!(temp.recorded_id(), Some(source_id(&source).unwrap()));
+    }
+
+    #[test]
+    fn a_source_that_cannot_be_read_keeps_the_temp_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("Film.mkv");
+        std::fs::write(&source, b"video").unwrap();
+
+        let temp = TempDir::for_video(dir.path(), "Film");
+        temp.claim_source(&source, "Film").unwrap();
+        let chunk = temp.chunk_path("00001");
+        std::fs::write(&chunk, b"chunk").unwrap();
+
+        // A share that drops out reads as no file at all, which is no replacement.
+        std::fs::remove_file(&source).unwrap();
+        assert!(temp.claim_source(&source, "Film").is_err());
+        assert!(chunk.exists());
+        assert!(!temp.source_unchanged(&source));
     }
 
     #[test]
@@ -317,7 +353,7 @@ mod tests {
 
         temp.claim_source(&source, "Film").unwrap();
         assert!(chunk.exists());
-        assert_eq!(temp.recorded_id(), Some(source_id(&source)));
+        assert_eq!(temp.recorded_id(), Some(source_id(&source).unwrap()));
     }
 
     #[test]
@@ -341,14 +377,28 @@ mod tests {
 
         let cache = CrfCache::load_or_create(&path).unwrap();
         assert_eq!(cache.get("00001"), None);
-        cache.insert("00001", 28.25).unwrap();
-        cache.insert("00002", 31.0).unwrap();
+        cache.insert("00001", 28.25, 9.512).unwrap();
+        cache.insert("00002", 31.0, f64::NAN).unwrap();
 
         // Each chunk costs several probe encodes and measurements to solve again.
         let reloaded = CrfCache::load_or_create(&path).unwrap();
         assert_eq!(reloaded.get("00001"), Some(28.25));
-        assert_eq!(reloaded.get("00002"), Some(31.0));
+        assert_eq!(reloaded.jod("00001"), Some(9.512));
+        assert_eq!((reloaded.get("00002"), reloaded.jod("00002")), (Some(31.0), None));
         assert_eq!(reloaded.get("00003"), None);
+    }
+
+    #[test]
+    fn a_tq_json_of_bare_crfs_still_resumes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tq.json");
+        std::fs::write(&path, r#"{"00001": 28.25, "00002": 31.0}"#).unwrap();
+
+        let cache = CrfCache::load_or_create(&path).unwrap();
+        assert_eq!((cache.get("00001"), cache.jod("00001")), (Some(28.25), None));
+        cache.insert("00003", 33.5, 9.6).unwrap();
+        let reloaded = CrfCache::load_or_create(&path).unwrap();
+        assert_eq!((reloaded.get("00002"), reloaded.get("00003"), reloaded.jod("00003")), (Some(31.0), Some(33.5), Some(9.6)));
     }
 
     #[test]

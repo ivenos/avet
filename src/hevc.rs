@@ -252,7 +252,11 @@ fn load(path: &Path) -> Result<Vec<Option<Arc<[u8]>>>> {
 /// HDR10+ per frame from the bitstream, cached at `cache` since it reads the whole file.
 pub fn hdr10plus_frames(source: &Path, cache: &Path) -> Result<Hdr10PlusFrames> {
     if cache.exists() {
-        return load(cache).map(Arc::new);
+        match load(cache) {
+            Ok(frames) => return Ok(Arc::new(frames)),
+            Err(e) if crate::job::is_transient(&e) => return Err(e),
+            Err(e) => tracing::warn!("{e:#} - reading HDR10+ from the bitstream again"),
+        }
     }
     let frames = scan(source)?;
     save(&frames, cache)?;

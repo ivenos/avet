@@ -20,7 +20,6 @@ struct Element {
     size: Option<u64>,
 }
 
-/// Vint length from the leading zero bits of its first byte.
 fn vint_len(first: u8) -> Option<usize> {
     (first != 0).then(|| first.leading_zeros() as usize + 1)
 }
