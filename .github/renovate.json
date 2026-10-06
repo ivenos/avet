@@ -13,20 +13,18 @@
     {
       "matchManagers": ["github-actions"],
       "groupName": "GitHub Actions",
-      "commitMessagePrefix": "ci:",
-      "automerge": true
+      "commitMessagePrefix": "ci:"
     },
     {
+      "matchManagers": ["github-actions"],
       "matchPackageNames": [
-        "actions/download-artifact",
-        "docker/build-push-action",
-        "docker/login-action",
-        "docker/metadata-action",
-        "peter-evans/dockerhub-description",
-        "softprops/action-gh-release"
+        "actions/checkout",
+        "actions/upload-artifact",
+        "docker/setup-buildx-action",
+        "dtolnay/rust-toolchain",
+        "Swatinem/rust-cache"
       ],
-      "matchUpdateTypes": ["major"],
-      "automerge": false
+      "automerge": true
     },
     {
       "matchManagers": ["dockerfile", "docker-compose"],

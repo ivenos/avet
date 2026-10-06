@@ -149,6 +149,9 @@ jobs:
           want=$(sed -n 's/^  FFMPEG_VERSION: n//p' .github/workflows/appimage.yml)
           have=$(docker run --rm --entrypoint ffmpeg avet:test -version | sed -n 's/^ffmpeg version \([0-9.]*\).*/\1/p')
           [ "$want" = "$have" ] || echo "::warning::the image has FFmpeg $have, appimage.yml builds $want"
+          want=$(sed -n 's/^  MKVTOOLNIX_VERSION: "\(.*\)"/\1/p' .github/workflows/appimage.yml)
+          have=$(docker run --rm --entrypoint mkvmerge avet:test --version | sed -n 's/^mkvmerge v\([0-9.]*\).*/\1/p')
+          [ "$want" = "$have" ] || echo "::warning::the image has MKVToolNix $have, appimage.yml installs $want"
 
       - name: Upload test images
         uses: actions/upload-artifact@v7

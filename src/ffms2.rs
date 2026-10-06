@@ -5,12 +5,12 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::raw::{c_char, c_double, c_int, c_uint};
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 use crate::ext::external_bin;
 
 const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
-const FFMS_SEEK_NORMAL: c_int = 1; // FFMS2 5.0: enum shifted, 1 = SEEK_NORMAL (supports random access)
+const FFMS_SEEK_NORMAL: c_int = 1;
 const FFMS_TYPE_VIDEO: c_int = 0;
 const FFMS_RESIZER_BICUBIC: c_int  = 4;
 
@@ -385,64 +385,118 @@ fn pixfmt_for(sub: PixelSubsampling, depth: u8) -> Option<c_int> {
     Some(get_pixel_format(name))
 }
 
+#[repr(C)]
+struct AVComponentDescriptor {
+    plane: c_int,
+    step: c_int,
+    offset: c_int,
+    shift: c_int,
+    depth: c_int,
+}
+
+// libavutil's AVPixFmtDescriptor, laid out like this since FFmpeg 5.0.
+#[repr(C)]
+struct AVPixFmtDescriptor {
+    name: *const c_char,
+    nb_components: u8,
+    log2_chroma_w: u8,
+    log2_chroma_h: u8,
+    flags: u64,
+    comp: [AVComponentDescriptor; 4],
+    alias: *const c_char,
+}
+
+const AV_PIX_FMT_FLAG_BE: u64 = 1 << 0;
+const AV_PIX_FMT_FLAG_PAL: u64 = 1 << 1;
+const AV_PIX_FMT_FLAG_BITSTREAM: u64 = 1 << 2;
+const AV_PIX_FMT_FLAG_HWACCEL: u64 = 1 << 3;
+const AV_PIX_FMT_FLAG_PLANAR: u64 = 1 << 4;
+const AV_PIX_FMT_FLAG_RGB: u64 = 1 << 5;
+const AV_PIX_FMT_FLAG_ALPHA: u64 = 1 << 7;
+const AV_PIX_FMT_FLAG_BAYER: u64 = 1 << 8;
+const AV_PIX_FMT_FLAG_FLOAT: u64 = 1 << 9;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PixelLayout {
+    pub rgb: bool,
+    pub components: u8,
+    pub log2_chroma_w: u8,
+    pub log2_chroma_h: u8,
+    pub depth: u32,
+    plain_yuv: bool,
+}
+
+impl PixelLayout {
+    pub fn not_yuv(&self) -> bool {
+        self.rgb || self.components <= 2
+    }
+}
+
+pub fn pixel_layout_of(name: &str) -> Option<PixelLayout> {
+    FFMS_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
+    pixel_layout(get_pixel_format(name))
+}
+
+fn pixel_layout(pix_fmt: c_int) -> Option<PixelLayout> {
+    type DescGet = unsafe extern "C" fn(c_int) -> *const AVPixFmtDescriptor;
+    unsafe extern "C" {
+        fn dlsym(handle: *mut std::ffi::c_void, symbol: *const c_char) -> *mut std::ffi::c_void;
+    }
+    // By name at run time: libffms2 has libavutil in the process, and no build needs FFmpeg's headers for it.
+    static DESC_GET: OnceLock<Option<DescGet>> = OnceLock::new();
+    let desc_get = (*DESC_GET.get_or_init(|| {
+        let symbol = unsafe { dlsym(std::ptr::null_mut(), c"av_pix_fmt_desc_get".as_ptr()) };
+        (!symbol.is_null()).then(|| unsafe { std::mem::transmute::<*mut std::ffi::c_void, DescGet>(symbol) })
+    }))?;
+
+    let desc = unsafe { desc_get(pix_fmt).as_ref() }?;
+    let comp = &desc.comp[..usize::from(desc.nb_components.min(4))];
+    let depth = comp.iter().map(|c| c.depth).max().unwrap_or(0).max(0) as u32;
+    let odd = AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_HWACCEL
+        | AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_ALPHA | AV_PIX_FMT_FLAG_BAYER | AV_PIX_FMT_FLAG_FLOAT;
+    let plain_yuv = desc.flags & AV_PIX_FMT_FLAG_PLANAR != 0
+        && desc.flags & odd == 0
+        && comp.len() == 3
+        && comp.iter().enumerate().all(|(i, c)| c.plane == i as c_int && c.shift == 0 && c.step == if depth > 8 { 2 } else { 1 });
+    Some(PixelLayout {
+        rgb: desc.flags & AV_PIX_FMT_FLAG_RGB != 0,
+        components: desc.nb_components,
+        log2_chroma_w: desc.log2_chroma_w,
+        log2_chroma_h: desc.log2_chroma_h,
+        depth,
+        plain_yuv,
+    })
+}
+
 fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
     use PixelSubsampling::*;
-    const TABLE: &[(&str, u32, PixelSubsampling)] = &[
-        ("yuv420p",      8, Yuv420),
-        ("yuvj420p",     8, Yuv420),
-        ("yuv420p10le", 10, Yuv420),
-        ("yuv420p12le", 12, Yuv420),
-        ("yuv420p16le", 16, Yuv420),
-        ("yuv422p",      8, Yuv422),
-        ("yuvj422p",     8, Yuv422),
-        ("yuv422p10le", 10, Yuv422),
-        ("yuv422p12le", 12, Yuv422),
-        ("yuv444p",      8, Yuv444),
-        ("yuvj444p",     8, Yuv444),
-        ("yuv444p10le", 10, Yuv444),
-        ("yuv444p12le", 12, Yuv444),
-    ];
 
-    for &(name, bit_depth, subsampling) in TABLE {
-        if pix_fmt == get_pixel_format(name) {
-            return PixelFormat { pix_fmt, bit_depth, subsampling };
-        }
+    let Some(layout) = pixel_layout(pix_fmt) else {
+        tracing::warn!("unrecognized FFMS pixel format {pix_fmt} - converting it to 10-bit 4:2:0");
+        return PixelFormat { pix_fmt: get_pixel_format("yuv420p10le"), bit_depth: 10, subsampling: Yuv420 };
+    };
+    let subsampling = match (layout.log2_chroma_w, layout.log2_chroma_h) {
+        _ if layout.components < 3 => Yuv420,
+        (0, _) => Yuv444,
+        (_, 0) => Yuv422,
+        _ => Yuv420,
+    };
+    let y4m_shape = matches!((layout.log2_chroma_w, layout.log2_chroma_h), (1, 1) | (1, 0) | (0, 0));
+    if layout.plain_yuv && y4m_shape && layout.depth != 9 {
+        return PixelFormat { pix_fmt, bit_depth: layout.depth, subsampling };
     }
-
-    const FIELD_SAFE: &[(&str, &str, u32, PixelSubsampling)] = &[
-        ("yuyv422", "yuv422p", 8, Yuv422),
-        ("uyvy422", "yuv422p", 8, Yuv422),
-        ("yvyu422", "yuv422p", 8, Yuv422),
-        ("nv16", "yuv422p", 8, Yuv422),
-        ("yuv411p", "yuv422p", 8, Yuv422),
-        ("yuv440p", "yuv444p", 8, Yuv444),
-        ("yuvj440p", "yuv444p", 8, Yuv444),
-        ("gbrp", "yuv444p", 8, Yuv444),
-        ("rgb24", "yuv444p", 8, Yuv444),
-        ("bgr24", "yuv444p", 8, Yuv444),
-        ("y210le", "yuv422p10le", 10, Yuv422),
-        ("gbrp10le", "yuv444p10le", 10, Yuv444),
-    ];
-    for &(name, target, bit_depth, subsampling) in FIELD_SAFE {
-        if pix_fmt == get_pixel_format(name) {
-            return PixelFormat { pix_fmt: get_pixel_format(target), bit_depth, subsampling };
-        }
-    }
-
-    const EIGHT_BIT: &[&str] = &[
-        "yuv410p", "nv12", "nv21", "gray", "pal8", "rgba", "bgra", "argb", "abgr", "rgb0", "bgr0",
-    ];
-    let bit_depth = if EIGHT_BIT.iter().any(|n| pix_fmt == get_pixel_format(n)) { 8 } else { 10 };
     // A real format, not the source's own: FFMS2 skips the conversion for a target it
     // already has, and the Y4M header would describe a layout the data does not have.
-    tracing::warn!(
-        "unrecognized FFMS pixel format {pix_fmt} - converting it to {bit_depth}-bit 4:2:0"
-    );
-    PixelFormat {
-        pix_fmt: get_pixel_format(if bit_depth == 8 { "yuv420p" } else { "yuv420p10le" }),
-        bit_depth,
-        subsampling: PixelSubsampling::Yuv420,
-    }
+    let bit_depth = if layout.depth > 8 { 10 } else { 8 };
+    let target = match (subsampling, bit_depth) {
+        (Yuv420, 8) => "yuv420p",
+        (Yuv420, _) => "yuv420p10le",
+        (Yuv422, 8) => "yuv422p",
+        (Yuv422, _) => "yuv422p10le",
+        (Yuv444, 8) => "yuv444p",
+        (Yuv444, _) => "yuv444p10le",
+    };
+    PixelFormat { pix_fmt: get_pixel_format(target), bit_depth, subsampling }
 }
 
 struct Index(*mut FFMS_Index);
@@ -778,24 +832,57 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_pixel_format_is_converted_at_its_own_depth_with_no_row_resampled() {
+    fn a_format_the_y4m_writer_cannot_take_is_converted_at_its_own_depth_with_no_row_resampled() {
         use PixelSubsampling::*;
+        FFMS_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
         // Passed through, FFMS2 skips swscale and the Y4M header describes the wrong layout.
         for (name, target, depth, subsampling) in [
-            ("nv12", "yuv420p", 8, Yuv420), ("gray", "yuv420p", 8, Yuv420), ("gray16le", "yuv420p10le", 10, Yuv420),
+            ("nv12", "yuv420p", 8, Yuv420), ("nv21", "yuv420p", 8, Yuv420), ("yuv410p", "yuv420p", 8, Yuv420),
+            ("gray", "yuv420p", 8, Yuv420), ("gray16le", "yuv420p10le", 10, Yuv420), ("pal8", "yuv420p", 8, Yuv420),
+            ("yuva420p", "yuv420p", 8, Yuv420), ("yuv420p9le", "yuv420p10le", 10, Yuv420),
             ("yuv411p", "yuv422p", 8, Yuv422), ("yuyv422", "yuv422p", 8, Yuv422), ("uyvy422", "yuv422p", 8, Yuv422),
-            ("bgr24", "yuv444p", 8, Yuv444), ("gbrp10le", "yuv444p10le", 10, Yuv444),
+            ("yvyu422", "yuv422p", 8, Yuv422), ("nv16", "yuv422p", 8, Yuv422), ("y210le", "yuv422p10le", 10, Yuv422),
+            ("yuv422p10be", "yuv422p10le", 10, Yuv422),
+            ("yuv440p", "yuv444p", 8, Yuv444), ("yuvj440p", "yuv444p", 8, Yuv444), ("gbrp", "yuv444p", 8, Yuv444),
+            ("rgb24", "yuv444p", 8, Yuv444), ("bgr24", "yuv444p", 8, Yuv444), ("gbrp10le", "yuv444p10le", 10, Yuv444),
+            ("bgr0", "yuv444p", 8, Yuv444), ("rgba", "yuv444p", 8, Yuv444), ("gbrap12le", "yuv444p10le", 10, Yuv444),
+            ("yuva444p10le", "yuv444p10le", 10, Yuv444),
         ] {
             let raw = get_pixel_format(name);
+            assert!(raw >= 0, "{name} is unknown to this libavutil");
             let detected = detect_pixel_format(raw);
             assert_ne!(detected.pix_fmt, raw, "{name} reaches the encoder unconverted");
             assert_eq!(detected.pix_fmt, get_pixel_format(target), "{name}");
             assert_eq!((detected.bit_depth, detected.subsampling), (depth, subsampling), "{name}");
         }
 
-        for known in ["yuv422p10le", "yuvj422p"] {
+        for (known, depth, subsampling) in [
+            ("yuv420p", 8, Yuv420), ("yuvj420p", 8, Yuv420), ("yuv420p10le", 10, Yuv420), ("yuv420p12le", 12, Yuv420),
+            ("yuv420p16le", 16, Yuv420), ("yuv422p", 8, Yuv422), ("yuvj422p", 8, Yuv422), ("yuv422p10le", 10, Yuv422),
+            ("yuv422p12le", 12, Yuv422), ("yuv444p", 8, Yuv444), ("yuvj444p", 8, Yuv444), ("yuv444p10le", 10, Yuv444),
+            ("yuv444p12le", 12, Yuv444),
+        ] {
             let raw = get_pixel_format(known);
-            assert_eq!(detect_pixel_format(raw).pix_fmt, raw, "{known}");
+            let detected = detect_pixel_format(raw);
+            assert_eq!((detected.pix_fmt, detected.bit_depth, detected.subsampling), (raw, depth, subsampling), "{known}");
         }
+
+        let unknown = detect_pixel_format(-1);
+        assert_eq!((unknown.pix_fmt, unknown.bit_depth), (get_pixel_format("yuv420p10le"), 10));
+    }
+
+    #[test]
+    fn full_width_chroma_and_what_is_not_yuv_are_read_off_the_format_itself() {
+        let layout = |name: &str| pixel_layout_of(name).unwrap_or_else(|| panic!("{name} is unknown to this libavutil"));
+        for name in ["gbrp", "rgb24", "bgr0", "pal8", "gray", "gray10le", "ya8", "monow", "gbrp12le", "x2rgb10le"] {
+            assert!(layout(name).not_yuv(), "{name}");
+        }
+        for name in ["yuv420p", "yuvj420p", "yuv444p10le", "nv12", "yuyv422", "yuva420p", "yuv440p"] {
+            assert!(!layout(name).not_yuv(), "{name}");
+        }
+        for (name, full_width) in [("yuv444p", true), ("yuv440p", true), ("yuvj440p", true), ("yuv422p", false), ("yuv411p", false), ("yuv420p", false)] {
+            assert_eq!(layout(name).log2_chroma_w == 0, full_width, "{name}");
+        }
+        assert_eq!(pixel_layout_of("no-such-format"), None);
     }
 }

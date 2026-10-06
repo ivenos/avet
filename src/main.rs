@@ -61,13 +61,16 @@ fn main() -> Result<()> {
     let ctx = job::JobContext {
         input_dir: input_dir.clone(),
         output_dir: output_dir.clone(),
+        poll: Duration::from_secs(poll_interval),
     };
 
     let shutdown = shutdown_signal();
     let Some(_lock) = lock_output(&output_dir, &shutdown)? else { return Ok(()) };
 
     loop {
-        match scanner::scan(&input_dir, &output_dir) {
+        let scanned = scanner::scan(&input_dir, &output_dir)
+            .map(|jobs| jobs.into_iter().filter(|j| j.delivered || job::RETRIES.due(j)).collect::<Vec<_>>());
+        match scanned {
             Err(e) => tracing::error!("scanner error: {e:#}"),
             Ok(jobs) if jobs.is_empty() => {
                 tracing::debug!("no jobs - sleeping {poll_interval}s");
@@ -80,11 +83,19 @@ fn main() -> Result<()> {
                         return Ok(());
                     }
                     let stem = j.stem();
+                    if j.delivered {
+                        if let Err(e) = job::finish_delivery(j, &ctx) {
+                            scanner::report(format!("[{stem}] output is in place, but archiving the source failed: {e:#}"));
+                        }
+                        continue;
+                    }
+                    let profile = resume::profile_id(&j.encode_toml);
 
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job::run(j, &ctx)))
                         .unwrap_or_else(|panic| Err(anyhow::anyhow!("avet panicked: {}", panic_message(&*panic))));
-                    if let Err(e) = result {
-                        job::handle_failure(j, &ctx, stem, &e, shutdown.load(Ordering::Relaxed));
+                    match result {
+                        Ok(()) => job::RETRIES.clear(j),
+                        Err(e) => job::handle_failure(j, &ctx, stem, &e, shutdown.load(Ordering::Relaxed), profile.as_deref()),
                     }
                     if shutdown.load(Ordering::Relaxed) {
                         tracing::info!("stopping after {stem}");

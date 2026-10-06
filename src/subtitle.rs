@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
 
 use crate::config::{SubtitleConfig, SubtitleMode};
-use crate::ext::external_bin;
 
 const MATROSKA_SUBTITLES: &[&str] = &[
     "subrip", "text", "ass", "webvtt", "dvd_subtitle", "dvb_subtitle", "hdmv_pgs_subtitle",
@@ -115,13 +113,9 @@ pub struct Identified {
 }
 
 pub fn identify(source: &Path, track_type: &str) -> Result<Vec<Identified>> {
-    let mut cmd = Command::new(external_bin("mkvmerge"));
+    let mut cmd = crate::ext::mkvmerge();
     cmd.args(["--identify", "--identification-format", "json"]).arg(source);
-    let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
-
-    if out.status.code().unwrap_or(2) >= 2 {
-        return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
-    }
+    let out = crate::ext::mkvmerge_output(&mut cmd, 300, "mkvmerge identify")?;
 
     #[derive(Deserialize)]
     struct Identify { tracks: Vec<Track> }

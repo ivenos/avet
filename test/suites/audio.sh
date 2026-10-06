@@ -185,7 +185,6 @@ assert_audio_channels    "$O/test.mkv" 0 8
 assert_audio_codec       "$O/test.mkv" 0 flac
 
 # untagged in MP4: ffprobe reports "und", which still means untagged
-# Reading only Matroska's missing field as untagged leaves an MP4 rip with no audio.
 I="$WORKDIR/20/in"; O="$WORKDIR/20/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_untagged.mp4" "$I/p/test.mp4"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -359,7 +358,7 @@ printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "video language: no output"
 assert_stream_value "$O/test.mkv" v:0 stream_tags=language -
 
-# a codec ffmpeg cannot encode is transient: no marker, the file stays
+# a codec ffmpeg cannot encode fails the file before the video, and the file stays
 I="$WORKDIR/17/in"; O="$WORKDIR/17/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -374,11 +373,12 @@ bitrate = "128k"
 EOF
 run_avet_timed "$I" "$O" 60 "has no encoder"
 assert_log_contains    "ffmpeg has no encoder 'nonexistent'"
+assert_log_not_contains "scene detection"
 assert_file_not_exists "$O/test.mkv"
-assert_file_not_exists "$O/.avet_test/.failed"
+assert_file_exists     "$O/.avet_test/.failed"
 assert_file_exists     "$I/p/test.mkv"
 
-# an encoder ffmpeg refuses stops the job before the video, retried for an option, failed for a track
+# an encoder ffmpeg refuses stops the job before the video, for an option as for a track
 I="$WORKDIR/19/in"; O="$WORKDIR/19/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -393,9 +393,8 @@ bitrate = "128k"
 EOF
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_log_contains     "experimental codecs are not enabled"
-assert_log_contains     "retrying on the next scan"
 assert_log_not_contains "scene detection"
-assert_file_not_exists  "$O/.avet_test/.failed"
+assert_file_exists      "$O/.avet_test/.failed"
 
 I="$WORKDIR/23/in"; O="$WORKDIR/23/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
@@ -411,9 +410,8 @@ options = { compression_level = 13 }
 EOF
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_log_contains     "try the audio encoders on the first second"
-assert_log_contains     "retrying on the next scan"
 assert_log_not_contains "scene detection"
-assert_file_not_exists  "$O/.avet_test/.failed"
+assert_file_exists      "$O/.avet_test/.failed"
 
 I="$WORKDIR/24/in"; O="$WORKDIR/24/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/tones_714.mov" "$I/p/test.mov"

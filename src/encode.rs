@@ -172,20 +172,6 @@ fn tool_failure(what: &str, status: ExitStatus, stderr: &str, index: usize) -> a
     crate::ext::tool_error(&format!("{what} (chunk {:05})", index + 1), status, stderr)
 }
 
-/// SvtAv1EncApp prints "Encoding" once its arguments, which come from the profile, have
-/// passed its checks; a rejection is fixed in encode.toml and must not lock the file out.
-fn encoder_failure(status: ExitStatus, stderr: &str, index: usize) -> anyhow::Error {
-    use std::os::unix::process::ExitStatusExt;
-
-    let err = tool_failure("encoder", status, stderr, index);
-    let rejected_arguments = status.signal().is_none() && !stderr.contains("Encoding");
-    if rejected_arguments && err.downcast_ref::<crate::job::Transient>().is_none() {
-        err.context(crate::job::Transient)
-    } else {
-        err
-    }
-}
-
 fn broken_pipe(err: &anyhow::Error) -> bool {
     err.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()
@@ -229,7 +215,7 @@ fn encode_direct(
 
     // Status first: an encoder that died early, even with exit 0, turns the write into a broken pipe.
     if !status.success() || write_res.as_ref().is_err_and(broken_pipe) {
-        let err = encoder_failure(status, &stderr, scene.index);
+        let err = tool_failure("encoder", status, &stderr, scene.index);
         return Err(match feed_failure(write_res) {
             Some(cause) => err.context(format!("reading the source failed first: {cause}")),
             None => err,
@@ -281,7 +267,7 @@ fn encode_filtered(
     let enc_failed = encoder_to_blame(ff_status.success(), &ff_stderr, enc_status.success(), &enc_stderr);
     if enc_failed || !ff_status.success() {
         let err = if enc_failed {
-            encoder_failure(enc_status, &enc_stderr, scene.index)
+            tool_failure("encoder", enc_status, &enc_stderr, scene.index)
         } else {
             tool_failure("ffmpeg filter", ff_status, &ff_stderr, scene.index)
         };
@@ -536,20 +522,19 @@ mod tests {
     }
 
     #[test]
-    fn an_encoder_that_rejects_its_arguments_is_retried_and_one_that_fails_encoding_is_not() {
+    fn an_encoder_that_rejects_its_arguments_is_a_verdict_and_a_killed_one_is_not() {
         use std::os::unix::process::ExitStatusExt;
         let exit = |code: i32| ExitStatus::from_raw(code << 8);
         let transient = |e: &anyhow::Error| e.downcast_ref::<crate::job::Transient>().is_some();
 
-        let typo = encoder_failure(exit(1), "Unprocessed tokens: --prest \nError in configuration, could not begin encoding! ...", 0);
-        assert!(transient(&typo), "got: {typo:#}");
-        let exits_zero = encoder_failure(exit(0), "Error: EncoderMode must be in the range of [-1-13]", 0);
-        assert!(transient(&exits_zero) && format!("{exits_zero:#}").contains("EncoderMode"), "got: {exits_zero:#}");
+        // Lifted by the edit of encode.toml that fixes it, not by trying again.
+        let typo = tool_failure("encoder", exit(1), "Unprocessed tokens: --prest \nError in configuration, could not begin encoding! ...", 0);
+        assert!(!transient(&typo) && format!("{typo:#}").contains("--prest"), "got: {typo:#}");
+        let too_wide = tool_failure("encoder", exit(1), "Svt[error]: Source Width must be less than or equal to 16384", 0);
+        assert!(!transient(&too_wide), "got: {too_wide:#}");
 
-        let mid_encode = encoder_failure(exit(1), "Encoding          \nSvt[error]: bug, no frame in undisplayed queue", 0);
-        assert!(!transient(&mid_encode), "got: {mid_encode:#}");
-        let crashed = encoder_failure(ExitStatus::from_raw(11), "", 0);
-        assert!(!transient(&crashed), "got: {crashed:#}");
+        let killed = tool_failure("encoder", ExitStatus::from_raw(9), "Encoding          ", 0);
+        assert!(transient(&killed) && killed.downcast_ref::<crate::job::Killed>().is_some(), "got: {killed:#}");
     }
 
     #[test]

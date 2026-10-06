@@ -13,8 +13,9 @@ use crate::resume::SceneEntry;
 // CRF granularity of the SVT-AV1 encoders (and the HDR fork): quarter steps.
 const CRF_STEP: f64 = 0.25;
 
-// Seeds the first interpolation only; measured on 4K HDR SVT-AV1 near the target zone.
+// Seed the first step only; measured on 4K HDR SVT-AV1 near the target zone.
 const NOMINAL_JOD_PER_CRF: f64 = 0.025;
+const NOMINAL_LN_SIZE_PER_CRF: f64 = 0.07;
 
 const CAMBI_PERCENTILE: f64 = 95.0;
 
@@ -107,7 +108,8 @@ pub fn ensure_available() -> Result<GpuSelection> {
         );
     }
     let devices = list_gpus(&String::from_utf8_lossy(&out.stdout));
-    if let Some(g) = first_usable(&devices, passes_kernel_check) {
+    let software = std::env::var_os("AVET_SOFTWARE_GPU").is_some_and(|v| v == "1");
+    if let Some(g) = first_usable(&devices, software, passes_kernel_check) {
         return Ok(g.clone());
     }
     let hardware: Vec<&str> = devices.iter().filter(|d| d.hardware).map(|d| d.label.as_str()).collect();
@@ -124,8 +126,8 @@ pub fn ensure_available() -> Result<GpuSelection> {
     }
 }
 
-fn first_usable(devices: &[GpuSelection], passes: impl Fn(u32) -> bool) -> Option<&GpuSelection> {
-    devices.iter().find(|d| d.hardware && passes(d.id))
+fn first_usable(devices: &[GpuSelection], software: bool, passes: impl Fn(u32) -> bool) -> Option<&GpuSelection> {
+    devices.iter().find(|d| (d.hardware || software) && passes(d.id))
 }
 
 /// `--list-gpu` also lists devices Vship refuses to run on, such as one without 64-bit shader integers.
@@ -133,7 +135,7 @@ fn passes_kernel_check(id: u32) -> bool {
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
     cmd.args(["--gpu-info", "--gpu-id", &id.to_string()]);
     crate::ext::output_with_timeout(&mut cmd, 120, "FFVship --gpu-info").is_ok_and(|out| {
-        out.status.success() && !String::from_utf8_lossy(&out.stdout).contains("Passes Kernel Check: 0")
+        out.status.success() && String::from_utf8_lossy(&out.stdout).lines().any(|l| l.trim() == "Passes Kernel Check: 1")
     })
 }
 
@@ -159,7 +161,9 @@ pub struct ProbeContext<'a> {
     pub config: &'a Config,
     pub opts: &'a EncodeOptions,
     pub tq: &'a TargetQualityConfig,
-    pub display_model: DisplayModel,
+    /// HDR or SDR as first signaled, then as FFVship read the source.
+    pub display_model: &'a Mutex<DisplayModel>,
+    pub source_rgb: bool,
     pub gpu_id: u32,
     /// Held around FFVship: a second run on the same GPU adds VRAM, not throughput.
     pub gpu_lock: &'a Mutex<()>,
@@ -249,119 +253,51 @@ impl SolveResult {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Phase {
-    Search,
-    ChasingCap,
-    NarrowingCap,
-}
-
-impl Phase {
-    fn suffix(self) -> &'static str {
-        match self {
-            Phase::Search       => "",
-            Phase::ChasingCap   => " (chasing the size cap)",
-            Phase::NarrowingCap => " (narrowing the size cap)",
-        }
-    }
-}
-
-/// Highest CRF holding `tq.jod` and the CAMBI limits under `tq.max_encoded_percent`. JOD
-/// falls monotonically with CRF, so this is an interpolated binary search on the 0.25 grid.
 pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
     let lo = ctx.tq.min_crf as f64;
     let hi = ctx.tq.max_crf as f64;
     let key = scene.padded_index();
     let mut n = 0u32;
 
-    solve(ctx.tq, seed_crf(ctx.config, lo, hi), &mut |crf, phase| {
+    solve(ctx.tq, seed_crf(ctx.config, lo, hi), &mut |crf| {
         let probe = probe_once(ctx, scene, crf)?;
         n += 1;
         tracing::info!(
-            "[{}] chunk {key} probe {n}/{} crf {crf} gives {}, {:.0}% size{}",
-            ctx.stem, ctx.tq.max_probes, probe.scores(), probe.size_pct, phase.suffix()
+            "[{}] chunk {key} probe {n}/{} crf {crf} gives {}, {:.0}% size",
+            ctx.stem, ctx.tq.max_probes, probe.scores(), probe.size_pct
         );
         Ok(probe)
     })
 }
 
-/// The search with the probe as a seam: driving it takes an encoder and a GPU, the
-/// decisions it makes between probes take neither.
+/// Highest CRF holding the floor, or the lowest fitting the size cap where that lies above it.
+/// A probe says "go up" while it holds the floor or is over the cap, and both fall with the CRF.
 fn solve(
     tq: &TargetQualityConfig,
     seed: f64,
-    probe_at: &mut dyn FnMut(f64, Phase) -> Result<Probe>,
+    probe_at: &mut dyn FnMut(f64) -> Result<Probe>,
 ) -> Result<SolveResult> {
     let lo = tq.min_crf as f64;
     let hi = tq.max_crf as f64;
     let floor = Floor::new(tq);
-    let tol = tq.tolerance;
     let cap = tq.max_encoded_percent;
 
     let mut pts: Vec<Probe> = Vec::new();
     let mut crf = round_to_step(seed, lo, hi);
-
-    for i in 0..tq.max_probes {
-        let probe = probe_at(crf, Phase::Search)?;
+    loop {
+        let probe = probe_at(crf)?;
         pts.push(probe);
-
-        if i + 1 >= tq.min_probes
-            && floor.holds(&probe) && probe.jod <= floor.jod + tol && probe.size_pct <= cap
-        {
+        let n = pts.len() as u32;
+        let settled = n >= tq.min_probes
+            && floor.holds(&probe) && probe.jod <= floor.jod + tq.tolerance && probe.size_pct <= cap;
+        if settled || n >= tq.max_probes {
             break;
         }
-        // Size falls as the CRF rises, so nothing below a probe over the cap can be picked.
-        let pickable = pts.iter().filter(|p| p.size_pct > cap).map(|p| p.crf + CRF_STEP).fold(lo, f64::max);
-        let last_probe = pts.len() as u32 + 1 >= tq.max_probes;
-        let next = next_crf(&pts, &floor, lo, hi, last_probe).map(|next| cap_crossing(&pts, cap).map_or(next, |c| next.max(c)));
-        match next {
-            Some(next) if (next - crf).abs() > 1e-9 && next >= pickable - 1e-9 && !already(&pts, next) => crf = next,
-            _ => break,
+        match next_probe(&pts, &floor, cap, lo, hi, n + 1 == tq.max_probes) {
+            Some(next) => crf = next,
+            None => break,
         }
     }
-
-    // The search above follows the floor only, so every probe can be over the cap.
-    while (pts.len() as u32) < tq.max_probes && !pts.iter().any(|p| p.size_pct <= cap) {
-        let highest = pts.iter().map(|p| p.crf).fold(f64::MIN, f64::max);
-        if highest >= hi - 1e-9 {
-            break;
-        }
-        let next = round_to_step((highest + hi) / 2.0, highest + CRF_STEP, hi);
-        if already(&pts, next) {
-            break;
-        }
-        let probe = probe_at(next, Phase::ChasingCap)?;
-        pts.push(probe);
-    }
-
-    // That bisection can overshoot, and a lower CRF under the cap is free quality.
-    while (pts.len() as u32) < tq.max_probes
-        && !pts.iter().any(|p| floor.holds(p) && p.size_pct <= cap)
-    {
-        let Some(fit) = pts.iter().filter(|p| p.size_pct <= cap).map(|p| p.crf).reduce(f64::min)
-        else {
-            break;
-        };
-        let Some(over) = pts
-            .iter()
-            .filter(|p| p.size_pct > cap && p.crf < fit)
-            .map(|p| p.crf)
-            .reduce(f64::max)
-        else {
-            break;
-        };
-        // Grid-aligned, so anything above one step is at least two.
-        if fit - over <= CRF_STEP + 1e-9 {
-            break;
-        }
-        let next = round_to_step((over + fit) / 2.0, over + CRF_STEP, fit - CRF_STEP);
-        if already(&pts, next) {
-            break;
-        }
-        let probe = probe_at(next, Phase::NarrowingCap)?;
-        pts.push(probe);
-    }
-
     Ok(decide(&pts, &floor, cap, lo))
 }
 
@@ -391,6 +327,12 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
         let guess = if ctx.source_height > 650 { "1" } else { "5" };
         opts.hdr_args.extend(["--matrix-coefficients".to_string(), guess.to_string()]);
     }
+    // It takes untagged RGB for sRGB with BT.709 primaries, and guesses both from the matrix on the encode.
+    for (flag, srgb) in [("--transfer-characteristics", "13"), ("--color-primaries", "1")] {
+        if ctx.source_rgb && !opts.hdr_args.iter().any(|a| a == flag) {
+            opts.hdr_args.extend([flag.to_string(), srgb.to_string()]);
+        }
+    }
     let size_bytes = encode::encode_chunk(
         ctx.source,
         ctx.index,
@@ -404,22 +346,10 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
     .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
     .with_context(|| format!("probe encode crf {crf}"))?;
 
-    let gpu = ctx.gpu_lock.lock().unwrap();
-    let jod = measure(&MeasureOpts {
-        distorted: &probe,
-        source: ctx.source,
-        index: ctx.index,
-        work_dir: ctx.temp_dir,
-        start: scene.start_frame,
-        crop: ctx.opts.crop,
-        source_width: ctx.source_width,
-        source_height: ctx.source_height,
-        frames: scene.frame_count(),
-        display_model: ctx.display_model,
-        gpu_id: ctx.gpu_id,
-        tag: &tag,
+    let jod = score(ctx, scene, &probe, &tag).and_then(|score| match score.mismatch {
+        Some(readings) => bail!("FFVship reads {readings}, so its score would compare two different pictures"),
+        None => Ok(score.jod),
     });
-    drop(gpu);
     let result = jod.and_then(|jod| {
         let cambi = Floor::new(ctx.tq).needs_cambi(jod)
             .then(|| measure_cambi(ctx, scene, &probe, &tag))
@@ -432,6 +362,121 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
     Ok(Probe { crf, jod, cambi, size_pct })
 }
 
+/// The finished chunk as it will play, which the probes at another preset only estimate.
+pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path) -> Option<f64> {
+    // FFVship would hold the deinterlaced encode against the source's combed frames.
+    if ctx.opts.deinterlace.is_some() {
+        return None;
+    }
+    match score(ctx, scene, chunk, &format!("{}_final", scene.padded_index())) {
+        Ok(Score { jod, mismatch: None }) => Some(jod),
+        Ok(Score { mismatch: Some(readings), .. }) => {
+            tracing::debug!("[{}] chunk {}: not measured, FFVship reads {readings}", ctx.stem, scene.padded_index());
+            None
+        }
+        Err(e) => {
+            tracing::warn!("[{}] chunk {}: could not measure the finished encode: {e:#}", ctx.stem, scene.padded_index());
+            None
+        }
+    }
+}
+
+struct Score {
+    jod: f64,
+    mismatch: Option<String>,
+}
+
+fn score(ctx: &ProbeContext, scene: &SceneEntry, distorted: &Path, tag: &str) -> Result<Score> {
+    let _gpu = ctx.gpu_lock.lock().unwrap();
+    let measured = |display_model| measure(&MeasureOpts {
+        distorted,
+        source: ctx.source,
+        index: ctx.index,
+        work_dir: ctx.temp_dir,
+        start: scene.start_frame,
+        crop: ctx.opts.crop,
+        source_width: ctx.source_width,
+        source_height: ctx.source_height,
+        frames: scene.frame_count(),
+        display_model,
+        gpu_id: ctx.gpu_id,
+        tag,
+    });
+
+    let model = *ctx.display_model.lock().unwrap();
+    let (mut jod, readings) = measured(model)?;
+    let Some((source, encoded)) = readings else {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| tracing::warn!("FFVship did not say how it read the files - its scores go unchecked"));
+        return Ok(Score { jod, mismatch: None });
+    };
+    // Vship takes a BT.2020 matrix without a transfer for PQ, whatever the file signals.
+    if source.hdr() != model.hdr {
+        let model = DisplayModel { hdr: source.hdr(), ..model };
+        let mut shared = ctx.display_model.lock().unwrap();
+        if shared.hdr != model.hdr {
+            tracing::info!("[{}] target quality: FFVship reads the source as {}, display {}", ctx.stem, source.transfer, model.describe());
+            *shared = model;
+        }
+        drop(shared);
+        jod = measured(model)?.0;
+    }
+    let mismatch = (!source.same_picture(&encoded)).then(|| format!("the source as {source} and the encode as {encoded}"));
+    Ok(Score { jod, mismatch })
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Reading {
+    family: String,
+    range: String,
+    matrix: String,
+    transfer: String,
+    primaries: String,
+}
+
+impl Reading {
+    fn hdr(&self) -> bool {
+        matches!(self.transfer.as_str(), "PQ" | "HLG")
+    }
+
+    /// RGB reaches the encoder as limited-range BT.470BG YUV, so there only the light compares.
+    fn same_picture(&self, encoded: &Reading) -> bool {
+        self.transfer == encoded.transfer
+            && self.primaries == encoded.primaries
+            && (self.family == "RGB" || (self.matrix == encoded.matrix && self.range == encoded.range))
+    }
+}
+
+impl std::fmt::Display for Reading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} range, matrix {}, transfer {}, primaries {}", self.family, self.range, self.matrix, self.transfer, self.primaries)
+    }
+}
+
+fn parse_readings(stdout: &str) -> Option<(Reading, Reading)> {
+    let (mut source, mut encoded) = (Reading::default(), Reading::default());
+    let mut current: Option<&mut Reading> = None;
+    for line in stdout.lines() {
+        if line.contains("Source-Colorspace") {
+            current = Some(&mut source);
+        } else if line.contains("Encoded-Colorspace") {
+            current = Some(&mut encoded);
+        } else if let (Some(reading), Some((key, value))) = (current.as_deref_mut(), line.split_once(": ")) {
+            let field = match key.trim() {
+                "Color Family" => &mut reading.family,
+                "Range" => &mut reading.range,
+                "YUV Matrix" => &mut reading.matrix,
+                "Transfer Function" => &mut reading.transfer,
+                "Primaries" => &mut reading.primaries,
+                _ => continue,
+            };
+            *field = value.trim().to_string();
+        }
+    }
+    let complete = |r: &Reading| ![&r.family, &r.range, &r.matrix, &r.transfer, &r.primaries].iter().any(|v| v.is_empty());
+    (complete(&source) && complete(&encoded)).then_some((source, encoded))
+}
+
 /// Percent of the source's own bytes for these frames; 0 when the index is missing.
 pub fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
     match (cum.get(start as usize), cum.get(end as usize + 1)) {
@@ -440,98 +485,51 @@ pub fn chunk_size_pct(encoded: u64, cum: &[u64], start: u64, end: u64) -> f64 {
     }
 }
 
-/// None once the crossing is bracketed to one step, a bound is hit, or the grid is used.
-fn next_crf(pts: &[Probe], floor: &Floor, lo: f64, hi: f64, last_probe: bool) -> Option<f64> {
-    let target = floor.jod;
-    let pass: Vec<f64> = pts.iter().filter(|p| floor.holds(p)).map(|p| p.crf).collect();
-    let fail: Vec<f64> = pts.iter().filter(|p| !floor.holds(p)).map(|p| p.crf).collect();
-    // A probe that held JOD and failed on banding gives the JOD secant nothing to aim at.
-    let by_jod = pts.iter().filter(|p| !floor.holds(p)).all(|p| p.jod < target);
-
-    if !pass.is_empty() && !fail.is_empty() {
-        let p = pass.iter().copied().fold(f64::MIN, f64::max);
-        let f = fail.iter().copied().fold(f64::MAX, f64::min);
-        if f - p <= CRF_STEP + 1e-9 {
-            return None;
-        }
-        // The secant keeps a far end while the near one creeps in; two probes on one side halve
-        // instead, unless no probe would be left to recover from the jump.
-        let last = &pts[pts.len().saturating_sub(2)..];
-        let creeping = !last_probe && last.len() == 2 && floor.holds(&last[0]) == floor.holds(&last[1]);
-        let guess = if by_jod && !creeping { interpolate_crf(pts, target) } else { (p + f) / 2.0 };
-        let mut cand = round_to_step(guess, p, f);
-        if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
-            cand = round_to_step((p + f) / 2.0, p, f);
-        }
-        if cand <= p + 1e-9 || cand >= f - 1e-9 || already(pts, cand) {
-            return None;
-        }
-        Some(cand)
-    } else if !pass.is_empty() {
-        let hp = pass.iter().copied().fold(f64::MIN, f64::max);
-        if hp >= hi - 1e-9 {
-            return None;
-        }
-        let guess = interpolate_crf(pts, target);
-        // No slope to follow, as on a black chunk every CRF scores alike.
-        let guess = if guess > hp { guess } else { hi };
-        let cand = round_to_step(guess.max(hp + CRF_STEP), hp + CRF_STEP, hi);
-        if already(pts, cand) { None } else { Some(cand) }
-    } else {
-        let lf = fail.iter().copied().fold(f64::MAX, f64::min);
-        if lf <= lo + 1e-9 {
-            return None;
-        }
-        let guess = if by_jod { interpolate_crf(pts, target).min(lf - CRF_STEP) } else { (lo + lf) / 2.0 };
-        let cand = round_to_step(guess, lo, lf - CRF_STEP);
-        if already(pts, cand) { None } else { Some(cand) }
-    }
-}
-
-/// The lowest CRF estimated to fit the cap, between the probes on either side of it. Size
-/// falls about exponentially with the CRF, so the estimate is taken on its logarithm.
-fn cap_crossing(pts: &[Probe], cap: f64) -> Option<f64> {
-    let over = pts.iter().filter(|p| p.size_pct > cap).max_by(|a, b| a.crf.total_cmp(&b.crf))?;
-    let fit = pts.iter().filter(|p| p.size_pct <= cap && p.crf > over.crf).min_by(|a, b| a.crf.total_cmp(&b.crf))?;
-    if fit.crf - over.crf <= CRF_STEP + 1e-9 || fit.size_pct <= 0.0 {
+/// A CRF strictly inside the bracket, or None once the bracket is one step wide.
+fn next_probe(pts: &[Probe], floor: &Floor, cap: f64, lo: f64, hi: f64, last: bool) -> Option<f64> {
+    let go_up = |p: &Probe| floor.holds(p) || p.size_pct > cap;
+    // Every probe lies inside the bracket of its time, so sorted by CRF the two kinds never mix.
+    let mut by_crf = pts.to_vec();
+    by_crf.sort_by(|x, y| x.crf.total_cmp(&y.crf));
+    let split = by_crf.iter().filter(|p| go_up(p)).count();
+    let below = split.checked_sub(1).map(|i| by_crf[i]);
+    let above = by_crf.get(split).copied();
+    // An end no probe has set yet lies one step outside the range, which leaves the bound a candidate.
+    let a = below.map_or(lo - CRF_STEP, |p| p.crf);
+    let b = above.map_or(hi + CRF_STEP, |p| p.crf);
+    if b - a <= CRF_STEP + 1e-9 {
         return None;
     }
-    let t = (over.size_pct.ln() - cap.ln()) / (over.size_pct.ln() - fit.size_pct.ln());
-    let crf = over.crf + t.clamp(0.0, 1.0) * (fit.crf - over.crf);
-    Some(((crf / CRF_STEP).ceil() * CRF_STEP).clamp(over.crf + CRF_STEP, fit.crf))
-}
 
-/// Linear (secant) estimate of the CRF that yields `target` JOD.
-fn interpolate_crf(pts: &[Probe], target: f64) -> f64 {
-    if pts.len() == 1 {
-        return pts[0].crf + (pts[0].jod - target) / NOMINAL_JOD_PER_CRF;
-    }
-    let (a, b) = bracket_pts(pts, target);
-    if (a.1 - b.1).abs() < 1e-6 {
-        return (a.0 + b.0) / 2.0;
-    }
-    let slope = (b.0 - a.0) / (b.1 - a.1);
-    a.0 + slope * (target - a.1)
-}
+    // The line through the two bracket ends, else through the two probes nearest the open end.
+    let i = split.saturating_sub(1).min(by_crf.len().saturating_sub(2));
+    let (p, q) = (by_crf[i], by_crf.get(i + 1));
+    let open_end = if above.is_none() { f64::INFINITY } else { f64::NEG_INFINITY };
+    let crossing = |value: fn(&Probe) -> f64, nominal: f64, target: f64| {
+        let slope = q.map_or(nominal, |q| (value(q) - value(&p)) / (q.crf - p.crf));
+        if slope < -1e-9 { p.crf + (target - value(&p)) / slope } else { open_end }
+    };
+    // Each estimate rounds toward the side its constraint can pick.
+    let c_floor = match (below, above) {
+        (Some(l), _) if !floor.holds(&l) => None,
+        // Banding failed the upper end, and it has no slope to follow.
+        (_, Some(u)) if u.jod >= floor.jod => Some((a + b) / 2.0),
+        _ => Some((crossing(|p| p.jod, -NOMINAL_JOD_PER_CRF, floor.jod) / CRF_STEP + 1e-6).floor() * CRF_STEP),
+    };
+    let c_cap = below.filter(|l| l.size_pct > cap).map(|_| {
+        (crossing(|p| p.size_pct.ln(), -NOMINAL_LN_SIZE_PER_CRF, cap.ln()) / CRF_STEP - 1e-6).ceil() * CRF_STEP
+    });
+    let guess = c_floor.into_iter().chain(c_cap).fold(f64::NEG_INFINITY, f64::max);
 
-/// One point at/above and one below the target, else the two closest in JOD.
-fn bracket_pts(pts: &[Probe], target: f64) -> ((f64, f64), (f64, f64)) {
-    let above = pts.iter().filter(|p| p.jod >= target).min_by(|x, y| x.jod.total_cmp(&y.jod));
-    let below = pts.iter().filter(|p| p.jod <  target).max_by(|x, y| x.jod.total_cmp(&y.jod));
-    if let (Some(a), Some(b)) = (above, below) {
-        return ((a.crf, a.jod), (b.crf, b.jod));
-    }
-    let mut sorted: Vec<&Probe> = pts.iter().collect();
-    sorted.sort_by(|x, y| (x.jod - target).abs().total_cmp(&(y.jod - target).abs()));
-    ((sorted[0].crf, sorted[0].jod), (sorted[1].crf, sorted[1].jod))
+    // A bracket with both ends probed may lag bisection by one probe, except on the last one.
+    let room = ((hi - lo + 2.0 * CRF_STEP) / 2f64.powi(pts.len() as i32 - 1)).max((b - a) / 2.0);
+    let paced = below.is_some() && above.is_some() && !last;
+    let next = if paced { guess.clamp(b - room, a + room) } else { guess };
+    Some(round_to_step(next, a + CRF_STEP, b - CRF_STEP))
 }
 
 fn round_to_step(v: f64, lo: f64, hi: f64) -> f64 {
     ((v / CRF_STEP).round() * CRF_STEP).clamp(lo, hi)
-}
-
-fn already(pts: &[Probe], crf: f64) -> bool {
-    pts.iter().any(|p| (p.crf - crf).abs() < 1e-9)
 }
 
 /// Highest CRF holding both, else the floor gives way to the cap, else the smallest chunk.
@@ -604,44 +602,32 @@ impl Drop for Cleanup {
 /// A driver reset, a GPU in use by something else or a lost device all come back on their
 /// own; anything else FFVship reports is a verdict on the file.
 fn gpu_error(what: &str, status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
-    // Vship throws these as C++ exceptions, so they arrive with an abort.
-    const RECOVERABLE: &[&str] = &[
-        "VK_ERROR_DEVICE_LOST",
-        "VK_ERROR_OUT_OF_DEVICE_MEMORY",
-        "VK_ERROR_INITIALIZATION_FAILED",
-        "out of device memory",
-        "no Vulkan device",
-        "OutOfVRAM",
-        "BadDeviceArgument",
-        "failed to create vulkan instance",
-        "failed to find GPUs with Vulkan support",
-        "failed to create logical device",
-        "Failed to initialize VmaAllocator",
-        "Failed to Allocate Memory",
-        "device lost",
-        "Failed to synchronize to Fence",
-        "Failed to Create Fence",
-        "Failed to reset Fence",
-        "Failed to create semaphore",
-        "command pool",
-        "command buffers",
-        "BadDeviceCode",
-        "Failed to Submit commandBuffer",
-        "Pinned buffer allocation failed",
-        "OutOfRAM",
-    ];
     let err = crate::ext::tool_error(what, status, stderr);
-    if err.downcast_ref::<crate::job::Transient>().is_none()
-        && RECOVERABLE.iter().any(|m| stderr.contains(m))
-    {
+    if err.downcast_ref::<crate::job::Transient>().is_none() && gpu_side(stderr) {
         return err.context(crate::job::Transient);
     }
     err
 }
 
+/// Vship reports as `VshipException`, then `<type>: <text>`. The other types are about the input.
+fn gpu_side(stderr: &str) -> bool {
+    const DEVICE: [&str; 7] = [
+        "OutOfVRAM", "OutOfRAM", "InternalError", "DeviceCountError", "NoDeviceDetected", "BadDeviceArgument",
+        "BadDeviceCode",
+    ];
+    let mut lines = stderr.lines();
+    let reported = std::iter::from_fn(|| {
+        lines.find(|l| l.trim() == "VshipException")?;
+        lines.next()
+    })
+    .any(|l| l.split_once(':').is_some_and(|(kind, _)| DEVICE.contains(&kind.trim())));
+    // FFVship's own check of the buffer it asks Vship for, which names no type.
+    reported || stderr.contains("Pinned buffer allocation failed")
+}
+
 /// FFVship crops the source to match and resizes on a mismatch; its last cumulative
 /// JOD is the chunk score.
-fn measure(m: &MeasureOpts) -> Result<f64> {
+fn measure(m: &MeasureOpts) -> Result<(f64, Option<(Reading, Reading)>)> {
     let json = m.work_dir.join(format!("cvvdp_{}.json", m.tag));
     let _cleanup = Cleanup(vec![json.clone()]);
 
@@ -658,7 +644,8 @@ fn measure(m: &MeasureOpts) -> Result<f64> {
         return Err(gpu_error("FFVship", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
 
-    parse_cvvdp(&read_metric_json(&json, "FFVship")?)
+    let jod = parse_cvvdp(&read_metric_json(&json, "FFVship")?)?;
+    Ok((jod, parse_readings(&String::from_utf8_lossy(&out.stdout))))
 }
 
 /// Everything but the file paths. The probe holds the chunk's frames from 0, and avet's
@@ -671,6 +658,7 @@ fn measure_args(m: &MeasureOpts) -> Vec<String> {
         "--displayModel".into(), DisplayModel::KEY.to_string(),
         "--displayConfig".into(), m.display_model.config_json(),
         "--gpu-id".into(), m.gpu_id.to_string(),
+        "--verbose".into(),
     ]);
     if let Some(c) = m.crop {
         args.extend([
@@ -796,9 +784,13 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     .collect();
     if !failed.is_empty() {
         let transient = failed.iter().any(|e| e.downcast_ref::<crate::job::Transient>().is_some());
+        let killed = failed.iter().any(|e| e.downcast_ref::<crate::job::Killed>().is_some());
         let mut err = anyhow!("{}", failed.iter().map(|e| e.root_cause().to_string()).collect::<Vec<_>>().join("\n"));
         if let Some(cause) = encode::feed_failure(write_res) {
             err = err.context(format!("reading the source failed first: {cause}"));
+        }
+        if killed {
+            err = err.context(crate::job::Killed);
         }
         return Err(if transient { err.context(crate::job::Transient) } else { err });
     }
@@ -895,8 +887,14 @@ mod tests {
         let (aborted, exit1) = (std::process::ExitStatus::from_raw(6), std::process::ExitStatus::from_raw(1 << 8));
         let transient = |status, stderr| gpu_error("FFVship", status, stderr).downcast_ref::<crate::job::Transient>().is_some();
 
-        assert!(transient(aborted, "terminate called after throwing an instance of 'std::runtime_error'\n  what():  Failed to Create Fence"));
-        assert!(transient(exit1, "BadDeviceCode: Vship was unable to run a simple GPU Kernel."));
+        assert!(transient(exit1, "VshipException\nInternalError: A GPU Call failed inside Vship. This may be due to a bad environment but is likely due to a bug in Vship.\n - At line 923 of src/Vulkan/butter/../util/vulkanHelper.hpp\nDetail: failed to create vulkan instance!\n"));
+        assert!(transient(exit1, "VshipException\nBadDeviceArgument: Vship received a bad gpu_id argument either you specified a number >= to your gpu count, either it was negative\n - At line 184 of src/Vulkan/butter/../util/vulkanDeviceManager.hpp\n"));
+        assert!(transient(aborted, "VshipException\nOutOfVRAM: Vship was not able to perform GPU memory allocation. (Advice) Reduce or Set numStream argument\n - At line 43 of csf.hpp\n\nAssertion failed!\nMessage    : Failed to initialize GPU Worker"));
+        assert!(transient(aborted, "Assertion failed!\nMessage    : Pinned buffer allocation failed in allocate_external_rgb_buffer"));
+
+        assert!(!transient(aborted, "VshipException\nBadDisplayModel: Vship was not able to find a corresponding model as specified.\n - At line 1 of x.hpp\nDetail: Display Unset, wrong display name?\n\nAssertion failed!\nMessage    : Failed to initialize GPU Worker"));
+        assert!(!transient(aborted, "VshipException\nBadJson: Vship failed to parse the json\nDetail: OutOfVRAM: not a type here"));
+        assert!(!transient(aborted, "Assertion failed!\nExpression : indexer != nullptr\nMessage    : FFMS2: Failed to create indexer for file [nope.ivf] - Can't open 'nope.ivf'"));
         assert!(!transient(exit1, "Error: could not open the distorted file"));
     }
 
@@ -959,19 +957,20 @@ mod tests {
     fn the_first_hardware_gpu_that_passes_is_chosen() {
         let all = |_: u32| true;
         let devices = list_gpus("GPU 0: NVIDIA GeForce RTX 5060 Ti\nGPU 1: llvmpipe (LLVM 22.1.7, 256 bits)\n");
-        assert_eq!(first_usable(&devices, all).map(|g| g.id), Some(0));
+        assert_eq!(first_usable(&devices, false, all).map(|g| g.id), Some(0));
 
         let devices = list_gpus("GPU 0: llvmpipe (LLVM 22.1.7)\nGPU 1: Intel Graphics\n");
-        assert_eq!(first_usable(&devices, all).map(|g| g.id), Some(1));
+        assert_eq!(first_usable(&devices, false, all).map(|g| g.id), Some(1));
+        assert_eq!(first_usable(&devices, true, all).map(|g| g.id), Some(0));
 
         let devices = list_gpus("GPU 0: Intel(R) HD Graphics 4600 (HSW GT2)\nGPU 1: AMD Radeon RX 7600 (RADV NAVI33)\n");
-        assert_eq!(first_usable(&devices, |id| id != 0).map(|g| g.id), Some(1));
-        assert!(first_usable(&devices, |_| false).is_none());
+        assert_eq!(first_usable(&devices, false, |id| id != 0).map(|g| g.id), Some(1));
+        assert!(first_usable(&devices, false, |_| false).is_none());
 
         let software = list_gpus("GPU 0: llvmpipe (LLVM 22.1.7)\n");
         assert_eq!(software.len(), 1);
         assert!(!software[0].hardware);
-        assert!(first_usable(&software, all).is_none());
+        assert!(first_usable(&software, false, all).is_none());
     }
 
     #[test]
@@ -991,6 +990,45 @@ mod tests {
         assert!(parse_cvvdp("[]").is_err());
     }
 
+    /// As FFVship prints it, between its index and progress lines.
+    fn verbose(source: [&str; 5], encoded: [&str; 5]) -> String {
+        let block = |r: [&str; 5]| format!(
+            "Source Size: 320x240\nSample Type: Uint8_t\nColor Family: {}\nRange: {}\nSubsampling (log): 1x1\nChroma Location: Left\n\
+             YUV Matrix: {}\nTransfer Function: {}\nPrimaries: {}\n", r[0], r[1], r[2], r[3], r[4]
+        );
+        format!(
+            "Successfully read index from [src.ffindex]\n-------Source-Colorspace--------\n{}------Encoded-Colorspace--------\n{}[|||] 12/12",
+            block(source), block(encoded)
+        )
+    }
+
+    #[test]
+    fn ffvships_own_reading_of_the_two_files_is_what_is_compared() {
+        let sdr = ["YUV", "Limited", "BT709", "BT709", "BT709"];
+        let (source, encoded) = parse_readings(&verbose(sdr, sdr)).unwrap();
+        assert!(source.same_picture(&encoded) && !source.hdr());
+        assert_eq!(source.to_string(), "YUV Limited range, matrix BT709, transfer BT709, primaries BT709");
+
+        // A crop under 650 rows, read with the other matrix; full range lost on the way.
+        for other in [["YUV", "Limited", "BT470_BG", "BT470_BG", "BT470_BG"], ["YUV", "Full", "BT709", "BT709", "BT709"]] {
+            let (source, encoded) = parse_readings(&verbose(sdr, other)).unwrap();
+            assert!(!source.same_picture(&encoded), "{other:?}");
+        }
+
+        let pq = ["YUV", "Limited", "BT2020_NCL", "PQ", "BT2020"];
+        assert!(parse_readings(&verbose(pq, pq)).unwrap().0.hdr());
+        assert!(parse_readings(&verbose(["YUV", "Limited", "BT2020_NCL", "HLG", "BT2020"], pq)).unwrap().0.hdr());
+
+        let rgb = ["RGB", "Full", "RGB", "sRGB", "BT709"];
+        let (source, encoded) = parse_readings(&verbose(rgb, ["YUV", "Limited", "BT470_BG", "sRGB", "BT709"])).unwrap();
+        assert!(source.same_picture(&encoded));
+        let (source, encoded) = parse_readings(&verbose(rgb, ["YUV", "Limited", "BT470_BG", "BT470_BG", "BT470_BG"])).unwrap();
+        assert!(!source.same_picture(&encoded));
+
+        assert_eq!(parse_readings("Successfully read index from [src.ffindex]\n[|||] 12/12"), None);
+        assert_eq!(parse_readings("-------Source-Colorspace--------\nRange: Limited\n"), None);
+    }
+
     #[test]
     fn round_to_step_quarters_and_clamps() {
         assert_eq!(round_to_step(28.1, 14.0, 45.0), 28.0);
@@ -1007,12 +1045,6 @@ mod tests {
         assert_eq!(chunk_size_pct(200, &cum, 3, 3), 50.0);
         assert_eq!(chunk_size_pct(300, &cum, 0, 99), 0.0);
         assert_eq!(chunk_size_pct(300, &[], 0, 2), 0.0);
-    }
-
-    #[test]
-    fn interpolate_hits_crossing() {
-        let pts = vec![p(30.0, 9.7, 0.0), p(40.0, 9.3, 0.0)];
-        assert!((interpolate_crf(&pts, 9.5) - 35.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1119,19 +1151,32 @@ mod tests {
     #[test]
     fn banding_alone_bisects_instead_of_following_the_jod_secant() {
         let floor = cambi(Some(5.0), None);
+        let next = |pts: &[Probe]| next_probe(pts, &floor, 90.0, 1.0, 70.0, false);
 
-        // JOD is far above the floor, so its secant would step one grid point at a time.
-        assert_eq!(next_crf(&[pc(35.0, 9.88, 8.0, 8.0)], &floor, 1.0, 70.0, false), Some(18.0));
-
+        // JOD is far above the floor, so its line would step one grid point at a time.
         let pts = [pc(20.0, 9.90, 4.5, 0.5), pc(40.0, 9.85, 7.0, 3.0)];
-        assert_eq!(next_crf(&pts, &floor, 1.0, 70.0, false), Some(30.0));
+        assert_eq!(next(&pts), Some(30.0));
+        let pts = [pc(20.0, 9.90, 4.5, 0.5), pc(30.0, 9.88, 4.8, 0.8), pc(40.0, 9.85, 7.0, 3.0)];
+        assert_eq!(next(&pts), Some(35.0));
     }
 
     #[test]
-    fn a_jod_failure_still_interpolates_with_a_cambi_floor_set() {
-        // Both bracket ends are clean on CAMBI, so the JOD secant places 35.
+    fn a_jod_failure_still_follows_the_line_with_a_cambi_floor_set() {
+        // Both bracket ends are clean on CAMBI, so the JOD line places 35.
         let pts = vec![pc(30.0, 9.7, 0.2, 0.2), pc(40.0, 9.3, 0.6, 0.6)];
-        assert_eq!(next_crf(&pts, &cambi(Some(5.0), Some(1.0)), 1.0, 70.0, false), Some(35.0));
+        assert_eq!(next_probe(&pts, &cambi(Some(5.0), Some(1.0)), 90.0, 1.0, 70.0, false), Some(35.0));
+    }
+
+    #[test]
+    fn a_probe_over_the_cap_is_followed_up_where_its_size_is_estimated_to_fit() {
+        // 120 % at 30 and 60 % at 40 cross 90 % a little above 34; the floor is out of reach either way.
+        let pts = vec![p(30.0, 9.2, 120.0), p(40.0, 9.0, 60.0)];
+        assert_eq!(next_probe(&pts, &jod(9.5), 90.0, 1.0, 70.0, false), Some(34.25));
+        // Where the floor holds further up than the cap asks for, the floor places the probe.
+        let pts = vec![p(30.0, 9.9, 120.0), p(40.0, 9.2, 60.0)];
+        assert_eq!(next_probe(&pts, &jod(9.5), 90.0, 1.0, 70.0, false), Some(35.5));
+        let pts = vec![p(34.0, 9.9, 91.0), p(34.25, 9.2, 89.0)];
+        assert_eq!(next_probe(&pts, &jod(9.5), 90.0, 1.0, 70.0, false), None);
     }
 
     #[test]
@@ -1182,7 +1227,7 @@ mod tests {
         mut curve: impl FnMut(f64) -> Probe,
     ) -> (SolveResult, Vec<f64>) {
         let mut calls = Vec::new();
-        let res = solve(cfg, seed, &mut |crf, _| {
+        let res = solve(cfg, seed, &mut |crf| {
             calls.push(crf);
             Ok(curve(crf))
         })
@@ -1278,7 +1323,7 @@ mod tests {
 
     #[test]
     fn a_probe_that_fails_ends_the_search_instead_of_settling_on_a_guess() {
-        let res = solve(&tq(9.5), 30.0, &mut |crf, _| {
+        let res = solve(&tq(9.5), 30.0, &mut |crf| {
             if crf == 30.0 { Ok(p(crf, 9.2, 50.0)) } else { bail!("FFVship failed") }
         });
         let Err(err) = res else { panic!("a failed measurement was swallowed") };
@@ -1303,6 +1348,99 @@ mod tests {
         let cfg = TargetQualityConfig { max_probes: 6, ..tq(9.5) };
         let (_, calls) = run_solve(&cfg, 35.0, |crf| p(crf, 9.5 + (crf * 7.0).sin() * 0.3, 80.0));
         check_probes(&cfg, &calls);
+    }
+
+    /// JOD by CRF of five 4K HDR clips, measured with svt-av1-hdr and joined by straight lines.
+    const MEASURED: [(&str, [(f64, f64); 6]); 5] = [
+        ("desert", [(1.0, 9.995), (20.0, 9.8594), (30.0, 9.7502), (40.0, 9.5082), (50.0, 9.2802), (60.0, 9.0419)]),
+        ("interrogation", [(1.0, 9.995), (20.0, 9.9177), (30.0, 9.869), (40.0, 9.8173), (50.0, 9.7694), (60.0, 9.6111)]),
+        ("space", [(1.0, 9.995), (20.0, 9.7862), (30.0, 9.7437), (40.0, 9.6834), (50.0, 9.6355), (60.0, 9.3644)]),
+        ("village", [(1.0, 9.995), (20.0, 9.9427), (30.0, 9.9162), (40.0, 9.8553), (50.0, 9.7599), (60.0, 9.533)]),
+        ("wreck", [(1.0, 9.995), (20.0, 9.9325), (30.0, 9.8755), (40.0, 9.8277), (50.0, 9.7378), (60.0, 9.4905)]),
+    ];
+
+    fn measured_jod(curve: &[(f64, f64)], crf: f64) -> f64 {
+        let i = curve.windows(2).position(|w| crf <= w[1].0).unwrap_or(curve.len() - 2);
+        let ((c0, j0), (c1, j1)) = (curve[i], curve[i + 1]);
+        j0 + (crf - c0) / (c1 - c0) * (j1 - j0)
+    }
+
+    /// The answer a search with a probe at every CRF would give.
+    fn oracle(cfg: &TargetQualityConfig, jod: impl Fn(f64) -> f64, size: impl Fn(f64) -> f64) -> f64 {
+        let grid = (cfg.min_crf * 4..=cfg.max_crf * 4).map(|i| f64::from(i) * CRF_STEP);
+        let fits: Vec<f64> = grid.filter(|&c| size(c) <= cfg.max_encoded_percent).collect();
+        let both = fits.iter().copied().filter(|&c| jod(c) >= cfg.jod).reduce(f64::max);
+        both.or(fits.first().copied()).unwrap_or(cfg.max_crf as f64)
+    }
+
+    #[test]
+    fn the_measured_curves_are_solved_no_worse_than_before() {
+        let (mut runs, mut near, mut probes, mut worst) = (0u32, 0u32, 0usize, 0f64);
+        for (name, curve) in &MEASURED {
+            let jod = |crf: f64| measured_jod(curve, crf);
+            for (size_at_seed, slope) in [(0.0, 0.0), (60.0, 0.04), (90.0, 0.07), (120.0, 0.1), (180.0, 0.07), (300.0, 0.04)] {
+                let size = |crf: f64| size_at_seed * (-slope * (crf - 35.5)).exp();
+                for seed in [30.0, 35.5, 45.0] {
+                    for target in (0..=12).map(|i| 9.3 + f64::from(i) * 0.05) {
+                        let cfg = tq(target);
+                        let (res, calls) = run_solve(&cfg, seed, |crf| p(crf, jod(crf), size(crf)));
+                        check_probes(&cfg, &calls);
+                        let gap = (res.crf - oracle(&cfg, jod, size)).abs();
+                        assert!(gap <= 9.0, "{name} at {target:.2} from {seed}, size {size_at_seed}/{slope}: crf {} via {calls:?}", res.crf);
+                        runs += 1;
+                        near += u32::from(gap <= 0.5);
+                        probes += calls.len();
+                        worst = worst.max(gap);
+                    }
+                }
+            }
+        }
+        // 79.2 % at 3.82 probes when this was written; a change may only move them the right way.
+        let (near, probes) = (f64::from(near) / f64::from(runs), probes as f64 / f64::from(runs));
+        assert!(near >= 0.79 && probes <= 3.85, "{:.1}% within half a CRF at {probes:.2} probes, worst {worst}", near * 100.0);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn the_search_keeps_to_budget_range_and_grid_on_any_curve(
+            (min_crf, max_crf) in (1u32..=40).prop_flat_map(|lo| (Just(lo), lo + 1..=70)),
+            (min_probes, max_probes) in (2u32..=5).prop_flat_map(|lo| (Just(lo), lo..=lo + 5)),
+            jod in 5.0f64..9.99,
+            tolerance in 0.0f64..0.2,
+            max_encoded_percent in 1.0f64..150.0,
+            max_cambi in prop::option::weighted(0.3, 0.0f64..10.0),
+            max_cambi_diff in prop::option::weighted(0.3, 0.0f64..5.0),
+            seed in -10.0f64..80.0,
+            (slope, noise, wave, decay, banding) in (0.0f64..0.1, 0.0f64..0.5, prop::option::weighted(0.2, 0.0f64..3.0), 0.02f64..0.1, 0.0f64..0.2),
+            mut state in 1u64..u64::MAX,
+        ) {
+            let cfg = TargetQualityConfig {
+                jod, min_crf, max_crf, min_probes, max_probes, tolerance, max_encoded_percent, max_cambi, max_cambi_diff,
+                ..Default::default()
+            };
+            let floor = Floor::new(&cfg);
+            let mut random = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64
+            };
+            // Readings scatter and need not fall with the CRF; the size does.
+            let (res, calls) = run_solve(&cfg, seed, |crf| {
+                let jod = 10.0 - slope * crf - (random() - 0.5) * noise + wave.map_or(0.0, |w| (crf * w).sin() * 0.4);
+                let cambi = floor.needs_cambi(jod).then(|| Cambi { score: crf * banding + random(), diff: crf * banding / 2.0 + random() / 2.0 });
+                Probe { crf, jod, cambi, size_pct: 400.0 * (-decay * crf).exp() }
+            });
+            check_probes(&cfg, &calls);
+            prop_assert!(calls.iter().any(|crf| (crf - res.crf).abs() < 1e-9), "settled on an unprobed crf {}: {calls:?}", res.crf);
+
+            let over_cap = |crf: f64| 400.0 * (-decay * crf).exp() > max_encoded_percent;
+            for (i, crf) in calls.iter().enumerate() {
+                prop_assert!(!calls[..i].iter().any(|earlier| over_cap(*earlier) && crf < earlier), "probed below an over-cap crf: {calls:?}");
+            }
+        }
     }
 
     #[test]
@@ -1332,6 +1470,7 @@ mod tests {
         assert_eq!(pair(&plain, "--displayModel").as_deref(), Some(DisplayModel::KEY));
         assert!(pair(&plain, "--displayConfig").is_some_and(|c| c.contains("[1920,940]")));
         assert_eq!(pair(&plain, "--gpu-id").as_deref(), Some("1"));
+        assert!(plain.iter().any(|a| a == "--verbose"));
         assert!(!plain.iter().any(|a| a.starts_with("--crop")));
 
         let cropped = measure_args(&opts(Some(Crop { w: 1920, h: 800, x: 0, y: 140 })));

@@ -180,14 +180,23 @@ assert_log_contains    "avet.scale must be at least 64"
 # The profile is broken, not the file, so the next scan has to pick it up after the fix.
 assert_dir_not_exists  "$O/.avet_test"
 
-# a key or value only the encoder checks is retried, not marked failed
-I="$WORKDIR/13/in"; O="$WORKDIR/13/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\nprest = 6\n' > "$I/p/encode.toml"
-run_avet_timed "$I" "$O" 60 "job failed"
-assert_log_contains    "Error in configuration"
-assert_log_contains    "retrying on the next scan"
-assert_file_not_exists "$O/.avet_test/.failed"
+# a key or value only the encoder checks marks the file failed until encode.toml is edited
+for encoder in svt-av1 svt-av1-hdr; do
+    I="$WORKDIR/13-$encoder/in"; O="$WORKDIR/13-$encoder/out"; mkdir -p "$I/p" "$O"
+    cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+    printf 'encoder = "%s"\n[encoder_params]\npreset = 12\ncrf = 50\nprest = 6\n' "$encoder" > "$I/p/encode.toml"
+    run_avet_timed "$I" "$O" 60 "job failed"
+    assert_log_contains    "Error in configuration"
+    assert_file_exists     "$O/.avet_test/.failed"
+    assert_file_exists     "$O/.avet_test/failed.profile"
+    assert_file_not_exists "$O/test.mkv"
+    TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 15 "no jobs"
+    assert_log_contains    "permanently failed"
+    assert_log_contains    "or change encode.toml to retry"
+    printf 'encoder = "%s"\n[encoder_params]\npreset = 12\ncrf = 50\n' "$encoder" > "$I/p/encode.toml"
+    run_avet "$I" "$O" "$O/test.mkv" 120 || fail "$encoder: fixing the profile did not lift the marker"
+    assert_dir_not_exists  "$O/.avet_test"
+done
 
 # SvtAv1EncApp exits 0 on this one, and only its closed input shows it.
 I="$WORKDIR/14/in"; O="$WORKDIR/14/out"; mkdir -p "$I/p" "$O"
@@ -195,8 +204,14 @@ cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 99\ncrf = 50\n' > "$I/p/encode.toml"
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_log_contains    "EncoderMode must be in the range"
-assert_log_contains    "retrying on the next scan"
-assert_file_not_exists "$O/.avet_test/.failed"
+assert_file_exists     "$O/.avet_test/.failed"
+
+# a marker without the record of its profile, as written before there was one, stays
+rm -f "$O/.avet_test/failed.profile"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 15 "no jobs"
+assert_log_contains    "permanently failed"
+assert_file_not_exists "$O/test.mkv"
 
 I="$WORKDIR/15/in"; O="$WORKDIR/15/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
@@ -213,7 +228,16 @@ EOF
 run_avet_timed "$I" "$O" 120 "job failed"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "Option not found"
-assert_log_contains    "retrying on the next scan"
-assert_file_not_exists "$O/.avet_test/.failed"
+assert_file_exists     "$O/.avet_test/.failed"
+sed -i 's/compresion_level/compression_level/' "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "audio option: fixing the profile did not lift the marker"
+
+I="$WORKDIR/16/in"; O="$WORKDIR/16/out"; mkdir -p "$I/p" "$O"
+ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=16386x64:rate=24" -frames:v 24 \
+    -c:v ffv1 "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 120 "job failed"
+assert_log_contains    "Source Width must be less than or equal to 16384"
+assert_file_exists     "$O/.avet_test/.failed"
 
 test_done

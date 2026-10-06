@@ -135,7 +135,9 @@ fn wait_briefly(child: &mut std::process::Child) -> bool {
 /// Ctrl-C) and a full disk both clear on their own; a tool that crashed does not.
 pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -> anyhow::Error {
     let err = anyhow::anyhow!("{what} failed:\n{}", tail(message, 40));
-    if stopped_from_outside(status) || out_of_space(message) {
+    if stopped_from_outside(status) {
+        err.context(crate::job::Killed).context(crate::job::Transient)
+    } else if out_of_space(message) {
         err.context(crate::job::Transient)
     } else {
         err
@@ -156,6 +158,21 @@ fn out_of_space(message: &str) -> bool {
     ["No space left", "ENOSPC", "Disk quota exceeded", "EDQUOT"]
         .iter()
         .any(|m| message.contains(m))
+}
+
+/// mkvmerge words its messages in the user's language otherwise, and avet reads some of them.
+pub fn mkvmerge() -> Command {
+    let mut cmd = Command::new(external_bin("mkvmerge"));
+    cmd.args(["--ui-language", "en_US"]);
+    cmd
+}
+
+pub fn mkvmerge_output(cmd: &mut Command, secs: u64, what: &str) -> Result<Output> {
+    let out = output_with_timeout(cmd, secs, what)?;
+    if out.status.code().unwrap_or(2) >= 2 {
+        return Err(tool_error(what, out.status, &String::from_utf8_lossy(&out.stdout)));
+    }
+    Ok(out)
 }
 
 /// `Child::drop` does not wait, so a tool left behind by an early return stays a zombie.
@@ -253,6 +270,7 @@ mod tests {
         }
         let killed = tool_error("SvtAv1EncApp", std::process::ExitStatus::from_raw(9), "");
         assert!(killed.downcast_ref::<crate::job::Transient>().is_some(), "got: {killed:#}");
+        assert!(killed.context("chunk 00007").downcast_ref::<crate::job::Killed>().is_some());
     }
 
     #[test]
@@ -261,6 +279,7 @@ mod tests {
 
         let full = tool_error("ffmpeg", out.status, "av_interleaved_write_frame(): No space left on device");
         assert!(full.downcast_ref::<crate::job::Transient>().is_some(), "got: {full:#}");
+        assert!(full.downcast_ref::<crate::job::Killed>().is_none(), "got: {full:#}");
         let quota = tool_error("mkvmerge", out.status, "Error: Disk quota exceeded");
         assert!(quota.downcast_ref::<crate::job::Transient>().is_some(), "got: {quota:#}");
         let mkvmerge = tool_error("mkvmerge", out.status, "Error: An exception occurred when writing the \

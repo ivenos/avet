@@ -113,7 +113,12 @@ impl DoneFile {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 #[serde(untagged)]
 enum Solved {
-    Scored { crf: f64, jod: f64 },
+    Scored {
+        crf: f64,
+        jod: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        measured: Option<f64>,
+    },
     Crf(f64),
 }
 
@@ -135,7 +140,15 @@ impl CrfCache {
         })
     }
 
+    /// Of the finished chunk where that was measured, else of the probe.
     pub fn jod(&self, chunk_key: &str) -> Option<f64> {
+        match self.state.lock().unwrap().get(chunk_key) {
+            Some(Solved::Scored { jod, measured, .. }) => Some(measured.unwrap_or(*jod)),
+            _ => None,
+        }
+    }
+
+    pub fn probed(&self, chunk_key: &str) -> Option<f64> {
         match self.state.lock().unwrap().get(chunk_key) {
             Some(Solved::Scored { jod, .. }) => Some(*jod),
             _ => None,
@@ -143,9 +156,17 @@ impl CrfCache {
     }
 
     pub fn insert(&self, chunk_key: &str, crf: f64, jod: f64) -> Result<()> {
-        let solved = if jod.is_finite() { Solved::Scored { crf, jod } } else { Solved::Crf(crf) };
+        let solved = if jod.is_finite() { Solved::Scored { crf, jod, measured: None } } else { Solved::Crf(crf) };
         let mut state = self.state.lock().unwrap();
         state.insert(chunk_key.to_owned(), solved);
+        write_json_atomic(&self.path, &*state)
+    }
+
+    pub fn set_measured(&self, chunk_key: &str, jod: f64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        if let Some(Solved::Scored { measured, .. }) = state.get_mut(chunk_key) {
+            *measured = Some(jod);
+        }
         write_json_atomic(&self.path, &*state)
     }
 }
@@ -186,6 +207,8 @@ pub struct TempDir {
     pub fingerprint_path: PathBuf,
     pub source_id_path: PathBuf,
     pub failed_path: PathBuf,
+    pub failed_profile_path: PathBuf,
+    pub delivered_path: PathBuf,
     pub attempts_path: PathBuf,
     pub chunks_dir: PathBuf,
     pub crop_cache: PathBuf,
@@ -208,6 +231,8 @@ impl TempDir {
         let fingerprint_path = path.join("profile.fingerprint");
         let source_id_path   = path.join("source.path");
         let failed_path      = path.join(".failed");
+        let failed_profile_path = path.join("failed.profile");
+        let delivered_path   = path.join("delivered");
         let attempts_path    = path.join("attempts");
         let chunks_dir       = path.join("chunks");
         let crop_cache       = path.join("crop.cache");
@@ -220,7 +245,8 @@ impl TempDir {
         let hdr10plus_path   = path.join("hdr10plus.json");
         Self {
             path, index_path, scenes_path, done_path, tq_path,
-            fingerprint_path, source_id_path, failed_path, attempts_path, chunks_dir, crop_cache, interlace_cache,
+            fingerprint_path, source_id_path, failed_path, failed_profile_path, delivered_path, attempts_path,
+            chunks_dir, crop_cache, interlace_cache,
             tracks_path, remux_path, video_path, mux_path, timestamps_path, hdr10plus_path,
         }
     }
@@ -261,6 +287,60 @@ impl TempDir {
     pub fn source_unchanged(&self, source: &Path) -> bool {
         self.recorded_id().is_some_and(|id| source_id(source).is_ok_and(|now| now == id))
     }
+
+    /// A marker is a verdict on the source under one encode.toml; a marker without a record stays.
+    pub fn failed_under_another_profile(&self, encode_toml: &Path) -> bool {
+        let then = std::fs::read_to_string(&self.failed_profile_path).ok();
+        match (then, profile_id(encode_toml)) {
+            (Some(then), Some(now)) => then.trim() != now,
+            _ => false,
+        }
+    }
+
+    pub fn clear_failed(&self) {
+        let _ = std::fs::remove_file(&self.failed_path);
+        let _ = std::fs::remove_file(&self.failed_profile_path);
+    }
+
+    /// The output of this very source is in place and the source not yet archived.
+    pub fn awaits_archiving(&self, source: &Path) -> bool {
+        self.delivered_path.exists() && self.source_unchanged(source)
+    }
+
+    /// From here on the temp dir only says that the source still has to be archived.
+    pub fn mark_delivered(&self, keep_temp: bool) -> Result<()> {
+        write_atomic(&self.delivered_path, if keep_temp { b"keep" } else { b"" })?;
+        if keep_temp {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&self.path).with_context(|| format!("read {}", self.path.display()))? {
+            let entry = entry.with_context(|| format!("read {}", self.path.display()))?;
+            let path = entry.path();
+            if path == self.delivered_path || path == self.source_id_path {
+                continue;
+            }
+            let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed.with_context(|| format!("remove {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn finish_delivery(&self) -> Result<()> {
+        if std::fs::read(&self.delivered_path).is_ok_and(|kept| kept == b"keep") {
+            return std::fs::remove_file(&self.delivered_path)
+                .with_context(|| format!("remove {}", self.delivered_path.display()));
+        }
+        std::fs::remove_dir_all(&self.path).with_context(|| format!("remove {}", self.path.display()))
+    }
+}
+
+pub fn profile_id(encode_toml: &Path) -> Option<String> {
+    let raw = std::fs::read(encode_toml).ok()?;
+    Some(format!("{:016x}", stable_hash(&String::from_utf8_lossy(&raw))))
 }
 
 /// The size below the path, so a file replaced under the same name is a new job. Not the
@@ -357,6 +437,37 @@ mod tests {
     }
 
     #[test]
+    fn a_delivered_job_leaves_only_what_finishes_the_archiving() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("Film.mkv");
+        std::fs::write(&source, b"video").unwrap();
+
+        let temp = TempDir::for_video(dir.path(), "Film");
+        temp.claim_source(&source, "Film").unwrap();
+        std::fs::write(temp.chunk_path("00001"), b"chunk").unwrap();
+        std::fs::write(&temp.index_path, b"index").unwrap();
+        assert!(!temp.awaits_archiving(&source));
+
+        temp.mark_delivered(false).unwrap();
+        let mut left: Vec<_> = std::fs::read_dir(&temp.path).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, ["delivered", "source.path"]);
+        assert!(temp.awaits_archiving(&source));
+        std::fs::write(&source, b"a different video").unwrap();
+        assert!(!temp.awaits_archiving(&source));
+
+        temp.finish_delivery().unwrap();
+        assert!(!temp.path.exists());
+
+        temp.claim_source(&source, "Film").unwrap();
+        std::fs::write(temp.chunk_path("00001"), b"chunk").unwrap();
+        temp.mark_delivered(true).unwrap();
+        assert!(temp.chunk_path("00001").exists() && temp.awaits_archiving(&source));
+        temp.finish_delivery().unwrap();
+        assert!(temp.chunk_path("00001").exists() && !temp.delivered_path.exists());
+    }
+
+    #[test]
     fn a_long_name_still_gets_a_temp_dir_of_its_own() {
         assert_eq!(temp_dir_name("Film"), ".avet_Film");
         let long = "ü".repeat(125) + "x";
@@ -386,6 +497,12 @@ mod tests {
         assert_eq!(reloaded.jod("00001"), Some(9.512));
         assert_eq!((reloaded.get("00002"), reloaded.jod("00002")), (Some(31.0), None));
         assert_eq!(reloaded.get("00003"), None);
+
+        reloaded.set_measured("00001", 9.47).unwrap();
+        reloaded.set_measured("00002", 9.5).unwrap();
+        let again = CrfCache::load_or_create(&path).unwrap();
+        assert_eq!((again.get("00001"), again.jod("00001"), again.probed("00001")), (Some(28.25), Some(9.47), Some(9.512)));
+        assert_eq!((again.get("00002"), again.jod("00002")), (Some(31.0), None));
     }
 
     #[test]

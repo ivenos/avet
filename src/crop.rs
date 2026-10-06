@@ -12,17 +12,19 @@ pub fn detect(
     stem: &str,
     visible: Crop,
 ) -> Result<Option<String>> {
-    if cache_path.exists() {
-        let cached = std::fs::read_to_string(cache_path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if cached.is_empty() {
-            tracing::info!("[{stem}] auto-crop: no black bars (cached)");
-        } else {
-            tracing::info!("[{stem}] auto-crop: {cached} (cached)");
+    // Read as "no black bars", an unreadable cache would change the fingerprint and discard the chunks.
+    match std::fs::read_to_string(cache_path) {
+        Ok(cached) => {
+            let cached = cached.trim().to_string();
+            if cached.is_empty() {
+                tracing::info!("[{stem}] auto-crop: no black bars (cached)");
+            } else {
+                tracing::info!("[{stem}] auto-crop: {cached} (cached)");
+            }
+            return Ok(if cached.is_empty() { None } else { Some(cached) });
         }
-        return Ok(if cached.is_empty() { None } else { Some(cached) });
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("[{stem}] auto-crop: cannot read {} ({e}) - measuring again", cache_path.display()),
     }
 
     let (orig_w, orig_h) = (visible.w, visible.h);
@@ -183,6 +185,23 @@ mod tests {
         assert_eq!(classify(crop(640, 360, 100, 100), 1920, 1080), (None, false));
         assert_eq!(classify(crop(1920, 1072, 0, 4), 1920, 1080), (None, true));
         assert_eq!(classify(None, 1920, 1080), (None, true));
+    }
+
+    #[test]
+    fn a_cache_that_cannot_be_read_is_not_read_as_no_black_bars() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let whole = Crop { w: 640, h: 360, x: 0, y: 0 };
+        let cached = |path: &Path| detect(Path::new("/nonexistent/film.mkv"), 60.0, path, "film", whole);
+
+        let cache = dir.path().join("crop.cache");
+        std::fs::write(&cache, "crop=640:276:0:42\n").unwrap();
+        assert_eq!(cached(&cache).unwrap().as_deref(), Some("crop=640:276:0:42"));
+        std::fs::write(&cache, "").unwrap();
+        assert_eq!(cached(&cache).unwrap(), None);
+
+        let unreadable = dir.path().join("as-a-dir");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(cached(&unreadable).is_err(), "an unreadable cache passed as 'no black bars'");
     }
 
     #[test]

@@ -82,12 +82,12 @@ output/
 
 - Supported extensions: `mkv`, `mp4`, `mov`, `avi`, `ts`, `m2ts`, `flv`, `webm`, `m4v`. Only the first video track is encoded.
 - Video is encoded as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row. Interlaced video is deinterlaced with bwdif at its frame rate, when the stream is flagged interlaced and ffmpeg's idet finds its frames combed. Aspect ratio, rotation, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
-- A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing.
+- A file whose output already exists is skipped. A file that is still being copied in is picked up once it stops growing. A source that could not be archived after its encode is archived on a later scan.
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
 - Output files keep the source's name with `.mkv`, so queued files that would end up at the same output path, such as `film.mkv` and `film.mp4`, wait until one is renamed.
 - Work in progress lives in `.avet_<name>/` next to the output file. Delete that folder to encode a file from scratch.
-- A failure that can clear on its own, such as a typo in the profile, a timeout or a full disk, is retried on the next scan. Any other failure writes a `.failed` file into that folder, and the video is skipped until you delete it.
-- A file during which avet itself dies three times in a row, as a crash in FFMS2 or the out-of-memory killer would cause, gets a `.failed` file as well. A stop by signal does not count.
+- A failure that can clear on its own, such as an `encode.toml` that cannot be read, a timeout or a full disk, is retried: on the next scan, then at doubling intervals of up to 60 scans, and at once after a change of `encode.toml`. Any other failure, such as an option the encoder refuses, writes a `.failed` file into that folder, and the video is skipped until you delete it or change `encode.toml`.
+- A file during which avet dies or one of its tools is killed three times in a row, as a crash in FFMS2 or the out-of-memory killer would cause, gets a `.failed` file as well. A stop by signal does not count.
 - On `SIGTERM`, `SIGINT` or `SIGHUP` avet exits after the current file, on a second signal at once. A file stopped mid-encode, e.g. by Ctrl-C in a terminal or by `docker stop` after its timeout, resumes from its last finished chunk.
 - A second avet on the same output folder waits until the first one stops. It checks the `.avet.lock` file there.
 - The `avet started` log line names the version, and `avet --version` prints it.
@@ -165,6 +165,7 @@ jod = 9.5
 - Needs `avet.video = "encode"` and cannot be combined with `avet.scale`.
 - `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged. The sizes are those of the probes; a finished chunk that still comes out larger is logged too. Where the source's packet sizes cannot be read, the limit is off for that file.
 - CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both are compared with the 95th percentile of a chunk's frames and are measured without film grain.
+- A finished chunk is scored again. The `done` line gives the lowest of these scores, and a chunk that came out under `jod` although its probe held it is logged as a warning.
 - If no probe holds every limit, the chunk uses the lowest probed CRF under `max_encoded_percent`, or the smallest probe if none is under it.
 
 ### `[avet]`

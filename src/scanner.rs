@@ -10,6 +10,8 @@ pub struct Job {
     pub encode_toml: PathBuf,
     pub source_file: PathBuf,
     pub rel_dir: PathBuf,
+    /// Encoded on an earlier run that was stopped before it archived the source.
+    pub delivered: bool,
 }
 
 impl Job {
@@ -50,10 +52,13 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
         }
 
         for (source_file, rel_dir) in find_video_files(&profile_dir) {
-            let job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir };
+            let mut job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir, delivered: false };
             if output_exists(&job.output_dir(output_dir), &job.source_file) {
-                report(format!("[{}] skip: output exists for {}", job.stem(), job.source_file.display()));
-                continue;
+                job.delivered = TempDir::for_video(&job.output_dir(output_dir), job.stem()).awaits_archiving(&job.source_file);
+                if !job.delivered {
+                    report(format!("[{}] skip: output exists for {}", job.stem(), job.source_file.display()));
+                    continue;
+                }
             }
             jobs.push(job);
         }
@@ -63,9 +68,11 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
     // side run, and its `claim_source` wipes the temp dir the marker lives in.
     let jobs = drop_name_collisions(jobs)
         .into_iter()
-        .filter(|job| match failed_marker(&job.output_dir(output_dir), &job.source_file) {
+        .filter(|job| match failed_marker(&job.output_dir(output_dir), job) {
             Some(marker) => {
-                report(format!("[{}] permanently failed - delete {} to retry", job.stem(), marker.display()));
+                report(format!(
+                    "[{}] permanently failed - delete {} or change encode.toml to retry", job.stem(), marker.display()
+                ));
                 false
             }
             None => true,
@@ -109,7 +116,7 @@ fn drop_name_collisions(jobs: Vec<Job>) -> Vec<Job> {
         .collect()
 }
 
-fn report(message: String) {
+pub fn report(message: String) {
     static SEEN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
     if SEEN.lock().map_or(true, |mut seen| seen.insert(message.clone())) {
         tracing::warn!("{message}");
@@ -195,15 +202,15 @@ fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
     }
 }
 
-/// The marker path when this exact source is locked out; a stem twin does not block.
-fn failed_marker(output_dir: &Path, source_file: &Path) -> Option<PathBuf> {
-    let stem = source_file.file_stem().and_then(|s| s.to_str())?;
+/// The marker path when this exact source is locked out under this encode.toml; a stem twin does not block.
+fn failed_marker(output_dir: &Path, job: &Job) -> Option<PathBuf> {
+    let stem = job.source_file.file_stem().and_then(|s| s.to_str())?;
     let temp = TempDir::for_video(output_dir, stem);
-    if !temp.failed_path.exists() {
+    if !temp.failed_path.exists() || temp.failed_under_another_profile(&job.encode_toml) {
         return None;
     }
     match temp.recorded_id() {
-        Some(prev) if crate::resume::source_id(source_file).is_ok_and(|id| id != prev) => None,
+        Some(prev) if crate::resume::source_id(&job.source_file).is_ok_and(|id| id != prev) => None,
         _ => Some(temp.failed_path),
     }
 }
@@ -280,6 +287,28 @@ mod tests {
 
         let jobs = scan(&input, &output).unwrap();
         assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn a_source_left_behind_by_a_stop_after_its_output_is_queued_for_archiving() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        let source = profile.join("film.mkv");
+        fs::write(&source, b"fake").unwrap();
+        fs::write(output.join("film.mkv"), b"done").unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 0);
+
+        let temp = crate::resume::TempDir::for_video(&output, "film");
+        temp.claim_source(&source, "film").unwrap();
+        temp.mark_delivered(false).unwrap();
+        let jobs = scan(&input, &output).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(jobs[0].delivered);
+
+        fs::write(&source, b"another video").unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 0);
     }
 
     #[test]
@@ -485,6 +514,26 @@ mod tests {
 
         // Marker left over from a different file that had the same name: not blocked.
         fs::write(&temp.source_id_path, "/somewhere/else/film.mkv").unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_file_is_tried_again_once_its_profile_is_edited() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join("p");
+        fs::create_dir_all(&profile).unwrap();
+        let toml = profile.join("encode.toml");
+        fs::write(&toml, b"encoder = \"svt-av1\"\n[encoder_params]\nprest = 6\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+
+        let temp = crate::resume::TempDir::for_video(&output, "film");
+        temp.create_dirs().unwrap();
+        fs::write(&temp.failed_path, b"Unprocessed tokens: --prest").unwrap();
+        fs::write(&temp.source_id_path, crate::resume::source_id(&profile.join("film.mkv")).unwrap()).unwrap();
+        fs::write(&temp.failed_profile_path, crate::resume::profile_id(&toml).unwrap()).unwrap();
+        assert_eq!(scan(&input, &output).unwrap().len(), 0);
+
+        fs::write(&toml, b"encoder = \"svt-av1\"\n[encoder_params]\npreset = 6\n").unwrap();
         assert_eq!(scan(&input, &output).unwrap().len(), 1);
     }
 }

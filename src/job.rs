@@ -18,6 +18,7 @@ use crate::workers;
 pub struct JobContext {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub poll: std::time::Duration,
 }
 
 /// Clears on its own or on the user's next edit: retried, never marked `.failed`.
@@ -26,11 +27,23 @@ pub struct Transient;
 
 impl std::fmt::Display for Transient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "retrying on the next scan")
+        write!(f, "clears on its own")
     }
 }
 
 impl std::error::Error for Transient {}
+
+/// A tool ended by a signal from outside, which is also how the out-of-memory killer ends one.
+#[derive(Debug)]
+pub struct Killed;
+
+impl std::fmt::Display for Killed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped from outside")
+    }
+}
+
+impl std::error::Error for Killed {}
 
 /// `downcast_ref`, not `chain()`: a `.context()` value is not a link there. ENOSPC too.
 pub fn is_transient(err: &anyhow::Error) -> bool {
@@ -52,7 +65,8 @@ struct WorkerCtx<'a> {
     temp: &'a TempDir,
     config: &'a Config,
     opts: &'a EncodeOptions,
-    tq_display_model: Option<target_quality::DisplayModel>,
+    tq_display_model: Option<Mutex<target_quality::DisplayModel>>,
+    source_rgb: bool,
     tq_gpu_id: Option<u32>,
     gpu_lock: Mutex<()>,
     source_width: u32,
@@ -85,7 +99,10 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let stem = job.stem();
 
-    wait_for_stable(&job.source_file, stem)?;
+    if !wait_for_stable(&job.source_file, stem)? {
+        tracing::info!("[{stem}] still being written - looking again on the next scan");
+        return Ok(());
+    }
     if ATTEMPTS.stopping() {
         tracing::info!("[{stem}] not starting, avet is stopping");
         return Ok(());
@@ -93,12 +110,31 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     temp.claim_source(&job.source_file, stem)?;
-    let _attempt = ATTEMPTS.start(&temp)?;
+    temp.clear_failed();
+    let _ = std::fs::remove_file(&temp.delivered_path);
+    let mut attempt = ATTEMPTS.start(&temp)?;
 
-    if config.avet.video == VideoMode::Copy {
-        return run_copy(job, ctx, &config, stem, &temp, started);
+    let result = if config.avet.video == VideoMode::Copy {
+        run_copy(job, ctx, &config, stem, &temp, started)
+    } else {
+        run_encode(job, ctx, &config, gpu, stem, &temp, started)
+    };
+    // The out-of-memory killer takes the encoder rather than avet, and again on every retry.
+    if result.as_ref().is_err_and(|e| e.downcast_ref::<Killed>().is_some()) {
+        attempt.counts = true;
     }
+    result
+}
 
+fn run_encode(
+    job: &Job,
+    ctx: &JobContext,
+    config: &Config,
+    gpu: Option<target_quality::GpuSelection>,
+    stem: &str,
+    temp: &TempDir,
+    started: Instant,
+) -> Result<()> {
     let audio_plan = audio::plan(&job.source_file, &config.audio)?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
@@ -106,7 +142,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     audio::check_encoders(&job.source_file, &audio_plan)?;
     let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
 
-    let video_file = frame_accurate_source(&job.source_file, &temp, stem)?;
+    let video_file = frame_accurate_source(&job.source_file, temp, stem)?;
     let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
     let video_info = video_source.info.clone();
     let source_timestamps = video_source.timestamps_ms()?;
@@ -148,6 +184,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let hdr = crate::hdr::detect(&job.source_file)?;
     let chroma_center = hdr.chroma_center;
+    let source_rgb = hdr.rgb;
     let hevc_source = hdr.codec_name == "hevc";
     // FFMS2 hands out the RPU of HEVC only, and AV1 has a form for profiles 7 and 8 only.
     let dv = config.avet.dv && hevc_source && hdr.dv_profile.is_none_or(|p| matches!(p, 7 | 8));
@@ -265,7 +302,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         hdr10plus_frames,
     };
 
-    let merged_args = encode::merged_encoder_args(&config, &encode_opts);
+    let merged_args = encode::merged_encoder_args(config, &encode_opts);
 
     // So a resumed encode never mixes chunks from different settings. The crf is left out
     // under target_quality: there it only seeds the probe search and never reaches a chunk.
@@ -278,7 +315,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         config.encoder, &fingerprint_args, &encode_opts, &config.scene_detection,
         config.target_quality.as_ref(),
     );
-    invalidate_stale_cache(&temp, &fingerprint, stem)?;
+    invalidate_stale_cache(temp, &fingerprint, stem)?;
 
     // Non-empty, not just present: the fingerprint keeps a crash leftover alive forever.
     let have_scenes = std::fs::metadata(&temp.scenes_path).is_ok_and(|m| m.len() > 0);
@@ -358,7 +395,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         .crop
         .map(|c| (c.w, c.h))
         .unwrap_or((video_info.width, video_info.height));
-    let (tq_display_model, tq_gpu_id, crf_cache): (Option<target_quality::DisplayModel>, Option<u32>, Option<CrfCache>) =
+    let (tq_display_model, tq_gpu_id, crf_cache): (Option<Mutex<target_quality::DisplayModel>>, Option<u32>, Option<CrfCache>) =
         if let (Some(tq), Some(gpu)) = (&config.target_quality, &gpu) {
             let display_model = target_quality::display_model_for(
                 reference_width, reference_height, (video_info.width, video_info.height), &encode_opts.hdr_args,
@@ -378,7 +415,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
                 tracing::info!("[{stem}] target quality: crf in encoder_params used only as a probe seed");
             }
             sweep_probe_leftovers(&temp.path, stem);
-            (Some(display_model), Some(gpu.id), Some(CrfCache::load_or_create(&temp.tq_path)?))
+            (Some(Mutex::new(display_model)), Some(gpu.id), Some(CrfCache::load_or_create(&temp.tq_path)?))
         } else {
             (None, None, None)
         };
@@ -403,10 +440,11 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let wctx = WorkerCtx {
         source: &video_file,
-        temp: &temp,
-        config: &config,
+        temp,
+        config,
         opts: &encode_opts,
         tq_display_model,
+        source_rgb,
         tq_gpu_id,
         gpu_lock: Mutex::new(()),
         source_width: video_info.width,
@@ -493,7 +531,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         remove: true,
         expected_frames: Some(total_frames),
     };
-    finalize(job, ctx, &config, &temp, &audio_plan, &subtitles, video, started, &details)
+    finalize(job, ctx, config, temp, &audio_plan, &subtitles, video, started, &details)
 }
 
 fn tq_summary(cache: &CrfCache, scenes: &[SceneEntry]) -> Option<String> {
@@ -646,16 +684,13 @@ fn finalize(
     // The archived source can sit on another file system, whose rename may reach the disk first.
     sync_dir(&final_output);
 
-    // Delivered: the scanner short-circuits on "output exists", so nothing below retries. The
-    // temp dir goes first, before a copy to another disk that a stop could cut short.
-    if !config.avet.keep_temp
-        && let Err(e) = std::fs::remove_dir_all(&temp.path)
-    {
-        tracing::error!("[{stem}] could not remove temp dir {}: {e:#}", temp.path.display());
+    // Delivered. The chunks go first, before a copy to another disk that a stop could cut
+    // short; what is left of the temp dir has the next scan finish the archiving.
+    if let Err(e) = temp.mark_delivered(config.avet.keep_temp) {
+        tracing::error!("[{stem}] could not clear temp dir {}: {e:#}", temp.path.display());
     }
-
-    if let Err(e) = archive_source(job, ctx) {
-        tracing::error!("[{stem}] output is in place, but archiving the source failed: {e:#}");
+    if let Err(e) = archive_source(job, ctx).and_then(|()| temp.finish_delivery()) {
+        tracing::error!("[{stem}] output is in place, but archiving the source failed - trying again on the next scan: {e:#}");
     }
 
     if output_bytes > source_bytes {
@@ -785,7 +820,7 @@ fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str, from_tracks: 
     let videos = muxed.iter().take_while(|t| *t == "video").count();
 
     let realigned = temp.path.join("realigned.mkv");
-    let mut cmd = std::process::Command::new(crate::ext::external_bin("mkvmerge"));
+    let mut cmd = crate::ext::mkvmerge();
     cmd.arg("-o").arg(&realigned);
     for id in 0..muxed.len() {
         let extracted_track = from_tracks.map_or(id >= videos && id < videos + extracted, |f| f.get(id) == Some(&true));
@@ -796,10 +831,7 @@ fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str, from_tracks: 
         cmd.arg("--chapter-sync").arg(others_ms.to_string());
     }
     cmd.arg(&temp.mux_path);
-    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(&temp.mux_path, 3600), "mkvmerge")?;
-    if out.status.code().unwrap_or(2) >= 2 {
-        return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
-    }
+    crate::ext::mkvmerge_output(&mut cmd, crate::ext::whole_file_timeout(&temp.mux_path, 3600), "mkvmerge")?;
     std::fs::rename(&realigned, &temp.mux_path)
         .with_context(|| format!("move {} to {}", realigned.display(), temp.mux_path.display()))
 }
@@ -833,14 +865,18 @@ fn track_types(path: &Path) -> Result<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct Track { #[serde(rename = "type")] track_type: String }
 
-    let mut cmd = std::process::Command::new(crate::ext::external_bin("mkvmerge"));
+    let mut cmd = crate::ext::mkvmerge();
     cmd.args(["--identify", "--identification-format", "json"]).arg(path);
-    let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
-    if out.status.code().unwrap_or(2) >= 2 {
-        return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
-    }
+    let out = crate::ext::mkvmerge_output(&mut cmd, 300, "mkvmerge identify")?;
     let identify: Identify = serde_json::from_slice(&out.stdout).context("parse mkvmerge identify output")?;
     Ok(identify.tracks.into_iter().map(|t| t.track_type).collect())
+}
+
+pub fn finish_delivery(job: &Job, ctx: &JobContext) -> Result<()> {
+    let stem = job.stem();
+    tracing::info!("[{stem}] already encoded - archiving the source");
+    archive_source(job, ctx)?;
+    TempDir::for_video(&job.output_dir(&ctx.output_dir), stem).finish_delivery()
 }
 
 /// Never over an existing file: two seasons can each have an `Episode 01.mkv`.
@@ -925,10 +961,20 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
     w.done.mark_done(&chunk_key, scene_frames, size_bytes)?;
 
-    if let Some(tq) = &w.config.target_quality {
+    if let (Some(ctx), Some(cache)) = (probe_context(w), &w.crf_cache) {
         let pct = target_quality::chunk_size_pct(size_bytes, &w.source_byte_index, scene.start_frame, scene.end_frame);
-        if pct > tq.max_encoded_percent {
+        if pct > ctx.tq.max_encoded_percent {
             tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.0}% of the source, over max_encoded_percent", w.stem);
+        }
+        if let Some(jod) = target_quality::measure_final(&ctx, scene, &w.temp.chunk_path(&chunk_key)) {
+            let probed = cache.probed(&chunk_key);
+            cache.set_measured(&chunk_key, jod)?;
+            if jod < ctx.tq.jod && probed.is_some_and(|p| p >= ctx.tq.jod) {
+                tracing::warn!(
+                    "[{}] chunk {chunk_key} came out at JOD {jod:.3}, under the floor of {} its probe held with {:.3}",
+                    w.stem, ctx.tq.jod, probed.unwrap_or(jod)
+                );
+            }
         }
     }
 
@@ -949,10 +995,21 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     Ok(())
 }
 
+/// None when target quality is off.
+fn probe_context<'a>(w: &'a WorkerCtx) -> Option<target_quality::ProbeContext<'a>> {
+    Some(target_quality::ProbeContext {
+        source: w.source, index: &w.temp.index_path, temp_dir: &w.temp.path,
+        config: w.config, opts: w.opts, tq: w.config.target_quality.as_ref()?,
+        display_model: w.tq_display_model.as_ref()?, source_rgb: w.source_rgb,
+        gpu_id: w.tq_gpu_id?, gpu_lock: &w.gpu_lock,
+        source_width: w.source_width, source_height: w.source_height,
+        n_threads: w.threads_per_worker, stem: w.stem, source_byte_index: &w.source_byte_index,
+    })
+}
+
 /// Cached CRF, else probe-and-solve; None when target quality is off.
 fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
-    let (Some(tq), Some(display_model), Some(gpu_id), Some(cache)) =
-        (&w.config.target_quality, w.tq_display_model, w.tq_gpu_id, &w.crf_cache) else {
+    let (Some(ctx), Some(cache)) = (probe_context(w), &w.crf_cache) else {
         return Ok(None);
     };
     if let Some(c) = cache.get(chunk_key) {
@@ -960,13 +1017,6 @@ fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Opt
         return Ok(Some(c));
     }
 
-    let ctx = target_quality::ProbeContext {
-        source: w.source, index: &w.temp.index_path, temp_dir: &w.temp.path,
-        config: w.config, opts: w.opts, tq,
-        display_model, gpu_id, gpu_lock: &w.gpu_lock,
-        source_width: w.source_width, source_height: w.source_height,
-        n_threads: w.threads_per_worker, stem: w.stem, source_byte_index: &w.source_byte_index,
-    };
     let res = target_quality::solve_chunk_crf(&ctx, scene)?;
 
     cache.insert(chunk_key, res.crf, res.jod)?;
@@ -994,6 +1044,48 @@ pub struct Attempts(Mutex<AttemptState>);
 
 pub static ATTEMPTS: Attempts = Attempts::new();
 
+/// When a job that failed for a reason that clears on its own is tried again: a poll interval
+/// later, then two, then four, at most `MAX_RETRY_POLLS`. An edit of encode.toml ends the wait.
+pub struct Retries(Mutex<std::collections::BTreeMap<PathBuf, Retry>>);
+
+pub static RETRIES: Retries = Retries(Mutex::new(std::collections::BTreeMap::new()));
+
+const MAX_RETRY_POLLS: u32 = 60;
+
+struct Retry {
+    failures: u32,
+    due: Instant,
+    profile: Option<String>,
+}
+
+impl Retries {
+    fn state(&self) -> MutexGuard<'_, std::collections::BTreeMap<PathBuf, Retry>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn due(&self, job: &Job) -> bool {
+        self.due_at(job, Instant::now())
+    }
+
+    fn due_at(&self, job: &Job, now: Instant) -> bool {
+        self.state()
+            .get(&job.source_file)
+            .is_none_or(|r| now >= r.due || r.profile != crate::resume::profile_id(&job.encode_toml))
+    }
+
+    fn failed(&self, job: &Job, profile: Option<&str>, poll: std::time::Duration, now: Instant) -> std::time::Duration {
+        let mut state = self.state();
+        let before = state.get(&job.source_file).filter(|r| r.profile.as_deref() == profile).map_or(0, |r| r.failures);
+        let wait = poll * (1u32 << before.min(6)).min(MAX_RETRY_POLLS);
+        state.insert(job.source_file.clone(), Retry { failures: before + 1, due: now + wait, profile: profile.map(str::to_owned) });
+        wait
+    }
+
+    pub fn clear(&self, job: &Job) {
+        self.state().remove(&job.source_file);
+    }
+}
+
 struct AttemptState {
     stopping: bool,
     /// The running job's counter file and its value before this start.
@@ -1003,6 +1095,7 @@ struct AttemptState {
 struct Attempt<'a> {
     attempts: &'a Attempts,
     path: PathBuf,
+    counts: bool,
 }
 
 impl Attempts {
@@ -1022,9 +1115,9 @@ impl Attempts {
             // Deleting .failed has to give the file a fresh start.
             let _ = std::fs::remove_file(&path);
             bail!(
-                "avet stopped {before} times in a row while working on this file, without finishing \
-                 or failing it. Something in the job takes the whole process down, such as a crash \
-                 in FFMS2 or the out-of-memory killer; the log before each restart shows how far it got."
+                "avet or one of its tools was stopped {before} times in a row while working on this \
+                 file, without finishing or failing it. Something takes the job down, such as a crash \
+                 in FFMS2 or the out-of-memory killer; the log before each stop shows how far it got."
             );
         }
         if !state.stopping {
@@ -1032,7 +1125,7 @@ impl Attempts {
                 .context("count the start of the job")?;
             state.current = Some((path.clone(), before));
         }
-        Ok(Attempt { attempts: self, path })
+        Ok(Attempt { attempts: self, path, counts: false })
     }
 
     fn stopping(&self) -> bool {
@@ -1053,20 +1146,33 @@ impl Drop for Attempt<'_> {
     fn drop(&mut self) {
         let mut state = self.attempts.state();
         state.current = None;
-        let _ = std::fs::remove_file(&self.path);
+        // Ctrl-C reaches the tools of a terminal's process group along with avet.
+        if !self.counts || state.stopping {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
-pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Error, shutting_down: bool) {
+pub fn handle_failure(
+    job: &Job,
+    ctx: &JobContext,
+    stem: &str,
+    err: &anyhow::Error,
+    shutting_down: bool,
+    profile: Option<&str>,
+) {
     let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     // A source replaced or gone mid-job is no verdict on the file now in its place.
     let source_moved = !job.source_file.exists() || (temp.recorded_id().is_some() && !temp.source_unchanged(&job.source_file));
 
     // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
     if shutting_down || source_moved || is_transient(err) {
-        tracing::error!("[{stem}] job failed - retrying on the next scan\n{err:#}");
+        let wait = if shutting_down { ctx.poll } else { RETRIES.failed(job, profile, ctx.poll, Instant::now()) };
+        let when = if wait > ctx.poll { format!("in {}", format_duration(wait.as_secs())) } else { "on the next scan".into() };
+        tracing::error!("[{stem}] job failed - retrying {when}\n{err:#}");
         return;
     }
+    RETRIES.clear(job);
 
     if let Err(e) = temp.create_dirs() {
         tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
@@ -1077,6 +1183,12 @@ pub fn handle_failure(job: &Job, ctx: &JobContext, stem: &str, err: &anyhow::Err
             .and_then(|id| crate::resume::write_atomic(&temp.source_id_path, id.as_bytes()))
     {
         tracing::warn!("[{stem}] could not record source path: {e:#}");
+    }
+    let _ = std::fs::remove_file(&temp.failed_profile_path);
+    if let Some(profile) = profile
+        && let Err(e) = crate::resume::write_atomic(&temp.failed_profile_path, profile.as_bytes())
+    {
+        tracing::warn!("[{stem}] could not record the profile of the failure: {e:#}");
     }
     if let Err(e) = crate::resume::write_atomic(&temp.failed_path, format!("{err:#}").as_bytes()) {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
@@ -1217,24 +1329,29 @@ fn profile_fingerprint(
     scene_cfg: &crate::config::SceneDetectionConfig,
     tq: Option<&TargetQualityConfig>,
 ) -> String {
+    // Without `..`, so a new field has to be placed; the skipped ones are in `merged_args` or follow from the source.
+    let EncodeOptions {
+        hdr_args: _, keyint: _, chroma_loc: _,
+        scale, crop, deinterlace, fps_num, fps_den, target_bit_depth, dynamic_hdr, hdr10plus_frames,
+    } = opts;
     let mut parts = vec![
         format!("{encoder:?}"),
         merged_args.join(" "),
-        format!("{:?}", opts.scale),
-        format!("{:?}", opts.crop),
-        format!("{:?}", opts.target_bit_depth),
+        format!("{scale:?}"),
+        format!("{crop:?}"),
+        format!("{target_bit_depth:?}"),
         // The chunks' IVF time base, which concat_ivf requires to match.
-        format!("fps={}/{}", opts.fps_num, opts.fps_den),
+        format!("fps={fps_num}/{fps_den}"),
         format!("scene_detection {}", changed_fields(scene_cfg)),
         tq.map_or_else(String::new, |tq| format!("target_quality {}", changed_fields(tq))),
     ];
-    if let Some(order) = opts.deinterlace {
+    if let Some(order) = deinterlace {
         parts.push(format!("deinterlace={order:?}"));
     }
-    if opts.dynamic_hdr.any() {
-        parts.push(format!("{:?}", opts.dynamic_hdr));
+    if dynamic_hdr.any() {
+        parts.push(format!("{dynamic_hdr:?}"));
         // The bitstream values and the decoder's fallback are not the same metadata.
-        parts.push(format!("hdr10plus_bitstream={}", opts.hdr10plus_frames.is_some()));
+        parts.push(format!("hdr10plus_bitstream={}", hdr10plus_frames.is_some()));
     }
     format!("{:016x}", crate::resume::stable_hash(&parts.join("|")))
 }
@@ -1305,7 +1422,7 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
 
 /// Size and mtime have to hold still for 3 s: NFS caches attributes for `acregmin`,
 /// so a shorter look at the size alone reads the same value twice.
-fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
+fn wait_for_stable(path: &Path, stem: &str) -> Result<bool> {
     const TIMEOUT_SECS: u64 = 300;
     const INTERVAL_SECS: u64 = 3;
 
@@ -1337,7 +1454,7 @@ fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
         if next == state {
             unchanged += 1;
             if unchanged >= STABLE_SAMPLES {
-                return Ok(());
+                return Ok(true);
             }
         } else {
             unchanged = 0;
@@ -1348,11 +1465,9 @@ fn wait_for_stable(path: &Path, stem: &str) -> Result<()> {
             state = next;
         }
 
+        // A copy that takes its time is no failure, and must not be made to wait like one.
         if std::time::Instant::now() >= deadline {
-            return Err(anyhow::Error::new(Transient).context(format!(
-                "still growing after {TIMEOUT_SECS}s: {}",
-                path.display()
-            )));
+            return Ok(false);
         }
     }
 }
@@ -1741,6 +1856,64 @@ mod failure_class_tests {
     }
 
     #[test]
+    fn a_tool_killed_three_times_in_a_row_locks_the_file_out() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let temp = TempDir::for_video(dir.path(), "film");
+        temp.create_dirs().unwrap();
+        let attempts = Attempts::new();
+        let killed = |attempts: &Attempts| {
+            let mut attempt = attempts.start(&temp).unwrap();
+            attempt.counts = true;
+        };
+
+        killed(&attempts);
+        killed(&attempts);
+        assert_eq!(counted(&temp).as_deref(), Some("2"));
+        drop(attempts.start(&temp).unwrap());
+        assert_eq!(counted(&temp), None);
+
+        for _ in 0..3 {
+            killed(&attempts);
+        }
+        let Err(err) = attempts.start(&temp) else { panic!("a fourth start was let through") };
+        assert!(format!("{err:#}").contains("stopped 3 times in a row"), "got: {err:#}");
+        assert!(!is_transient(&err), "got: {err:#}");
+
+        let attempts = Attempts::new();
+        let mut attempt = attempts.start(&temp).unwrap();
+        attempts.stop_requested();
+        attempt.counts = true;
+        drop(attempt);
+        assert_eq!(counted(&temp), None);
+    }
+
+    #[test]
+    fn a_failure_that_keeps_coming_back_is_tried_at_growing_intervals() {
+        use std::time::Duration;
+        let dir = tempfile::TempDir::new().unwrap();
+        let toml = dir.path().join("encode.toml");
+        std::fs::write(&toml, "encoder = \"svt-av1\"\n").unwrap();
+        let job = Job { encode_toml: toml.clone(), source_file: dir.path().join("film.mkv"), rel_dir: PathBuf::new(), delivered: false };
+        let retries = Retries(Mutex::new(std::collections::BTreeMap::new()));
+        let (poll, start) = (Duration::from_secs(60), Instant::now());
+        let profile = crate::resume::profile_id(&toml);
+
+        assert!(retries.due_at(&job, start));
+        let waits: Vec<u64> = (0..9).map(|_| retries.failed(&job, profile.as_deref(), poll, start).as_secs() / 60).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+        assert!(!retries.due_at(&job, start + Duration::from_secs(59 * 60)));
+        assert!(retries.due_at(&job, start + Duration::from_secs(60 * 60)));
+
+        std::fs::write(&toml, "encoder = \"svt-av1-hdr\"\n").unwrap();
+        assert!(retries.due_at(&job, start));
+        let fixed = crate::resume::profile_id(&toml);
+        assert_eq!(retries.failed(&job, fixed.as_deref(), poll, start), poll);
+
+        retries.clear(&job);
+        assert!(retries.due_at(&job, start));
+    }
+
+    #[test]
     fn an_ordinary_failure_is_not_transient() {
         let err = Err::<(), _>(anyhow::anyhow!("encoder failed"))
             .context("chunk 00007")
@@ -1752,6 +1925,8 @@ mod failure_class_tests {
 #[cfg(test)]
 mod output_param_tests {
     use super::*;
+
+    const POLL: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn packets(json: &str) -> Vec<Pkt> {
         serde_json::from_str::<Packets>(json).unwrap().packets
@@ -1975,11 +2150,12 @@ mod output_param_tests {
         std::fs::write(season.join("Episode 01.mkv"), b"e1").unwrap();
         std::fs::write(season.join("Episode 02.mkv"), b"e2").unwrap();
 
-        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output") };
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
         let job = |name: &str| Job {
             encode_toml: profile.join("encode.toml"),
             source_file: season.join(name),
             rel_dir: PathBuf::from("Show/Season 1"),
+            delivered: false,
         };
 
         archive_source(&job("Episode 01.mkv"), &ctx).unwrap();
@@ -1990,6 +2166,25 @@ mod output_param_tests {
         assert!(profile.is_dir());
         let archived = ctx.input_dir.join("processed/Show/Season 1");
         assert_eq!(std::fs::read(archived.join("Episode 02.mkv")).unwrap(), b"e2");
+    }
+
+    #[test]
+    fn the_archiving_a_stop_cut_short_is_finished_on_a_later_scan() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("input").join("p");
+        std::fs::create_dir_all(&profile).unwrap();
+        let source = profile.join("film.mkv");
+        std::fs::write(&source, b"video").unwrap();
+
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
+        let job = Job { encode_toml: profile.join("encode.toml"), source_file: source.clone(), rel_dir: PathBuf::new(), delivered: true };
+        let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film");
+        temp.claim_source(&source, "film").unwrap();
+        temp.mark_delivered(false).unwrap();
+
+        finish_delivery(&job, &ctx).unwrap();
+        assert_eq!(std::fs::read(ctx.input_dir.join("processed").join("film.mkv")).unwrap(), b"video");
+        assert!(!source.exists() && !temp.path.exists());
     }
 
     #[test]
@@ -2036,25 +2231,56 @@ mod output_param_tests {
         std::fs::create_dir_all(&profile).unwrap();
         std::fs::write(profile.join("film.mkv"), b"data").unwrap();
 
-        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output") };
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
         let job = Job {
             encode_toml: profile.join("encode.toml"),
             source_file: profile.join("film.mkv"),
             rel_dir: PathBuf::new(),
+            delivered: false,
         };
         let marker = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film").failed_path;
 
         // A stop mid-job is no verdict on the file.
         let err = anyhow::anyhow!("encoder exited with status 1");
-        handle_failure(&job, &ctx, "film", &err, true);
+        handle_failure(&job, &ctx, "film", &err, true, None);
         assert!(!marker.exists(), "a shutdown wrote a failure marker");
 
-        handle_failure(&job, &ctx, "film", &anyhow::Error::new(Transient).context("ffprobe timed out"), false);
+        handle_failure(&job, &ctx, "film", &anyhow::Error::new(Transient).context("ffprobe timed out"), false, None);
         assert!(!marker.exists(), "a transient failure wrote a failure marker");
 
-        handle_failure(&job, &ctx, "film", &err, false);
+        handle_failure(&job, &ctx, "film", &err, false, None);
         assert!(marker.exists(), "a real failure wrote no marker");
         assert!(std::fs::read_to_string(&marker).unwrap().contains("status 1"));
+    }
+
+    #[test]
+    fn a_marker_holds_until_the_profile_it_was_written_under_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let profile = dir.path().join("input").join("p");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("film.mkv"), b"data").unwrap();
+        let toml = profile.join("encode.toml");
+        std::fs::write(&toml, "encoder = \"svt-av1\"\n[encoder_params]\nprest = 6\n").unwrap();
+
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
+        let job = Job { encode_toml: toml.clone(), source_file: profile.join("film.mkv"), rel_dir: PathBuf::new(), delivered: false };
+        let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film");
+
+        let ran_under = crate::resume::profile_id(&toml);
+        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("Unprocessed tokens: --prest"), false, ran_under.as_deref());
+        assert!(temp.failed_path.exists());
+        assert!(!temp.failed_under_another_profile(&toml), "the marker does not hold under its own profile");
+
+        std::fs::write(&toml, "encoder = \"svt-av1\"\n[encoder_params]\npreset = 6\n").unwrap();
+        assert!(temp.failed_under_another_profile(&toml), "the fix of the profile did not lift the marker");
+
+        // A marker from before the record existed, or one the profile could not be read for, stays.
+        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("no video track found"), false, None);
+        assert!(temp.failed_path.exists() && !temp.failed_profile_path.exists());
+        assert!(!temp.failed_under_another_profile(&toml));
+
+        temp.clear_failed();
+        assert!(!temp.failed_path.exists());
     }
 
     #[test]
@@ -2065,14 +2291,14 @@ mod output_param_tests {
         let source = profile.join("film.mkv");
         std::fs::write(&source, b"first").unwrap();
 
-        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output") };
-        let job = Job { encode_toml: profile.join("encode.toml"), source_file: source.clone(), rel_dir: PathBuf::new() };
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
+        let job = Job { encode_toml: profile.join("encode.toml"), source_file: source.clone(), rel_dir: PathBuf::new(), delivered: false };
         let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film");
         temp.claim_source(&source, "film").unwrap();
         let claimed = temp.recorded_id();
 
         std::fs::write(&source, b"a longer replacement").unwrap();
-        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("the index does not match the source file"), false);
+        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("the index does not match the source file"), false, None);
         assert!(!temp.failed_path.exists(), "the replacement was locked out");
         assert_eq!(temp.recorded_id(), claimed);
     }

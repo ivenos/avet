@@ -670,9 +670,7 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
                 "audio track {}: codec is required when mode = encode", track.audio_index
             ))?;
             if audio_encoders().is_some_and(|known| !known.contains(codec)) {
-                return Err(anyhow::Error::new(crate::job::Transient).context(format!(
-                    "audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index
-                )));
+                anyhow::bail!("audio track {}: ffmpeg has no encoder '{codec}'", track.audio_index);
             }
             if span.is_none() {
                 span = Some(lenient(source_span(source_file), track.audio_index)?.flatten());
@@ -831,7 +829,7 @@ pub fn extract(
         &mut cmd, crate::ext::whole_file_timeout(source_file, 7200), "ffmpeg track extraction",
     )?;
     if !out.status.success() {
-        return Err(extraction_error(out.status, &String::from_utf8_lossy(&out.stderr)));
+        return Err(crate::ext::tool_error("ffmpeg track extraction", out.status, &String::from_utf8_lossy(&out.stderr)));
     }
 
     Ok(())
@@ -890,39 +888,10 @@ pub fn check_encoders(source_file: &Path, plan: &AudioPlan) -> Result<()> {
     cmd.args(["-f", "null", "-"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg audio encoder check")?;
     if !out.status.success() {
-        let err = extraction_error(out.status, &String::from_utf8_lossy(&out.stderr))
-            .context("try the audio encoders on the first second");
-        // ffmpeg words a refused option value and a track the encoder cannot take alike.
-        if !crate::job::is_transient(&err) && !encoders_open_on_stereo(&tracks)? {
-            return Err(err.context(crate::job::Transient));
-        }
-        return Err(err);
+        return Err(crate::ext::tool_error("ffmpeg track extraction", out.status, &String::from_utf8_lossy(&out.stderr))
+            .context("try the audio encoders on the first second"));
     }
     Ok(())
-}
-
-fn encoders_open_on_stereo(tracks: &[&PlannedTrack]) -> Result<bool> {
-    let mut cmd = Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-t", "1", "-i", "anullsrc=r=48000:cl=stereo"]);
-    for (out_idx, t) in tracks.iter().enumerate() {
-        let Action::Encode { codec, options, .. } = &t.action else { continue };
-        cmd.args(["-map", "0:a"]).args([format!("-c:a:{out_idx}"), codec.clone()]);
-        for (k, v) in options {
-            cmd.args([format!("-{k}:a:{out_idx}"), v.clone()]);
-        }
-    }
-    cmd.args(["-f", "null", "-"]);
-    Ok(crate::ext::output_with_timeout(&mut cmd, 120, "ffmpeg audio encoder check on silence")?.status.success())
-}
-
-fn extraction_error(status: std::process::ExitStatus, stderr: &str) -> anyhow::Error {
-    let err = crate::ext::tool_error("ffmpeg track extraction", status, stderr);
-    let profile_errors = ["Option not found", "Error applying encoder options", "experimental codecs are not enabled"];
-    if profile_errors.iter().any(|m| stderr.contains(m)) {
-        err.context(crate::job::Transient)
-    } else {
-        err
-    }
 }
 
 /// BCP 47 tags by kind and ffprobe index; ffmpeg keeps ISO 639-2 only, pt-BR becomes por.
@@ -952,36 +921,37 @@ impl Languages {
         #[derive(Deserialize)]
         struct Track { #[serde(rename = "type")] kind: String, #[serde(default)] properties: Props }
         #[derive(Deserialize, Default)]
-        struct Props { language: Option<String>, language_ietf: Option<String> }
+        struct Props { number: Option<u64>, language: Option<String>, language_ietf: Option<String> }
         #[derive(Deserialize)]
         struct Probe { #[serde(default)] streams: Vec<Stream> }
         #[derive(Deserialize)]
-        struct Stream { #[serde(default)] codec_type: String, #[serde(default)] tags: Tags }
+        struct Stream { #[serde(default)] codec_type: String, id: Option<String>, #[serde(default)] tags: Tags }
         #[derive(Deserialize, Default)]
         struct Tags { language: Option<String> }
 
-        let mut cmd = Command::new(external_bin("mkvmerge"));
+        let mut cmd = crate::ext::mkvmerge();
         cmd.args(["--identify", "--identification-format", "json"]).arg(source);
-        let out = crate::ext::output_with_timeout(&mut cmd, 300, "mkvmerge --identify")?;
-        if out.status.code().unwrap_or(2) >= 2 {
-            return Err(crate::ext::tool_error("mkvmerge identify", out.status, &String::from_utf8_lossy(&out.stdout)));
-        }
+        let out = crate::ext::mkvmerge_output(&mut cmd, 300, "mkvmerge identify")?;
         let identify: Identify = serde_json::from_slice(&out.stdout).context("parse mkvmerge identify output")?;
         let probe: Probe = crate::ext::ffprobe_json(
-            &["-v", "error", "-show_entries", "stream=codec_type:stream_tags=language", "-of", "json"],
+            &["-v", "error", "-show_entries", "stream=codec_type,id:stream_tags=language", "-of", "json"],
             source,
         )?;
 
         let tags = |ffprobe_kind: &str, mkvmerge_kind: &str| {
-            let ours: Vec<Option<&str>> = probe.streams.iter()
+            let ours: Vec<(Option<&str>, Option<&str>)> = probe.streams.iter()
                 .filter(|s| s.codec_type == ffprobe_kind)
-                .map(|s| s.tags.language.as_deref())
+                .map(|s| (s.id.as_deref(), s.tags.language.as_deref()))
                 .collect();
-            let theirs: Vec<&Props> = identify.tracks.iter()
+            let theirs: Vec<Twin> = identify.tracks.iter()
                 .filter(|t| t.kind == mkvmerge_kind)
-                .map(|t| &t.properties)
+                .map(|t| Twin {
+                    number: t.properties.number,
+                    legacy: t.properties.language.as_deref(),
+                    ietf: t.properties.language_ietf.as_deref(),
+                })
                 .collect();
-            matched_tags(&ours, &theirs.iter().map(|p| (p.language.as_deref(), p.language_ietf.as_deref())).collect::<Vec<_>>())
+            matched_tags(&ours, &theirs)
         };
         Ok(Self {
             video: identify.tracks.iter()
@@ -1006,24 +976,28 @@ impl Languages {
     }
 }
 
-/// A BCP 47 tag where both tools read the same code at the same place; a TS descriptor's `ger,eng` as `ger`.
-fn matched_tags(ffprobe: &[Option<&str>], mkvmerge: &[(Option<&str>, Option<&str>)]) -> Vec<Option<String>> {
+struct Twin<'a> {
+    number: Option<u64>,
+    legacy: Option<&'a str>,
+    ietf: Option<&'a str>,
+}
+
+/// Only what mkvmerge read for the same track, which `--language` cannot refuse.
+fn matched_tags(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &[Twin]) -> Vec<Option<String>> {
     let same_tracks = ffprobe.len() == mkvmerge.len();
     ffprobe.iter().enumerate()
-        .map(|(i, ours)| {
+        .map(|(i, (id, ours))| {
             let ours = (*ours)?;
             let first = ours.split(',').next()?.trim();
-            let theirs = mkvmerge.get(i).filter(|_| same_tracks);
-            if let Some((Some(legacy), Some(bcp47))) = theirs
-                && *legacy == first
-            {
-                return Some((*bcp47).to_owned());
+            let twin = match id.and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok()) {
+                Some(number) => mkvmerge.iter().find(|t| t.number == Some(number)),
+                None => mkvmerge.get(i).filter(|_| same_tracks),
+            }?;
+            let legacy = twin.legacy?;
+            if first != ours {
+                return Some(twin.ietf.unwrap_or(legacy).to_owned());
             }
-            // mkvmerge leaves out a descriptor code it does not know, and `--language` refuses it.
-            if first != ours && theirs.is_some_and(|(legacy, _)| legacy.is_none()) {
-                return None;
-            }
-            (first != ours).then(|| first.to_owned())
+            twin.ietf.filter(|_| crate::config::language_matches(first, legacy)).map(str::to_owned)
         })
         .collect()
 }
@@ -1054,7 +1028,7 @@ pub fn mux_final(
     let encoded = video_path.extension().is_some_and(|e| e == "ivf");
     let source_video = if encoded { probe_dispositions(source_file, "v:0") } else { Vec::new() };
 
-    let mut cmd = Command::new(external_bin("mkvmerge"));
+    let mut cmd = crate::ext::mkvmerge();
     cmd.arg("-o").arg(output_path);
 
     // Otherwise the tracks mkvmerge takes from the source end up behind all of ffmpeg's.
@@ -1105,6 +1079,15 @@ pub fn mux_final(
 
     cmd.args(["--no-video", "--no-track-tags"]);
     cmd.args(sources.source_args());
+    // mkvmerge flags a track default where the container has no such flag, as in MPEG-TS.
+    for (tracks, spec) in [(&sources.source_audio, "a"), (&sources.source_subtitles, "s")] {
+        let dispositions = if tracks.is_empty() { Vec::new() } else { probe_dispositions(source_file, spec) };
+        for (index, id) in tracks {
+            if let Some(stream) = dispositions.get(*index) {
+                cmd.args(stream.disposition.to_mkvmerge_flags(*id as usize));
+            }
+        }
+    }
     // A copied video keeps mkvmerge's timeline, and realign_copied_video moves these with it.
     if from_source && encoded {
         let shift = source_shift_ms + wrapped_ts_shift_ms(source_file, sources, output_path)?;
@@ -1117,10 +1100,7 @@ pub fn mux_final(
     }
     cmd.arg(source_file);
 
-    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source_file, 3600), "mkvmerge")?;
-    if out.status.code().unwrap_or(2) >= 2 {
-        return Err(crate::ext::tool_error("mkvmerge", out.status, &String::from_utf8_lossy(&out.stdout)));
-    }
+    let out = crate::ext::mkvmerge_output(&mut cmd, crate::ext::whole_file_timeout(source_file, 3600), "mkvmerge")?;
     // Exit 1 also covers "track skipped: unsupported codec", which silently drops a track.
     if out.status.code() == Some(1) {
         let msg = String::from_utf8_lossy(&out.stdout);
@@ -1236,15 +1216,15 @@ fn wrapped_ts_shift_ms(source: &Path, sources: &Sources, scratch: &Path) -> Resu
     }
 
     let taken = scratch.with_file_name("from_source.mkv");
-    let mut cmd = Command::new(external_bin("mkvmerge"));
+    let mut cmd = crate::ext::mkvmerge();
     cmd.arg("-o").arg(&taken)
         .args(["--no-video", "--no-attachments", "--no-chapters", "--no-global-tags", "--no-track-tags"])
         .args(sources.source_args())
         .arg(source);
-    let out = crate::ext::output_with_timeout(&mut cmd, crate::ext::whole_file_timeout(source, 3600), "mkvmerge")?;
-    if out.status.code().unwrap_or(2) >= 2 {
+    let out = crate::ext::mkvmerge_output(&mut cmd, crate::ext::whole_file_timeout(source, 3600), "mkvmerge probe of the source tracks");
+    if let Err(e) = out {
         let _ = std::fs::remove_file(&taken);
-        return Err(crate::ext::tool_error("mkvmerge probe of the source tracks", out.status, &String::from_utf8_lossy(&out.stdout)));
+        return Err(e);
     }
     let packets: Result<Packets> = crate::ext::ffprobe_json(
         &["-v", "error", "-read_intervals", "%+#8", "-show_entries", "packet=pts_time", "-of", "json"],
@@ -1296,22 +1276,41 @@ mod tests {
 
     #[test]
     fn a_bcp_47_tag_is_kept_only_where_both_tools_agree_on_the_track() {
-        let theirs = [(Some("por"), Some("pt-BR")), (Some("por"), Some("pt-PT")), (Some("eng"), Some("en"))];
+        let twin = |number, legacy, ietf| Twin { number, legacy, ietf };
+        let by_place = |tracks: &[(Option<&'static str>, Option<&'static str>)]| -> Vec<Twin<'static>> {
+            tracks.iter().map(|(legacy, ietf)| twin(None, *legacy, *ietf)).collect()
+        };
+        let untagged = |langs: &[Option<&'static str>]| langs.iter().map(|l| (None, *l)).collect::<Vec<_>>();
         let tags = |t: &[&str]| t.iter().map(|t| (!t.is_empty()).then(|| t.to_string())).collect::<Vec<_>>();
-        assert_eq!(matched_tags(&[Some("por"), Some("por"), Some("eng")], &theirs), tags(&["pt-BR", "pt-PT", "en"]));
-        assert_eq!(matched_tags(&[Some("ger"), Some("por"), Some("eng")], &theirs), tags(&["", "pt-PT", "en"]));
-        assert_eq!(matched_tags(&[None, Some("por"), Some("eng")], &theirs)[0], None);
-        assert_eq!(matched_tags(&[Some("por"), Some("por")], &theirs), [None, None]);
 
-        // Cantonese under the legacy code for all of Chinese.
-        assert_eq!(matched_tags(&[Some("chi")], &[(Some("chi"), Some("yue"))]), tags(&["yue"]));
+        let theirs = by_place(&[(Some("por"), Some("pt-BR")), (Some("por"), Some("pt-PT")), (Some("eng"), Some("en"))]);
+        assert_eq!(matched_tags(&untagged(&[Some("por"), Some("por"), Some("eng")]), &theirs), tags(&["pt-BR", "pt-PT", "en"]));
+        assert_eq!(matched_tags(&untagged(&[Some("ger"), Some("por"), Some("eng")]), &theirs), tags(&["", "pt-PT", "en"]));
+        assert_eq!(matched_tags(&untagged(&[None, Some("por"), Some("eng")]), &theirs)[0], None);
+        assert_eq!(matched_tags(&untagged(&[Some("por"), Some("por")]), &theirs), [None, None]);
 
-        let ts = [(Some("ger"), Some("de")), (Some("ger"), Some("de")), (Some("eng"), Some("en"))];
-        assert_eq!(matched_tags(&[Some("ger,eng"), Some("ger"), Some("fre,eng")], &ts), tags(&["de", "de", "fre"]));
-        assert_eq!(matched_tags(&[Some("ger,eng"), Some("eng")], &ts[..1]), tags(&["ger", ""]));
+        // Cantonese under the legacy code for all of Chinese, and MP4's `zho` for Matroska's `chi`.
+        assert_eq!(matched_tags(&untagged(&[Some("chi")]), &by_place(&[(Some("chi"), Some("yue"))])), tags(&["yue"]));
+        assert_eq!(matched_tags(&untagged(&[Some("zho")]), &by_place(&[(Some("chi"), Some("zh-Hant"))])), tags(&["zh-Hant"]));
+    }
 
-        let unknown_first = [(None, None), (Some("fre"), None)];
-        assert_eq!(matched_tags(&[Some("zzz,eng"), Some("fre,eng")], &unknown_first), tags(&["", "fre"]));
+    #[test]
+    fn a_ts_language_list_becomes_what_mkvmerge_read_for_that_pid() {
+        let twin = |number, legacy, ietf| Twin { number: Some(number), legacy, ietf };
+        let tags = |t: &[&str]| t.iter().map(|t| (!t.is_empty()).then(|| t.to_string())).collect::<Vec<_>>();
+
+        let ts = [twin(0x101, Some("ger"), Some("de")), twin(0x102, Some("ger"), Some("de")), twin(0x103, Some("fre"), None)];
+        let ours = [(Some("0x101"), Some("ger,eng")), (Some("0x102"), Some("ger")), (Some("0x103"), Some("fre,eng"))];
+        assert_eq!(matched_tags(&ours, &ts), tags(&["de", "de", "fre"]));
+
+        let ours = [(Some("0x100"), Some("eng")), (Some("0x101"), Some("ger,eng")), (Some("0x103"), Some("fre,eng"))];
+        assert_eq!(matched_tags(&ours, &ts), tags(&["", "de", "fre"]));
+
+        let unknown_first = [twin(0x101, None, None), twin(0x102, Some("fre"), None)];
+        let ours = [(Some("0x101"), Some("zzz,eng")), (Some("0x102"), Some("fre,eng"))];
+        assert_eq!(matched_tags(&ours, &unknown_first), tags(&["", "fre"]));
+        let ours = [(Some("0x100"), Some("eng")), (Some("0x101"), Some("zzz,eng")), (Some("0x109"), Some("zzz,eng"))];
+        assert_eq!(matched_tags(&ours, &unknown_first), tags(&["", "", ""]));
     }
 
     fn sample_set() -> HashSet<String> {
@@ -1450,17 +1449,6 @@ mod tests {
         assert_eq!(pcm_codec(&track("s32", 24)), "pcm_s24le");
         assert_eq!(pcm_codec(&track("s32", 0)), "pcm_s32le");
         assert_eq!(pcm_codec(&track("fltp", 0)), "pcm_f32le");
-    }
-
-    #[test]
-    fn a_rejected_option_is_retried_and_a_broken_track_is_not() {
-        use std::os::unix::process::ExitStatusExt;
-        let failed = std::process::ExitStatus::from_raw(8 << 8);
-        let transient = |e: &anyhow::Error| e.downcast_ref::<crate::job::Transient>().is_some();
-
-        assert!(transient(&extraction_error(failed, "Unrecognized option 'compresion_level:a:0'.\nError splitting the argument list: Option not found")));
-        assert!(transient(&extraction_error(failed, "[flac] Error setting option compression_level to value abc.\n[aost#0:0/flac] Error applying encoder options: Invalid argument")));
-        assert!(!transient(&extraction_error(failed, "[truehd] Invalid data found when processing input")));
     }
 
     #[test]

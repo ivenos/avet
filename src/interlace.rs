@@ -28,8 +28,14 @@ impl FieldOrder {
 
 /// A stream flagged interlaced whose frames idet finds combed. Cached in the job's temp dir.
 pub fn detect(source: &Path, duration_secs: f64, cache: &Path, stem: &str) -> Result<Option<FieldOrder>> {
-    if let Ok(cached) = std::fs::read_to_string(cache) {
-        return Ok([FieldOrder::Tff, FieldOrder::Bff].into_iter().find(|o| o.name() == cached.trim()));
+    match std::fs::read_to_string(cache).as_deref().map(str::trim) {
+        Ok("progressive") => return Ok(None),
+        Ok(cached) => {
+            if let Some(order) = [FieldOrder::Tff, FieldOrder::Bff].into_iter().find(|o| o.name() == cached) {
+                return Ok(Some(order));
+            }
+        }
+        Err(_) => {}
     }
     if !flagged_interlaced(source)? {
         return Ok(None);
@@ -144,6 +150,20 @@ mod tests {
                       [Parsed_idet_0 @ 0x2] Multi frame detection: TFF:   101 BFF:     0 Progressive:     2 Undetermined:     0\n";
         assert_eq!(parse_idet(stderr), Counts { tff: 101, bff: 0, progressive: 2 });
         assert_eq!(parse_idet("no summary"), Counts::default());
+    }
+
+    #[test]
+    fn only_a_verdict_detect_wrote_itself_is_taken_from_the_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("interlace.cache");
+        let cached = || detect(Path::new("/nonexistent/film.mkv"), 60.0, &cache, "film");
+
+        for (text, order) in [("tff", Some(FieldOrder::Tff)), ("bff\n", Some(FieldOrder::Bff)), ("progressive", None)] {
+            std::fs::write(&cache, text).unwrap();
+            assert_eq!(cached().unwrap(), order, "{text:?}");
+        }
+        std::fs::write(&cache, "tf").unwrap();
+        assert!(cached().is_err(), "a cut-off cache passed as progressive");
     }
 
     #[test]

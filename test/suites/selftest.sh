@@ -158,6 +158,9 @@ expect_fail "no expected value"      assert_stream_value "$SRC" v:0 stream_side_
 expect_pass "no rotation, spelled out" assert_stream_value "$SRC" v:0 stream_side_data=rotation -
 expect_fail "no rotation in no file" assert_stream_value "$W/missing.mkv" v:0 stream_side_data=rotation -
 expect_fail "no rotation without video" assert_stream_value "$W/audio_only.mkv" v:0 stream_side_data=rotation -
+expect_pass "a stream that is there" assert_has_stream "$SRC" v:0
+expect_fail "one that is not"        assert_has_stream "$W/audio_only.mkv" v:0
+expect_fail "one in no file"         assert_has_stream "$W/missing.mkv" v:0
 expect_pass "language and flags"     assert_track_flags_match "$SRC" "$SRC" a
 expect_fail "a lost default flag"    assert_track_flags_match "$W/flag.mkv" "$SRC" a
 
@@ -259,6 +262,12 @@ expect_pass "HLG in the AV1 bitstream too" assert_color_transfer "$W/hlg_av1.mkv
 expect_fail "HLG in Matroska alone"  assert_color_transfer "$W/tags_only.mkv" arib-std-b67
 expect_fail "BT.2020 in Matroska alone" assert_color_primaries "$W/tags_only.mkv" bt2020
 expect_fail "HDR10 in Matroska alone" assert_hdr_static_match "$W/tags_only.mkv" "$W/wp15636,16451.mkv"
+expect_pass "a color entry by name"  assert_color_value "$W/hlg_av1.mkv" color_space bt2020nc
+expect_fail "another value for it"   assert_color_value "$W/hlg_av1.mkv" color_space bt709
+# A bitstream that cannot be pulled out is not one that agrees.
+ffmpeg() { case " $* " in *" -f obu "*) return 1 ;; esac; tool ffmpeg "$@"; }
+expect_fail "a bitstream that cannot be read" assert_color_transfer "$W/hlg_av1.mkv" arib-std-b67
+ffmpeg() { tool ffmpeg "$@"; }
 
 mkvmerge -q -o "$W/bcp47.mkv" --language 1:en-GB --language 2:de-CH "$SRC"
 need "$W/bcp47.mkv"
@@ -278,5 +287,67 @@ RUN_LOGS=""
 
 # A file no seek can read at all must not pass as "every seek landed".
 expect_fail "seeking in nothing"     assert_seeks_land_on_frames "$W/missing.mkv"
+
+# no file at all and a zero-byte one, where "none of this in there" is true of every property
+sweep() { # ASSERTION, with @ for the file
+    local broken
+    for broken in "$W/missing.mkv" "$W/empty.mkv"; do
+        expect_fail "${broken##*/} in: $1" eval "$(printf '%s' "$1" | sed "s|@|$broken|")"
+    done
+}
+sweep 'assert_file_nonempty @'
+sweep 'assert_probeable @'
+sweep 'assert_audio_track_count @ 2'
+sweep 'assert_audio_codec @ 0 flac'
+sweep 'assert_audio_channels @ 0 2'
+sweep 'assert_audio_language @ 1 ger'
+sweep 'assert_audio_title @ 0 English'
+sweep 'assert_subtitle_track_count @ 3'
+sweep 'assert_subtitle_language @ 2 jpn'
+sweep 'assert_bcp47_languages @ "und en-GB de-CH en de ja"'
+sweep 'assert_video_codec @ h264'
+sweep 'assert_video_height @ 180'
+sweep 'assert_video_pix_fmt @ yuv420p'
+sweep 'assert_video_frames @ 240'
+sweep 'assert_color_value @ color_transfer arib-std-b67'
+sweep 'assert_color_transfer @ arib-std-b67'
+sweep 'assert_color_primaries @ bt2020'
+sweep 'assert_has_stream @ v:0'
+sweep 'assert_stream_value @ v:0 stream=pix_fmt yuv420p'
+sweep 'assert_scenes_cover @'
+sweep 'assert_min_chunk_frames @ 24'
+sweep 'assert_max_chunk_frames @ 240'
+sweep 'assert_keyframes_at_chunks @ "$W/one_chunk.json"'
+sweep 'assert_frames_match @ "$SRC"'
+sweep 'assert_frames_identical @ "$SRC"'
+sweep 'assert_frame_times_match @ "$SRC"'
+sweep 'assert_seeks_land_on_frames @'
+sweep 'assert_decodes_cleanly @'
+sweep 'assert_same_bytes @ "$SRC"'
+sweep 'assert_av_sync @ "$SRC" 0'
+sweep 'assert_packets_identical @ a:0 "$SRC" a:0'
+sweep 'assert_audio_samples_identical @ "$SRC" 0'
+sweep 'assert_channel_frequencies @ 0 "300 500"'
+sweep 'assert_stream_times_match @ s:0 "$SRC" s:0'
+sweep 'assert_subtitle_events_match @ s:0 "$SRC" s:0'
+sweep 'assert_chapters_match @ "$SRC"'
+sweep 'assert_tracks_match @ "$SRC" a'
+sweep 'assert_track_flags_match @ "$SRC" a'
+sweep 'assert_attachments_match @ "$SRC"'
+sweep 'assert_frames_with_side_data @ "SMPTE2094-40" 48'
+sweep 'assert_hdr10plus_matches @ "$DV"'
+sweep 'assert_dovi_record @ "8,1"'
+sweep 'assert_hdr_static_match @ "$W/wp15636,16451.mkv"'
+
+# An assertion nobody has seen fail is not known to be able to, and one that reads a file
+# has to be in the sweep above.
+for assertion in $(grep -oE '^assert_[a-z0-9_]+' "$(dirname "$0")/../lib.sh" | sort -u); do
+    grep -qE "expect_fail .* $assertion( |\$)" "$0" || fail "selftest: $assertion is never shown to fail"
+    case "$assertion" in
+        assert_file_exists|assert_file_not_exists|assert_dir_exists|assert_dir_not_exists) continue ;;
+        assert_log_contains|assert_log_not_contains) continue ;;
+    esac
+    grep -qF "sweep '$assertion @" "$0" || fail "selftest: $assertion is not tried on a missing and an empty file"
+done
 
 test_done

@@ -358,10 +358,12 @@ $FF -f lavfi -i "$(pattern 320x180 300 yuv420p)" -frames:v 300 \
 $FF -f lavfi -i "$(pattern 320x180 500 yuv420p)" -frames:v 250 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_500fps.mkv
 
-echo "  pattern_interlaced_yuyv.mkv, pattern_dv.avi"
+echo "  pattern_interlaced_yuyv.mkv, pattern_interlaced_bgr0.mkv, pattern_dv.avi"
 FIELDS="geq=lum=128+60*sin(X/9+N*1.7)+50*cos(Y/7-N*1.1):cb=128+60*sin(X/40+Y/9+N*1.3):cr=128+60*cos(Y/7-X/70-N*1.1)"
 $FF -f lavfi -i "nullsrc=size=320x180:rate=50,$FIELDS,format=yuv422p" -frames:v 48 \
     -vf "tinterlace=mode=interleave_top,setfield=tff,format=yuyv422" -c:v rawvideo pattern_interlaced_yuyv.mkv
+$FF -f lavfi -i "nullsrc=size=320x180:rate=50,$FIELDS,format=yuv444p" -frames:v 48 \
+    -vf "tinterlace=mode=interleave_top,setfield=tff,format=bgr0" -c:v ffv1 pattern_interlaced_bgr0.mkv
 $FF -f lavfi -i "nullsrc=size=720x480:rate=60000/1001,$FIELDS,format=yuv411p" -frames:v 48 \
     -vf "tinterlace=mode=interleave_bottom,setfield=bff" -c:v dvvideo pattern_dv.avi
 
@@ -404,10 +406,11 @@ $FF -f lavfi -i "testsrc2=size=320x180:rate=5:duration=120" \
     -vf "drawbox=y=0:h=22:color=black:t=fill:enable='not(between(t,36,46))',drawbox=y=158:h=22:color=black:t=fill:enable='not(between(t,36,46))'" \
     -c:v libx264 -g 10 -preset ultrafast crop_imax.mkv
 
-echo "  pattern_odd.mkv, pattern_422.mkv, pattern_444.mkv"
+echo "  pattern_odd.mkv, pattern_422.mkv, pattern_444.mkv, pattern_440.mkv"
 $FF -f lavfi -i "$(pattern 321x181 24 yuv420p)" -frames:v 48 -c:v ffv1 pattern_odd.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuv422p10le)" -frames:v 48 -c:v ffv1 pattern_422.mkv
 $FF -f lavfi -i "$(pattern 320x180 24 yuv444p)" -frames:v 48 -c:v ffv1 pattern_444.mkv
+$FF -f lavfi -i "$(pattern 320x180 24 yuv440p)" -frames:v 48 -c:v ffv1 pattern_440.mkv
 
 echo "  pattern_rgb.mkv, pattern_gray.mkv"
 $FF -f lavfi -i "$(pattern 320x180 24 gbrp),setparams=range=pc:colorspace=gbr" -frames:v 48 -c:v ffv1 pattern_rgb.mkv

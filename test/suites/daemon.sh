@@ -1,6 +1,6 @@
 #!/bin/sh
 # The scan loop itself: files that arrive later, a job that fails beside a good one, a
-# copy still running, a signaled stop and a crash.
+# copy still running, a signaled stop, a crash and a killed encoder.
 . "$(dirname "$0")/../lib.sh"
 
 WORKDIR=$(test_workdir)
@@ -126,6 +126,23 @@ kill_avet
 crash
 assert_file_not_exists "$O/.avet_test/.failed"
 run_avet_timed "$I" "$O" 60 "job failed"
+assert_log_contains    "stopped 3 times in a row"
+assert_file_exists     "$O/.avet_test/.failed"
+assert_file_not_exists "$O/test.mkv"
+assert_file_exists     "$I/p/test.mkv"
+
+# an encoder killed three times in a row, as the out-of-memory killer does, locks the file out as well
+setup killed 'encoder = "svt-av1"\n[encoder_params]\npreset = 4\ncrf = 40\n[scene_detection]\nextra_split = 24\n'
+cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+TEST_CPUS=0.5 start_avet "$I" "$O" 1
+kills=0; waited=0
+while [ ! -f "$O/.avet_test/.failed" ] && [ "$waited" -lt 240 ]; do
+    docker exec "$AVET_CID" pkill -KILL SvtAv1EncApp 2>/dev/null && kills=$((kills + 1))
+    sleep 1
+    waited=$((waited + 1))
+done
+kill_avet
+[ "$kills" -ge 3 ] || fail "killed: only $kills kills reached an encoder"
 assert_log_contains    "stopped 3 times in a row"
 assert_file_exists     "$O/.avet_test/.failed"
 assert_file_not_exists "$O/test.mkv"

@@ -58,6 +58,7 @@ done
 for mode in encode copy; do
     run "latm_$mode" audio_latm.ts "[avet]\nvideo = \"$mode\"\n"
     assert_log_contains "copy as AAC"
+    assert_track_flags_match "$O/test.mkv" "$SRC" a
     set -- "0 aac ger" "1 ac3 eng"
     for track; do
         set -- $track

@@ -69,6 +69,9 @@ else
     done
 fi
 
+TEST_IMAGE=$(docker image inspect -f '{{.Id}}' "$TEST_IMAGE") || exit 1
+TOOLS_IMAGE=$(docker image inspect -f '{{.Id}}' "$TOOLS_IMAGE") || exit 1
+
 FIXTURES_DIR=$(mktemp -d)
 RESULTS=$(mktemp -d)
 AVET_TEST_RUN=$$

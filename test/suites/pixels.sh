@@ -32,15 +32,17 @@ run_avet "$I" "$O" "$O/test.mkv" 180 || fail "scaled chroma: no output"
 assert_frames_match "$O/test.mkv" "$SRC" "scale=320:180:flags=lanczos:in_chroma_loc=left:out_chroma_loc=left" 50
 assert_stream_value "$O/test.mkv" v:0 stream=chroma_location left
 
-# 4:2:2, 4:4:4, RGB and gray are brought to 4:2:0 instead of failing
-for sub in 422 444; do
+# 4:2:2, 4:4:4, 4:4:0, RGB and gray are brought to 4:2:0 instead of failing
+for sub in 422 444 440; do
     encode "chroma$sub" "pattern_$sub.mkv"
     assert_log_contains "chroma conversion"
     assert_frames_match "$O/test.mkv" "$SRC"
 done
 assert_video_pix_fmt "$WORKDIR/chroma422/out/test.mkv" yuv420p10le
-assert_video_pix_fmt "$WORKDIR/chroma444/out/test.mkv" yuv420p
-assert_stream_value "$WORKDIR/chroma444/out/test.mkv" v:0 stream=chroma_location center
+for sub in 444 440; do
+    assert_video_pix_fmt "$WORKDIR/chroma$sub/out/test.mkv" yuv420p
+    assert_stream_value "$WORKDIR/chroma$sub/out/test.mkv" v:0 stream=chroma_location center
+done
 for fmt in rgb gray; do
     encode "$fmt" "pattern_$fmt.mkv"
     assert_frames_match "$O/test.mkv" "$SRC"
@@ -48,7 +50,7 @@ for fmt in rgb gray; do
     assert_video_pix_fmt "$O/test.mkv" yuv420p
 done
 
-# interlaced, DV and packed 4:2:2 included: one frame per frame, fields kept apart; flagged alone, left as it is
+# interlaced, DV, packed 4:2:2 and RGB included: one frame per frame, fields kept apart; flagged alone, left as it is
 encode interlaced pattern_interlaced.mkv 'keep_temp = true'
 assert_log_contains "interlaced, top field first"
 assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=tff:deint=all"
@@ -67,6 +69,9 @@ assert_log_contains "interlaced, bottom field first"
 assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=bff:deint=all" 30
 encode interlaced_yuyv pattern_interlaced_yuyv.mkv
 assert_frames_match "$O/test.mkv" "$SRC" "format=yuv422p,bwdif=mode=send_frame:parity=tff:deint=all" 30
+encode interlaced_bgr0 pattern_interlaced_bgr0.mkv
+assert_log_contains "interlaced, top field first"
+assert_frames_match "$O/test.mkv" "$SRC" "format=yuv444p,bwdif=mode=send_frame:parity=tff:deint=all" 30
 
 # bit_depth converts without touching the picture
 encode up8to10 pattern.mkv 'bit_depth = 10'

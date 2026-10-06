@@ -233,4 +233,20 @@ assert_log_contains  "ignoring empty output file"
 assert_video_frames  "$O/test.mkv" 240
 assert_file_exists   "$I/processed/test.mkv"
 
+I="$WORKDIR/17/in"; O="$WORKDIR/17/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+: > "$I/processed"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "failed archiving: no output"
+assert_log_contains    "archiving the source failed"
+assert_file_exists     "$I/p/test.mkv"
+assert_file_exists     "$O/.avet_test/delivered"
+assert_file_not_exists "$O/.avet_test/done.json"
+rm -f "$I/processed"
+run_avet_timed "$I" "$O" 30 "already encoded"
+assert_log_contains    "already encoded - archiving the source"
+assert_file_exists     "$I/processed/test.mkv"
+assert_file_not_exists "$I/p/test.mkv"
+assert_dir_not_exists  "$O/.avet_test"
+
 test_done

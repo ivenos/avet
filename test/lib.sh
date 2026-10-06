@@ -70,6 +70,7 @@ run_avet() {
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
         "${TEST_IMAGE}")
 
     local elapsed=0 failed_line
@@ -106,6 +107,12 @@ run_avet() {
     RUN_LOGS=$(docker logs "$cid" 2>&1) || true
     docker rm -f "$cid" >/dev/null 2>&1 || true
 
+    if [ -z "${TEST_SCENE_REPAIR:-}" ]; then
+        local repair
+        repair=$(printf '%s\n' "$RUN_LOGS" | grep -m 1 -E 'extending the last chunk|clamping scene|dropping scene|scene cuts move by')
+        [ -z "$repair" ] || fail "run_avet: the scene list needed a repair: $repair"
+    fi
+
     # -s, not -e: every "expected 0 tracks" assertion reads a zero-byte file as a pass.
     [ -s "$expected" ] && return 0 || return 1
 }
@@ -124,6 +131,7 @@ run_avet_timed() { # INPUT OUTPUT WAIT_S LOG_PATTERN
         -v "${output}:/output:z" \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
         "${TEST_IMAGE}")
 
     local elapsed=0
@@ -150,6 +158,7 @@ start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
         -v "${2}:/output:z" \
         -e POLL_INTERVAL="${3:-2}" \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
+        ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
         "${TEST_IMAGE}")
 }
 
@@ -338,7 +347,8 @@ av1_bitstream() { # FILE -> its video as bare OBUs, nothing for another codec
     local obu
     [ "$(stream_value "$1" v:0 stream=codec_name)" = av1 ] || return 0
     obu=$(mktemp -p "$_SCRATCH")
-    ffmpeg -v error -y -i "$1" -map 0:v:0 -c copy -f obu "$obu" && printf '%s' "$obu"
+    ffmpeg -v error -y -i "$1" -map 0:v:0 -c copy -f obu "$obu"
+    printf '%s' "$obu"
 }
 
 assert_color_value() { # FILE ENTRY EXPECTED

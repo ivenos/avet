@@ -20,6 +20,7 @@ pub struct HdrInfo {
     /// Only set for full range. Studio is the encoder default and the common case.
     pub color_range: Option<u32>,
     pub not_yuv: bool,
+    pub rgb: bool,
     pub content_light_level: Option<String>,
     pub mastering_display: Option<String>,
     /// Dolby Vision profile from the DOVI configuration record, when there is one.
@@ -172,8 +173,10 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
 impl HdrInfo {
     fn from_probe(probe: ProbeOutput) -> Self {
         let stream = probe.streams.into_iter().next().unwrap_or_default();
+        let layout = crate::ffms2::pixel_layout_of(&stream.pix_fmt);
+        let not_yuv = layout.is_some_and(|l| l.not_yuv());
         // FFMS2 subsamples full-width chroma between two samples, a siting AV1 has no code for.
-        let full_chroma = not_yuv(&stream.pix_fmt) || stream.pix_fmt.contains("444");
+        let full_chroma = not_yuv || layout.is_some_and(|l| l.log2_chroma_w == 0);
 
         let mut info = HdrInfo {
             codec_name: stream.codec_name.clone(),
@@ -183,7 +186,8 @@ impl HdrInfo {
             chroma_sample_position: if full_chroma { None } else { map_chroma(&stream.chroma_location) },
             chroma_center: full_chroma || stream.chroma_location == "center",
             color_range: map_color_range(&stream.color_range),
-            not_yuv: not_yuv(&stream.pix_fmt),
+            not_yuv,
+            rgb: layout.is_some_and(|l| l.rgb),
             ..Default::default()
         };
 
@@ -419,13 +423,6 @@ fn parse_mastering_display(s: &str) -> Option<[(f64, f64); 5]> {
     Some([pair("G(")?, pair("B(")?, pair("R(")?, pair("WP(")?, pair("L(")?])
 }
 
-/// FFMS2's test: the RGB flag, or at most two components. Pixel format names say both.
-fn not_yuv(pix_fmt: &str) -> bool {
-    ["gbr", "rgb", "bgr", "argb", "abgr", "0rgb", "0bgr", "x2rgb", "x2bgr", "pal8", "gray", "ya", "mono"]
-        .iter()
-        .any(|family| pix_fmt.starts_with(family))
-}
-
 // ffprobe name to ITU-T H.273 numeric code (same values used by SVT-AV1)
 fn map_color_primaries(s: &str) -> Option<u32> {
     Some(match s {
@@ -591,11 +588,12 @@ mod tests {
             "--color-primaries", "1", "--transfer-characteristics", "13", "--matrix-coefficients", "5",
         ]);
 
+        let probed = |pix_fmt: &str| HdrInfo::from_probe(serde_json::from_str(&format!(r#"{{"streams": [{{"pix_fmt": "{pix_fmt}"}}]}}"#)).unwrap());
         for fmt in ["gbrp", "bgr0", "rgb24", "rgba64le", "x2rgb10le", "pal8", "gray", "gray10le", "ya8", "monow"] {
-            assert!(not_yuv(fmt), "{fmt}");
+            assert!(probed(fmt).not_yuv, "{fmt}");
         }
         for fmt in ["yuv420p", "yuvj420p", "yuv444p12le", "nv12", "p010le", "yuyv422", "y210le", ""] {
-            assert!(!not_yuv(fmt), "{fmt}");
+            assert!(!probed(fmt).not_yuv, "{fmt}");
         }
     }
 
@@ -654,6 +652,8 @@ mod tests {
         let full = info("yuv444p10le", "left");
         assert_eq!((full.chroma_loc(), full.chroma_sample_position), ("center", None));
         assert_eq!(info("gbrp", "unspecified").chroma_loc(), "center");
+        // 4:4:0 has full-width chroma as well, which the name does not say as plainly.
+        assert_eq!(info("yuvj440p", "unspecified").chroma_loc(), "center");
 
         assert_eq!(info("yuv420p10le", "topleft").chroma_loc(), "topleft");
         assert_eq!(info("yuv420p", "unspecified").chroma_loc(), "left");
