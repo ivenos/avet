@@ -27,6 +27,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: The image and the AppImage pin the same versions
+        run: |
+          ok=1
+          for pin in SVT_AV1_VERSION SVT_AV1_HDR_REF FFMS2_VERSION VSHIP_VERSION VMAF_VERSION RUST_VERSION; do
+            image=$(sed -n "s/^ARG $pin=//p" Dockerfile)
+            appimage=$(sed -n "s/^  $pin: *\"\{0,1\}\([^\" ]*\)\"\{0,1\}\$/\1/p" .github/workflows/appimage.yml)
+            [ -n "$image" ] && [ "$image" = "$appimage" ] \
+              || { echo "::error::$pin is '$image' in the Dockerfile and '$appimage' in appimage.yml"; ok=0; }
+          done
+          image=$(sed -n 's/^ARG RUST_VERSION=//p' Dockerfile)
+          [ "$image" = "$RUST_VERSION" ] \
+            || { echo "::error::RUST_VERSION is '$image' in the Dockerfile and '$RUST_VERSION' in this workflow"; ok=0; }
+          [ "$ok" = 1 ]
+
       # The version the image builds with, not `stable`: a newly stabilized API would
       # pass here and fail 25 minutes later inside the image build.
       - name: Install Rust toolchain
@@ -146,12 +160,17 @@ jobs:
             FFVship --list-gpu             >/dev/null
             [ "$(avet --version)" = "avet $AVET_VERSION" ]
           '
+
+      - name: The image has the FFmpeg and MKVToolNix of the AppImage
+        run: |
+          ok=1
           want=$(sed -n 's/^  FFMPEG_VERSION: n//p' .github/workflows/appimage.yml)
           have=$(docker run --rm --entrypoint ffmpeg avet:test -version | sed -n 's/^ffmpeg version \([0-9.]*\).*/\1/p')
-          [ "$want" = "$have" ] || echo "::warning::the image has FFmpeg $have, appimage.yml builds $want"
+          [ "$want" = "$have" ] || { echo "::error::the image has FFmpeg $have, appimage.yml builds $want"; ok=0; }
           want=$(sed -n 's/^  MKVTOOLNIX_VERSION: "\(.*\)"/\1/p' .github/workflows/appimage.yml)
           have=$(docker run --rm --entrypoint mkvmerge avet:test --version | sed -n 's/^mkvmerge v\([0-9.]*\).*/\1/p')
-          [ "$want" = "$have" ] || echo "::warning::the image has MKVToolNix $have, appimage.yml installs $want"
+          [ "$want" = "$have" ] || { echo "::error::the image has MKVToolNix $have, appimage.yml installs $want"; ok=0; }
+          [ "$ok" = 1 ]
 
       - name: Upload test images
         uses: actions/upload-artifact@v7

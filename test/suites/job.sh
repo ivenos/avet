@@ -249,4 +249,22 @@ assert_file_exists     "$I/processed/test.mkv"
 assert_file_not_exists "$I/p/test.mkv"
 assert_dir_not_exists  "$O/.avet_test"
 
+I="$WORKDIR/18/in"; O="$WORKDIR/18/out"; mkdir -p "$I/p" "$I/processed" "$O" "$WORKDIR/18/processed"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+TEST_PROCESSED="$WORKDIR/18/processed"
+chmod 555 "$I/p"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "archive mount: no output"
+chmod 755 "$I/p"
+assert_log_contains    "remove the original after copying it"
+assert_file_exists     "$I/p/test.mkv"
+assert_file_not_exists "$TEST_PROCESSED/test.mkv"
+TEST_RUST_LOG=debug start_avet "$I" "$O"
+wait_for_log "no jobs" 30 || fail "archive mount: the source was not archived"
+kill_avet
+assert_same_bytes      "$TEST_PROCESSED/test.mkv" "$FIXTURES_DIR/sdr_simple.mkv"
+assert_file_not_exists "$I/p/test.mkv"
+assert_dir_not_exists  "$O/.avet_test"
+unset TEST_PROCESSED
+
 test_done

@@ -69,7 +69,7 @@ fn main() -> Result<()> {
 
     loop {
         let scanned = scanner::scan(&input_dir, &output_dir)
-            .map(|jobs| jobs.into_iter().filter(|j| j.delivered || job::RETRIES.due(j)).collect::<Vec<_>>());
+            .map(|jobs| jobs.into_iter().filter(|j| job::RETRIES.due(j)).collect::<Vec<_>>());
         match scanned {
             Err(e) => tracing::error!("scanner error: {e:#}"),
             Ok(jobs) if jobs.is_empty() => {

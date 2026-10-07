@@ -17,9 +17,6 @@ avet is an AV1 encoding service that watches a folder, splits each video at its 
 
 ---
 
-> [!WARNING]
-> This README describes avet 2.0, which is not released yet. The current release is avxs 1.0.0 with the image `ivenos/avxs:latest`, documented in its [README](https://github.com/ivenos/avet/blob/v1.0.0/README.md).
-
 ## Features
 
 - [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) per profile
@@ -86,7 +83,7 @@ output/
 - Folders inside a profile are kept in `output/` and `processed/`. Once a folder's last video is encoded, the empty source folder is removed.
 - Output files keep the source's name with `.mkv`, so queued files that would end up at the same output path, such as `film.mkv` and `film.mp4`, wait until one is renamed.
 - Work in progress lives in `.avet_<name>/` next to the output file. Delete that folder to encode a file from scratch.
-- A failure that can clear on its own, such as an `encode.toml` that cannot be read, a timeout or a full disk, is retried: on the next scan, then at doubling intervals of up to 60 scans, and at once after a change of `encode.toml`. Any other failure, such as an option the encoder refuses, writes a `.failed` file into that folder, and the video is skipped until you delete it or change `encode.toml`.
+- A failure that can clear on its own, such as an `encode.toml` avet cannot read or rejects, a timeout or a full disk, is retried: on the next scan, then at doubling intervals of up to 60 scans, and at once after a change of `encode.toml`. Any other failure, such as an option the encoder refuses, writes a `.failed` file into that folder, and the video is skipped until you delete it or change `encode.toml`.
 - A file during which avet dies or one of its tools is killed three times in a row, as a crash in FFMS2 or the out-of-memory killer would cause, gets a `.failed` file as well. A stop by signal does not count.
 - On `SIGTERM`, `SIGINT` or `SIGHUP` avet exits after the current file, on a second signal at once. A file stopped mid-encode, e.g. by Ctrl-C in a terminal or by `docker stop` after its timeout, resumes from its last finished chunk.
 - A second avet on the same output folder waits until the first one stops. It checks the `.avet.lock` file there.

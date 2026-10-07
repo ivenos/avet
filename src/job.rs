@@ -678,15 +678,19 @@ fn finalize(
         .with_context(|| format!("flush {}", temp.mux_path.display()))?;
     let bytes = |path: &Path| std::fs::metadata(path).map_or(0, |m| m.len());
     let (source_bytes, output_bytes) = (bytes(&job.source_file), bytes(&temp.mux_path));
+    // Before the rename: the scanner skips an output without the marker and leaves its source.
+    temp.mark_delivered(config.avet.keep_temp)?;
     std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
         format!("move {} to {}", temp.mux_path.display(), final_output.display())
     })?;
     // The archived source can sit on another file system, whose rename may reach the disk first.
     sync_dir(&final_output);
 
-    // Delivered. The chunks go first, before a copy to another disk that a stop could cut
+    // The chunks go first, before a copy to another disk that a stop could cut
     // short; what is left of the temp dir has the next scan finish the archiving.
-    if let Err(e) = temp.mark_delivered(config.avet.keep_temp) {
+    if !config.avet.keep_temp
+        && let Err(e) = temp.clear_work()
+    {
         tracing::error!("[{stem}] could not clear temp dir {}: {e:#}", temp.path.display());
     }
     if let Err(e) = archive_source(job, ctx).and_then(|()| temp.finish_delivery()) {
@@ -875,8 +879,15 @@ fn track_types(path: &Path) -> Result<Vec<String>> {
 pub fn finish_delivery(job: &Job, ctx: &JobContext) -> Result<()> {
     let stem = job.stem();
     tracing::info!("[{stem}] already encoded - archiving the source");
-    archive_source(job, ctx)?;
-    TempDir::for_video(&job.output_dir(&ctx.output_dir), stem).finish_delivery()
+    let archived = archive_source(job, ctx)
+        .and_then(|()| TempDir::for_video(&job.output_dir(&ctx.output_dir), stem).finish_delivery());
+    match &archived {
+        Ok(()) => RETRIES.clear(job),
+        Err(_) => {
+            RETRIES.failed(job, crate::resume::profile_id(&job.encode_toml).as_deref(), ctx.poll, Instant::now());
+        }
+    }
+    archived
 }
 
 /// Never over an existing file: two seasons can each have an `Episode 01.mkv`.
@@ -908,7 +919,11 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
         return Err(e).context("copy across file systems");
     }
     sync_dir(to);
-    std::fs::remove_file(from).context("remove the original after copying it")
+    if let Err(e) = std::fs::remove_file(from) {
+        let _ = std::fs::remove_file(to);
+        return Err(e).context("remove the original after copying it");
+    }
+    Ok(())
 }
 
 /// Best effort: not every network file system can sync a directory.
@@ -2180,11 +2195,21 @@ mod output_param_tests {
         let job = Job { encode_toml: profile.join("encode.toml"), source_file: source.clone(), rel_dir: PathBuf::new(), delivered: true };
         let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film");
         temp.claim_source(&source, "film").unwrap();
+        std::fs::write(temp.chunk_path("00001"), b"chunk").unwrap();
         temp.mark_delivered(false).unwrap();
 
+        let processed = ctx.input_dir.join("processed");
+        std::fs::write(&processed, b"a file where the folder belongs").unwrap();
+        assert!(finish_delivery(&job, &ctx).is_err());
+        assert!(source.exists() && temp.awaits_archiving(&source));
+        assert!(!RETRIES.due(&job), "archiving that failed is tried again on the very next scan");
+        assert!(RETRIES.due_at(&job, Instant::now() + POLL));
+
+        std::fs::remove_file(&processed).unwrap();
         finish_delivery(&job, &ctx).unwrap();
-        assert_eq!(std::fs::read(ctx.input_dir.join("processed").join("film.mkv")).unwrap(), b"video");
+        assert_eq!(std::fs::read(processed.join("film.mkv")).unwrap(), b"video");
         assert!(!source.exists() && !temp.path.exists());
+        assert!(RETRIES.due(&job));
     }
 
     #[test]

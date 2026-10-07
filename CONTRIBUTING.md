@@ -86,6 +86,7 @@ Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/) with a sho
 - The git tag is the version; `Cargo.toml` stays at `0.0.0`.
 - A push to `main` publishes the `dev` image, a `v*` tag the release image, and a GitHub release gets the AppImages.
 - The changelog lives in the GitHub release notes, in Keep a Changelog style (https://keepachangelog.com/en/1.1.0/). There is no CHANGELOG.md.
+- An entry that goes back to an issue or a pull request ends with its number: `(#12)`.
 
 ## Dependencies
 
@@ -93,6 +94,7 @@ Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/) with a sho
 - The pinned sources (SVT-AV1, SVT-AV1-HDR, FFMS2, Vship, libvmaf, Rust) are set in both the `Dockerfile` and `.github/workflows/appimage.yml`; change them together. `RUST_VERSION` is in `.github/workflows/build-publish.yml` as well.
 - Both apply `packaging/ffms2-frame-hdr-metadata.patch` to FFMS2.
 - FFmpeg and MKVToolNix in `appimage.yml` follow the image's Alpine versions and are bumped by hand.
+- CI fails while one of these versions differs between the image and the AppImage.
 - GitHub Actions and base images stay on version tags, never commit SHAs or digests.
 - Renovate opens the bumps. Other PRs leave dependencies alone.
 

@@ -307,12 +307,12 @@ impl TempDir {
         self.delivered_path.exists() && self.source_unchanged(source)
     }
 
-    /// From here on the temp dir only says that the source still has to be archived.
     pub fn mark_delivered(&self, keep_temp: bool) -> Result<()> {
-        write_atomic(&self.delivered_path, if keep_temp { b"keep" } else { b"" })?;
-        if keep_temp {
-            return Ok(());
-        }
+        write_atomic(&self.delivered_path, if keep_temp { b"keep" } else { b"" })
+    }
+
+    /// From here on the temp dir only says that the source still has to be archived.
+    pub fn clear_work(&self) -> Result<()> {
         for entry in std::fs::read_dir(&self.path).with_context(|| format!("read {}", self.path.display()))? {
             let entry = entry.with_context(|| format!("read {}", self.path.display()))?;
             let path = entry.path();
@@ -449,6 +449,8 @@ mod tests {
         assert!(!temp.awaits_archiving(&source));
 
         temp.mark_delivered(false).unwrap();
+        assert!(temp.chunk_path("00001").exists() && temp.awaits_archiving(&source));
+        temp.clear_work().unwrap();
         let mut left: Vec<_> = std::fs::read_dir(&temp.path).unwrap().map(|e| e.unwrap().file_name()).collect();
         left.sort();
         assert_eq!(left, ["delivered", "source.path"]);

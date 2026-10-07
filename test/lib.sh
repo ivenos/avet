@@ -68,6 +68,7 @@ run_avet() {
         ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
+        ${TEST_PROCESSED:+-v "${TEST_PROCESSED}:/input/processed:z"} \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
@@ -129,6 +130,7 @@ run_avet_timed() { # INPUT OUTPUT WAIT_S LOG_PATTERN
         ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${input}:/input:z" \
         -v "${output}:/output:z" \
+        ${TEST_PROCESSED:+-v "${TEST_PROCESSED}:/input/processed:z"} \
         -e POLL_INTERVAL=999999 \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
@@ -156,6 +158,7 @@ start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
         ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
         -v "${1}:/input:z" \
         -v "${2}:/output:z" \
+        ${TEST_PROCESSED:+-v "${TEST_PROCESSED}:/input/processed:z"} \
         -e POLL_INTERVAL="${3:-2}" \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
