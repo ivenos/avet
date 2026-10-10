@@ -7,6 +7,7 @@ All notable changes to this project are documented in this file, in the format o
 ### Dependencies
 
 - signal-hook 0.4.4 -> 0.4.5 (#45)
+- SVT-AV1-HDR 18327c0 -> a46bc2d
 
 ## [2.0.0] - 2026-10-07
 
