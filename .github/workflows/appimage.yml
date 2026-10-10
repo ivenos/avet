@@ -3,13 +3,17 @@ name: AppImage
 # Also on changes to this file: the pinned tool versions live here, and a bump that
 # breaks the build would otherwise surface at the next release and nowhere else.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       version:
         description: "Version for the artifact names and avet --version, e.g. v1.0.0. Empty uses dev-<sha>."
         required: false
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to build, such as v1.5.0
+        required: true
+        type: string
   pull_request:
     paths: [".github/workflows/appimage.yml", ".github/scripts/crate-licenses.sh", "packaging/**"]
   push:
@@ -32,7 +36,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-appimage-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -42,6 +46,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Install Rust ${{ env.RUST_VERSION }}
         uses: dtolnay/rust-toolchain@v1
@@ -74,21 +80,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.tag }}
           persist-credentials: false
 
       - name: Resolve version
         # Not interpolated: both are attacker-chosen text and this writes $GITHUB_ENV.
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ inputs.tag }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -eu
-          if [ "$EVENT_NAME" = "release" ]; then
-            VERSION="$RELEASE_TAG"
-          else
-            VERSION="${INPUT_VERSION:-dev-${GITHUB_SHA:0:7}}"
-          fi
+          VERSION="${TAG:-${INPUT_VERSION:-dev-${GITHUB_SHA:0:7}}}"
           case "$VERSION" in
             *[!A-Za-z0-9._-]*|"") echo "::error::refusing unusual version name"; exit 1 ;;
           esac
@@ -291,22 +293,3 @@ jobs:
           name: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
           path: avet-${{ env.APP_VERSION }}-${{ matrix.arch }}.AppImage
           if-no-files-found: error
-
-  release:
-    if: github.event_name == 'release'
-    needs: appimage
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: avet-*.AppImage
-          merge-multiple: true
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: avet-*.AppImage
-          fail_on_unmatched_files: true

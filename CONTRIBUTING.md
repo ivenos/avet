@@ -79,14 +79,34 @@ Reopen one of these with a case it gets wrong, not with a preference.
 
 ## Commits
 
-Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/) with a short imperative subject.
+- Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/) with a short imperative subject.
+- A commit that does more than one thing lists its changes in the body, under the changelog section names as plain words. Changes to CI and tests are listed there too:
+
+```
+Added
+- avet.dv carries Dolby Vision into the output
+
+Changed
+- CI runs each suite on its own runner
+
+Fixed
+- Audio from MP4 played 21 ms late
+```
+
+## Changelog
+
+- `CHANGELOG.md` follows Keep a Changelog (https://keepachangelog.com/en/1.1.0/), with `Breaking changes` as the first section and `Dependencies` as the last.
+- Every commit that changes something for users adds its entry under `Unreleased`. CI, tests and refactoring stay out.
+- An entry is one short sentence in plain words that anyone understands. Details belong in the README.
+- What users have to act on after an update goes under `Breaking changes`.
+- An entry that goes back to an issue or a pull request ends with its number: `(#12)`.
 
 ## Releases
 
+- Run the Release workflow with the new version, such as `1.5.0`. It turns `Unreleased` into that version, tags the commit, publishes the image and builds a draft release with the AppImages and the notes from `CHANGELOG.md`.
+- A tag pushed by hand publishes the image and builds the draft too, from the section of its version.
 - The git tag is the version; `Cargo.toml` stays at `0.0.0`.
-- A push to `main` publishes the `dev` image, a `v*` tag the release image, and a GitHub release gets the AppImages.
-- The changelog lives in the GitHub release notes, in Keep a Changelog style (https://keepachangelog.com/en/1.1.0/). There is no CHANGELOG.md.
-- An entry that goes back to an issue or a pull request ends with its number: `(#12)`.
+- Commits on `main` publish the `dev` image.
 
 ## Dependencies
 
@@ -96,11 +116,11 @@ Conventional Commits (https://www.conventionalcommits.org/en/v1.0.0/) with a sho
 - FFmpeg and MKVToolNix in `appimage.yml` follow the image's Alpine versions and are bumped by hand.
 - CI fails while one of these versions differs between the image and the AppImage.
 - GitHub Actions and base images stay on version tags, never commit SHAs or digests.
-- Renovate opens the bumps. Other PRs leave dependencies alone.
+- Renovate opens the bumps and adds each one to the changelog. The release adds the numbers of their pull requests. Other PRs leave dependencies alone.
 
 ## Pull requests
 
-- One concern per PR, with tests for behavior changes.
+- One concern per PR, with tests and a changelog entry for behavior changes.
 - Only the PR author and the maintainer commit to it.
 - `cargo test` and `./test/run.sh` must pass.
 - Fill in the PR template, including the test plan and the CLA checkbox.

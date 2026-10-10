@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The new version, such as 1.5.0
+        required: true
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Stamp the changelog and tag the commit
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::A release is started from main"
+            exit 1
+          fi
+          sh .github/scripts/changelog.sh release "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: release $VERSION" CHANGELOG.md
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push --atomic origin HEAD:main "v$VERSION"
+
+  image:
+    needs: tag
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-publish.yml
+    with:
+      tag: ${{ needs.tag.outputs.name }}
+    secrets: inherit
+
+  appimage:
+    needs: tag
+    uses: ./.github/workflows/appimage.yml
+    with:
+      tag: ${{ needs.tag.outputs.name }}
+
+  release:
+    needs: [tag, image, appimage]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.tag.outputs.name }}
+
+      - name: Write the release notes
+        run: sh .github/scripts/changelog.sh notes "${VERSION#v}" > "$RUNNER_TEMP/notes.md"
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: avet-*.AppImage
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.tag.outputs.name }}
+          body_path: ${{ runner.temp }}/notes.md
+          files: avet-*.AppImage
+          fail_on_unmatched_files: true
+          draft: true

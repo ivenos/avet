@@ -1,13 +1,19 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
+  "ignorePaths": [],
   "dependencyDashboard": false,
   "labels": ["dependencies"],
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-optional",
   "platformAutomerge": false,
   "automergeStrategy": "squash",
-  "ignorePaths": [],
+  "rebaseWhen": "behind-base-branch",
+  "postUpgradeTasks": {
+    "commands": ["sh .github/scripts/changelog.sh dependency"],
+    "dataFileTemplate": "{{{depName}}}\t{{#if (equals updateType 'digest')}}{{{currentDigestShort}}}{{else}}{{#if (equals datasource 'docker')}}{{{currentValue}}}{{else}}{{#if currentVersion}}{{{currentVersion}}}{{else}}{{{currentValue}}}{{/if}}{{/if}}{{/if}}\t{{#if (equals updateType 'digest')}}{{{newDigestShort}}}{{else}}{{#if (equals datasource 'docker')}}{{{newValue}}}{{else}}{{#if newVersion}}{{{newVersion}}}{{else}}{{{newValue}}}{{/if}}{{/if}}{{/if}}\n",
+    "fileFilters": ["CHANGELOG.md"]
+  },
   "lockFileMaintenance": { "enabled": true },
   "packageRules": [
     {
@@ -63,7 +69,8 @@
       "matchStrings": ["ARG SVT_AV1_HDR_REF=(?<currentDigest>[^\\n]+)"],
       "currentValueTemplate": "main",
       "datasourceTemplate": "git-refs",
-      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
+      "depNameTemplate": "SVT-AV1-HDR",
+      "packageNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
     },
     {
       "customType": "regex",
@@ -78,7 +85,8 @@
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": ["ARG VSHIP_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "git-refs",
-      "depNameTemplate": "https://codeberg.org/Line-fr/Vship",
+      "depNameTemplate": "Vship",
+      "packageNameTemplate": "https://codeberg.org/Line-fr/Vship",
       "versioningTemplate": "semver"
     },
     {
@@ -111,7 +119,8 @@
       "matchStrings": ["SVT_AV1_HDR_REF:\\s*\"?(?<currentDigest>[^\"\\s]+)\"?"],
       "currentValueTemplate": "main",
       "datasourceTemplate": "git-refs",
-      "depNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
+      "depNameTemplate": "SVT-AV1-HDR",
+      "packageNameTemplate": "https://github.com/juliobbv-p/svt-av1-hdr"
     },
     {
       "customType": "regex",
@@ -126,7 +135,8 @@
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
       "matchStrings": ["VSHIP_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
       "datasourceTemplate": "git-refs",
-      "depNameTemplate": "https://codeberg.org/Line-fr/Vship",
+      "depNameTemplate": "Vship",
+      "packageNameTemplate": "https://codeberg.org/Line-fr/Vship",
       "versioningTemplate": "semver"
     },
     {

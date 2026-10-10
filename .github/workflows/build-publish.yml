@@ -3,10 +3,15 @@ name: Build & Publish
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag to build and publish, such as v1.5.0
+        required: true
+        type: string
 
 env:
   GITHUB_IMAGE: ghcr.io/ivenos/avet
@@ -17,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -26,6 +31,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: The image and the AppImage pin the same versions
         run: |
@@ -61,6 +68,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Read rust-version
         id: msrv
@@ -86,6 +95,8 @@ jobs:
       list: ${{ steps.suites.outputs.list }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: List suites
         id: suites
@@ -109,17 +120,18 @@ jobs:
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       # The same value as in the build job, so that job reuses this one's layers.
       - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          case "$GITHUB_REF" in
-            refs/tags/v*) VERSION="$GITHUB_REF_NAME" ;;
-            *)            VERSION="dev-${GITHUB_SHA:0:7}" ;;
-          esac
+          VERSION="${TAG:-dev-${GITHUB_SHA:0:7}}"
           case "$VERSION" in
             *[!A-Za-z0-9._-]*) echo "::error::refusing unusual version name"; exit 1 ;;
           esac
@@ -199,6 +211,8 @@ jobs:
             runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Download test images
         uses: actions/download-artifact@v8
@@ -218,7 +232,7 @@ jobs:
 
   build:
     needs: [test, msrv, integration]
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    if: github.ref == 'refs/heads/main' || inputs.tag != ''
     permissions:
       contents: read
       packages: write
@@ -237,6 +251,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -255,15 +271,18 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag }}
         run: |
-          case "$GITHUB_REF" in
-            refs/tags/v*) VERSION="$GITHUB_REF_NAME" ;;
-            *)            VERSION="dev-${GITHUB_SHA:0:7}" ;;
-          esac
+          VERSION="${TAG:-dev-${GITHUB_SHA:0:7}}"
           case "$VERSION" in
             *[!A-Za-z0-9._-]*) echo "::error::refusing unusual version name"; exit 1 ;;
           esac
           echo "AVET_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Read the commit that was checked out
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Docker meta
         id: meta
@@ -273,6 +292,7 @@ jobs:
           labels: |
             org.opencontainers.image.licenses=GPL-3.0-only
             org.opencontainers.image.version=${{ env.AVET_VERSION }}
+            org.opencontainers.image.revision=${{ steps.commit.outputs.sha }}
 
       - name: Build and push by digest
         id: build
@@ -310,6 +330,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
 
       - name: Download digests
         uses: actions/download-artifact@v8
@@ -342,10 +364,10 @@ jobs:
             ${{ env.GITHUB_IMAGE }}
             docker.io/${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/main' }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/main' && inputs.tag == '' }}
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}},value=${{ inputs.tag }}
 
       - name: Create and push multi-arch manifest to GHCR
         working-directory: /tmp/digests
@@ -355,7 +377,7 @@ jobs:
             $(printf '${{ env.GITHUB_IMAGE }}@sha256:%s ' *)
 
       - name: Prepare Docker Hub README
-        if: startsWith(github.ref, 'refs/tags/')
+        if: inputs.tag != ''
         run: |
           printf '**Note:** This description is automatically generated from the [GitHub repository README](https://github.com/ivenos/avet).\n\n---\n\n' \
             | cat - README.md > /tmp/dockerhub-readme.md
@@ -368,7 +390,7 @@ jobs:
             $(printf 'docker.io/${{ env.DOCKERHUB_IMAGE }}@sha256:%s ' *)
 
       - name: Update Docker Hub description
-        if: startsWith(github.ref, 'refs/tags/')
+        if: inputs.tag != ''
         uses: peter-evans/dockerhub-description@v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
