@@ -58,6 +58,11 @@ impl DisplayModel {
         let kind = if self.hdr { "HDR" } else { "SDR" };
         format!("{}x{} {kind}", self.width, self.height)
     }
+
+    /// The same picture in other pixels: it keeps the place on the panel it had.
+    pub fn scaled(self, (width, height): (u32, u32)) -> Self {
+        DisplayModel { width, height, ..self }
+    }
 }
 
 /// HDR by the signaled transfer, at the resolution the two files are compared at. `frame`
@@ -253,14 +258,41 @@ impl SolveResult {
     }
 }
 
-pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry) -> Result<SolveResult> {
+/// A chunk's encoder input as a file: FFVship resizes an encode to its source, so a scaled one is held against this.
+pub struct Reference(PathBuf);
+
+impl Reference {
+    pub const PREFIX: &'static str = "reference_";
+
+    pub fn write(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Option<Self>> {
+        if ctx.opts.scale.is_none() {
+            return Ok(None);
+        }
+        let reference = Reference(ctx.temp_dir.join(format!("{}{}.mkv", Self::PREFIX, scene.padded_index())));
+        encode::write_reference(ctx.source, ctx.index, scene, &reference.0, ctx.config, ctx.opts)
+            .with_context(|| format!("write the reference of chunk {:05}", scene.index + 1))?;
+        Ok(Some(reference))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Reference {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry, reference: Option<&Reference>) -> Result<SolveResult> {
     let lo = ctx.tq.min_crf as f64;
     let hi = ctx.tq.max_crf as f64;
     let key = scene.padded_index();
     let mut n = 0u32;
 
     solve(ctx.tq, seed_crf(ctx.config, lo, hi), &mut |crf| {
-        let probe = probe_once(ctx, scene, crf)?;
+        let probe = probe_once(ctx, scene, crf, reference)?;
         n += 1;
         tracing::info!(
             "[{}] chunk {key} probe {n}/{} crf {crf} gives {}, {:.0}% size",
@@ -316,9 +348,36 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
 }
 
 /// Both readings carry the probe preset's bias; the final encode can come out larger.
-fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe> {
+fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64, reference: Option<&Reference>) -> Result<Probe> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
+    let overrides = encode::EncodeOverrides { crf: Some(crf), preset: Some(ctx.tq.probe_preset) };
+    let size_bytes = match reference {
+        Some(reference) => encode::encode_reference(reference.path(), scene, &probe, ctx.config, ctx.opts, overrides),
+        None => encode::encode_chunk(ctx.source, ctx.index, scene, &probe, ctx.config, &probe_opts(ctx), overrides),
+    }
+    // Nothing else in the temp dir's housekeeping knows about probe files.
+    .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
+    .with_context(|| format!("probe encode crf {crf}"))?;
+
+    let jod = score(ctx, scene, &probe, &tag, reference).and_then(|score| match score.mismatch {
+        Some(readings) => bail!("FFVship reads {readings}, so its score would compare two different pictures"),
+        None => Ok(score.jod),
+    });
+    let result = jod.and_then(|jod| {
+        let cambi = Floor::new(ctx.tq).needs_cambi(jod)
+            .then(|| measure_cambi(ctx, scene, &probe, &tag, reference))
+            .transpose()?;
+        Ok((jod, cambi))
+    });
+    let _ = std::fs::remove_file(&probe);
+    let (jod, cambi) = result.with_context(|| format!("measure chunk {:05} at crf {crf}", scene.index + 1))?;
+    let size_pct = chunk_size_pct(size_bytes, ctx.source_byte_index, scene.start_frame, scene.end_frame);
+    Ok(Probe { crf, jod, cambi, size_pct })
+}
+
+/// A probe read against the source itself has to look to FFVship like the source does.
+fn probe_opts(ctx: &ProbeContext) -> EncodeOptions {
     let mut opts = EncodeOptions {
         dynamic_hdr: Default::default(), hdr10plus_frames: None, deinterlace: None, ..ctx.opts.clone()
     };
@@ -333,42 +392,16 @@ fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64) -> Result<Probe>
             opts.hdr_args.extend([flag.to_string(), srgb.to_string()]);
         }
     }
-    let size_bytes = encode::encode_chunk(
-        ctx.source,
-        ctx.index,
-        scene,
-        &probe,
-        ctx.config,
-        &opts,
-        encode::EncodeOverrides { crf: Some(crf), preset: Some(ctx.tq.probe_preset) },
-    )
-    // Nothing else in the temp dir's housekeeping knows about probe files.
-    .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
-    .with_context(|| format!("probe encode crf {crf}"))?;
-
-    let jod = score(ctx, scene, &probe, &tag).and_then(|score| match score.mismatch {
-        Some(readings) => bail!("FFVship reads {readings}, so its score would compare two different pictures"),
-        None => Ok(score.jod),
-    });
-    let result = jod.and_then(|jod| {
-        let cambi = Floor::new(ctx.tq).needs_cambi(jod)
-            .then(|| measure_cambi(ctx, scene, &probe, &tag))
-            .transpose()?;
-        Ok((jod, cambi))
-    });
-    let _ = std::fs::remove_file(&probe);
-    let (jod, cambi) = result.with_context(|| format!("measure chunk {:05} at crf {crf}", scene.index + 1))?;
-    let size_pct = chunk_size_pct(size_bytes, ctx.source_byte_index, scene.start_frame, scene.end_frame);
-    Ok(Probe { crf, jod, cambi, size_pct })
+    opts
 }
 
 /// The finished chunk as it will play, which the probes at another preset only estimate.
-pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path) -> Option<f64> {
+pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path, reference: Option<&Reference>) -> Option<f64> {
     // FFVship would hold the deinterlaced encode against the source's combed frames.
-    if ctx.opts.deinterlace.is_some() {
+    if ctx.opts.deinterlace.is_some() && reference.is_none() {
         return None;
     }
-    match score(ctx, scene, chunk, &format!("{}_final", scene.padded_index())) {
+    match score(ctx, scene, chunk, &format!("{}_final", scene.padded_index()), reference) {
         Ok(Score { jod, mismatch: None }) => Some(jod),
         Ok(Score { mismatch: Some(readings), .. }) => {
             tracing::debug!("[{}] chunk {}: not measured, FFVship reads {readings}", ctx.stem, scene.padded_index());
@@ -386,10 +419,11 @@ struct Score {
     mismatch: Option<String>,
 }
 
-fn score(ctx: &ProbeContext, scene: &SceneEntry, distorted: &Path, tag: &str) -> Result<Score> {
+fn score(ctx: &ProbeContext, scene: &SceneEntry, distorted: &Path, tag: &str, reference: Option<&Reference>) -> Result<Score> {
     let _gpu = ctx.gpu_lock.lock().unwrap();
     let measured = |display_model| measure(&MeasureOpts {
         distorted,
+        reference: reference.map(Reference::path),
         source: ctx.source,
         index: ctx.index,
         work_dir: ctx.temp_dir,
@@ -573,6 +607,8 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
 
 struct MeasureOpts<'a> {
     distorted: &'a Path,
+    /// Holds the chunk's frames from 0 and at the encode's size, where the source does neither.
+    reference: Option<&'a Path>,
     source: &'a Path,
     /// avet's existing FFMS2 index for the source, reused read-only by FFVship.
     index: &'a Path,
@@ -632,9 +668,11 @@ fn measure(m: &MeasureOpts) -> Result<(f64, Option<(Reading, Reading)>)> {
     let _cleanup = Cleanup(vec![json.clone()]);
 
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
-    cmd.arg("-s").arg(m.source)
-        .arg("-e").arg(m.distorted)
-        .arg("--source-index").arg(m.index)
+    match m.reference {
+        Some(reference) => cmd.arg("-s").arg(reference),
+        None => cmd.arg("-s").arg(m.source).arg("--source-index").arg(m.index),
+    };
+    cmd.arg("-e").arg(m.distorted)
         .args(measure_args(m))
         .arg("--json").arg(&json);
 
@@ -653,13 +691,15 @@ fn measure(m: &MeasureOpts) -> Result<(f64, Option<(Reading, Reading)>)> {
 fn measure_args(m: &MeasureOpts) -> Vec<String> {
     let mut args: Vec<String> = ["-m", "CVVDP"].iter().map(|s| (*s).to_string()).collect();
     args.extend([
-        "--start".into(), m.start.to_string(),
-        "--encoded-offset".into(), format!("-{}", m.start),
         "--displayModel".into(), DisplayModel::KEY.to_string(),
         "--displayConfig".into(), m.display_model.config_json(),
         "--gpu-id".into(), m.gpu_id.to_string(),
         "--verbose".into(),
     ]);
+    if m.reference.is_some() {
+        return args;
+    }
+    args.extend(["--start".into(), m.start.to_string(), "--encoded-offset".into(), format!("-{}", m.start)]);
     if let Some(c) = m.crop {
         args.extend([
             "--cropLeftSource".into(), c.x.to_string(),
@@ -691,7 +731,7 @@ fn parse_cvvdp(raw: &str) -> Result<f64> {
 
 /// libvmaf's full-reference CAMBI clamps the per-frame diff at 0, so banding the source
 /// already had costs nothing there.
-fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str) -> Result<Cambi> {
+fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str, reference: Option<&Reference>) -> Result<Cambi> {
     let timeout_secs = 1800 + scene.frame_count();
 
     // Not in the temp dir: a share without Unix extensions has no FIFOs.
@@ -731,7 +771,11 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let sink = vmaf.stdin.take().expect("reference input is piped");
     let (source, index, opts) = (ctx.source.to_path_buf(), ctx.index.to_path_buf(), ctx.opts.clone());
     let (start, end) = (scene.start_frame, scene.end_frame);
+    let reference = reference.map(|r| r.path().to_path_buf());
     let writer = std::thread::spawn(move || -> Result<()> {
+        if let Some(reference) = reference {
+            return pipe_reference(&reference, &opts, sink);
+        }
         let mut vs = VideoSource::open(&source, &index, OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: false })
             .context("open FFMS2 VideoSource")?;
         vs.info.fps_num = opts.fps_num;
@@ -797,6 +841,21 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     write_res.context("write Y4M reference to vmaf")?;
 
     parse_cambi(&read_metric_json(&json, "vmaf")?)
+}
+
+/// A reader that went away first comes back as the broken pipe the Y4M writer would report.
+fn pipe_reference(reference: &Path, opts: &EncodeOptions, sink: std::process::ChildStdin) -> Result<()> {
+    let mut decoder = encode::spawn_reference_decoder(reference, opts, Stdio::from(sink))?;
+    let stderr = crate::ext::drain_text(decoder.stderr.take());
+    let status = decoder.wait().context("wait for ffmpeg reference decoder")?;
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    if stderr.contains("Broken pipe") {
+        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+    }
+    Err(crate::ext::tool_error("ffmpeg reference decoder", status, &stderr))
 }
 
 /// CAMBI's visibility thresholds come in BT.1886 and PQ; HLG is measured as BT.1886.
@@ -951,6 +1010,15 @@ mod tests {
             let native = display_model_for(w, h, (w, h), &[]);
             assert!((pitch(native) - pitch(full)).abs() < 1e-12, "{w}x{h}");
         }
+    }
+
+    #[test]
+    fn a_scaled_picture_fills_the_panel_as_the_source_did() {
+        let source = display_model_for(3840, 1600, (3840, 2160), &[]);
+        let scaled = source.scaled((1920, 800));
+        assert!(scaled.config_json().contains("\"resolution\":[1920,800]"), "{}", scaled.config_json());
+        assert_eq!(scaled.diagonal_inches, source.diagonal_inches);
+        assert_eq!(scaled.describe(), "1920x800 SDR");
     }
 
     #[test]
@@ -1445,8 +1513,9 @@ mod tests {
 
     #[test]
     fn measure_args_offsets_the_chunk_and_turns_the_crop_into_edge_amounts() {
-        let opts = |crop| MeasureOpts {
+        let opts = |crop, reference| MeasureOpts {
             distorted: Path::new("probe.ivf"),
+            reference,
             source: Path::new("film.mkv"),
             index: Path::new("film.ffindex"),
             work_dir: Path::new("."),
@@ -1464,7 +1533,7 @@ mod tests {
         };
 
         // The probe holds the chunk's frames from 0; the source has them from 720.
-        let plain = measure_args(&opts(None));
+        let plain = measure_args(&opts(None, None));
         assert_eq!(pair(&plain, "--start").as_deref(), Some("720"));
         assert_eq!(pair(&plain, "--encoded-offset").as_deref(), Some("-720"));
         assert_eq!(pair(&plain, "--displayModel").as_deref(), Some(DisplayModel::KEY));
@@ -1473,17 +1542,23 @@ mod tests {
         assert!(plain.iter().any(|a| a == "--verbose"));
         assert!(!plain.iter().any(|a| a.starts_with("--crop")));
 
-        let cropped = measure_args(&opts(Some(Crop { w: 1920, h: 800, x: 0, y: 140 })));
+        let crop = Some(Crop { w: 1920, h: 800, x: 0, y: 140 });
+        let cropped = measure_args(&opts(crop, None));
         assert_eq!(pair(&cropped, "--cropLeftSource").as_deref(), Some("0"));
         assert_eq!(pair(&cropped, "--cropTopSource").as_deref(), Some("140"));
         assert_eq!(pair(&cropped, "--cropRightSource").as_deref(), Some("0"));
         assert_eq!(pair(&cropped, "--cropBottomSource").as_deref(), Some("140"));
 
-        let pillar = measure_args(&opts(Some(Crop { w: 1440, h: 1080, x: 240, y: 0 })));
+        let pillar = measure_args(&opts(Some(Crop { w: 1440, h: 1080, x: 240, y: 0 }), None));
         assert_eq!(pair(&pillar, "--cropLeftSource").as_deref(), Some("240"));
         assert_eq!(pair(&pillar, "--cropRightSource").as_deref(), Some("240"));
         assert_eq!(pair(&pillar, "--cropTopSource").as_deref(), Some("0"));
         assert_eq!(pair(&pillar, "--cropBottomSource").as_deref(), Some("0"));
+
+        // A reference holds the chunk as the probe does: cropped, and from frame 0.
+        let reference = measure_args(&opts(crop, Some(Path::new("reference_00003.mkv"))));
+        assert!(!reference.iter().any(|a| a.starts_with("--crop") || a == "--start" || a == "--encoded-offset"), "{reference:?}");
+        assert!(pair(&reference, "--displayConfig").is_some());
     }
 
     #[test]

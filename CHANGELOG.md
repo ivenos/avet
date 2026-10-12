@@ -4,6 +4,10 @@ All notable changes to this project are documented in this file, in the format o
 
 ## [Unreleased]
 
+### Added
+
+- `[target_quality]` works together with `avet.scale`.
+
 ### Dependencies
 
 - signal-hook 0.4.4 -> 0.4.5 (#45)

@@ -43,7 +43,7 @@ cargo test --locked           # unit tests
 - Failures that clear on their own carry `job::Transient` and are retried. Everything else writes a `.failed` marker, which an edit of `encode.toml` lifts.
 - Run external tools through `ext::output_with_timeout` and report a non-zero exit with `ext::tool_error`, which classifies a tool stopped from outside and a full disk as transient.
 - mkvmerge starts from `ext::mkvmerge` and runs through `ext::mkvmerge_output`.
-- Tools fed through a pipe (the encoders, the ffmpeg filter stage, scene detection, the HDR10+ scan and CAMBI) start with `ext::spawn` and drain their stderr with `ext::drain_text`.
+- Tools fed through a pipe (the encoders, the ffmpeg filter stage, the reference writer, scene detection, the HDR10+ scan and CAMBI) start with `ext::spawn` and drain their stderr with `ext::drain_text`.
 - ffmpeg calls on the source name their stream: `-map 0:v:0`, `-map 0:a:<n>`.
 - Write output and state files under a scratch name, then rename them into place.
 - A comment only earns its place when it records something the code cannot. One or two lines.

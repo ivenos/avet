@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
 use crate::config::{Config, Encoder};
-use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, PixelSubsampling, VideoSource};
+use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, PixelFormat, PixelSubsampling, VideoSource};
 use crate::ext::external_bin;
 use crate::hdr::{DynamicHdr, Geometry};
 use crate::resume::SceneEntry;
@@ -44,45 +44,12 @@ pub fn encode_chunk(
     opts: &EncodeOptions,
     overrides: EncodeOverrides,
 ) -> Result<u64> {
-    let encoder = config.encoder.context("encoder is required when video is encoded")?;
-    let encoder_name = encoder_binary(encoder);
-    let encoder_bin = external_bin(encoder_name);
-    let mut encoder_args = build_encoder_args(config, output_path, opts)?;
-    if let Some(crf) = overrides.crf {
-        set_arg(&mut encoder_args, "--crf", crf.to_string());
-    }
-    if let Some(preset) = overrides.preset {
-        set_arg(&mut encoder_args, "--preset", preset.to_string());
-    }
-
-    let mut vs = VideoSource::open(
-        source_file,
-        index_file,
-        OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: opts.deinterlace.is_some() },
-    )
-    .context("open FFMS2 VideoSource")?;
-    vs.info.fps_num = opts.fps_num;
-    vs.info.fps_den = opts.fps_den;
+    let (encoder_bin, encoder_name, encoder_args) = encoder_invocation(config, output_path, opts, overrides)?;
+    let mut vs = open_source(source_file, index_file, opts)?;
 
     let mut hdr_metadata = Vec::new();
     let capture = opts.dynamic_hdr.any().then_some(&mut hdr_metadata);
-    let format = &vs.info.pixel_format;
-    let subsample = format.subsampling != PixelSubsampling::Yuv420;
-    // Left to its default, swscale shifts left and center sited chroma alike.
-    let siting = opts.chroma_loc.map_or_else(String::new, |loc| format!(":in_chroma_loc={loc}:out_chroma_loc={loc}"));
-    let resample = match opts.scale {
-        Some((w, h)) => Some(format!("scale={w}:{h}:flags=lanczos{siting}")),
-        None => subsample.then(|| format!("scale=iw:ih{siting}")),
-    };
-    let to_420 = subsample.then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
-    let filters: Vec<String> = [
-        opts.deinterlace.map(|d| d.filter().to_string()),
-        resample,
-        to_420,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let filters = filter_chain(opts, &vs.info.pixel_format);
     if filters.is_empty() {
         encode_direct(&encoder_bin, encoder_name, &encoder_args, &mut vs, scene, opts.crop, capture)?;
     } else {
@@ -100,6 +67,173 @@ pub fn encode_chunk(
         }
         insert_hdr_metadata(output_path, &hdr_metadata, opts.dynamic_hdr, geometry, scene)?;
     }
+
+    Ok(std::fs::metadata(output_path)
+        .with_context(|| format!("chunk output not found: {}", output_path.display()))?
+        .len())
+}
+
+fn encoder_invocation(
+    config: &Config,
+    output_path: &Path,
+    opts: &EncodeOptions,
+    overrides: EncodeOverrides,
+) -> Result<(std::ffi::OsString, &'static str, Vec<String>)> {
+    let encoder = config.encoder.context("encoder is required when video is encoded")?;
+    let encoder_name = encoder_binary(encoder);
+    let mut encoder_args = build_encoder_args(config, output_path, opts)?;
+    if let Some(crf) = overrides.crf {
+        set_arg(&mut encoder_args, "--crf", crf.to_string());
+    }
+    if let Some(preset) = overrides.preset {
+        set_arg(&mut encoder_args, "--preset", preset.to_string());
+    }
+    Ok((external_bin(encoder_name), encoder_name, encoder_args))
+}
+
+fn open_source(source_file: &Path, index_file: &Path, opts: &EncodeOptions) -> Result<VideoSource> {
+    let mut vs = VideoSource::open(
+        source_file,
+        index_file,
+        OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: opts.deinterlace.is_some() },
+    )
+    .context("open FFMS2 VideoSource")?;
+    vs.info.fps_num = opts.fps_num;
+    vs.info.fps_den = opts.fps_den;
+    Ok(vs)
+}
+
+fn filter_chain(opts: &EncodeOptions, format: &PixelFormat) -> Vec<String> {
+    let subsample = format.subsampling != PixelSubsampling::Yuv420;
+    // Left to its default, swscale shifts left and center sited chroma alike.
+    let siting = opts.chroma_loc.map_or_else(String::new, |loc| format!(":in_chroma_loc={loc}:out_chroma_loc={loc}"));
+    let resample = match opts.scale {
+        Some((w, h)) => Some(format!("scale={w}:{h}:flags=lanczos{siting}")),
+        None => subsample.then(|| format!("scale=iw:ih{siting}")),
+    };
+    let to_420 = subsample.then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
+    [
+        opts.deinterlace.map(|d| d.filter().to_string()),
+        resample,
+        to_420,
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The encoder's input for a chunk as a lossless file that carries the tags of the encode.
+pub fn write_reference(
+    source_file: &Path,
+    index_file: &Path,
+    scene: &SceneEntry,
+    path: &Path,
+    config: &Config,
+    opts: &EncodeOptions,
+) -> Result<()> {
+    let mut vs = open_source(source_file, index_file, opts)?;
+    let mut filters = filter_chain(opts, &vs.info.pixel_format);
+    filters.push(reference_tags(&merged_encoder_args(config, opts)));
+
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
+    cmd
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "yuv4mpegpipe", "-r", &format!("{}/{}", opts.fps_num, opts.fps_den), "-i", "pipe:0"])
+        .args(["-vf", &filters.join(","), "-fps_mode", "passthrough", "-c:v", "ffv1", "-level", "3", "-g", "1", "-f", "matroska"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut ff = crate::ext::spawn(&mut cmd, "ffmpeg reference")?;
+    let ff_err_t = crate::ext::drain_text(ff.stderr.take());
+
+    let mut ff_in = BufWriter::with_capacity(256 * 1024, ff.stdin.take().expect("ffmpeg stdin unavailable"));
+    let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, opts.crop, None);
+    drop(ff_in);
+
+    let status = ff.wait().context("wait for ffmpeg reference")?;
+    let stderr = ff_err_t.join().unwrap_or_default();
+    if !status.success() || write_res.as_ref().is_err_and(broken_pipe) {
+        let err = tool_failure("ffmpeg reference", status, &stderr, scene.index);
+        return Err(match feed_failure(write_res) {
+            Some(cause) => err.context(format!("reading the source failed first: {cause}")),
+            None => err,
+        });
+    }
+    write_res.context("write Y4M frames to ffmpeg reference")
+}
+
+/// As a `setparams` filter: named as an output option, a tag makes ffmpeg convert the pixels to it.
+fn reference_tags(encoder_args: &[String]) -> String {
+    let value = |flag: &str| encoder_args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str());
+    let mut tags = vec![
+        format!("range={}", if value("--color-range") == Some("1") { "pc" } else { "tv" }),
+        // AV1 has no center siting, so FFVship takes the encode for left sited there too.
+        format!("chroma_location={}", if value("--chroma-sample-position") == Some("2") { "topleft" } else { "left" }),
+    ];
+    for (flag, key) in [
+        ("--color-primaries", "color_primaries"),
+        ("--transfer-characteristics", "color_trc"),
+        ("--matrix-coefficients", "colorspace"),
+    ] {
+        tags.extend(value(flag).map(|v| format!("{key}={v}")));
+    }
+    format!("setparams={}", tags.join(":"))
+}
+
+pub fn spawn_reference_decoder(reference: &Path, opts: &EncodeOptions, stdout: Stdio) -> Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
+    cmd
+        // Without -r, the rate comes back from Matroska's millisecond timestamps: 29011/242 for 120000/1001.
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-r", &format!("{}/{}", opts.fps_num, opts.fps_den), "-i"])
+        .arg(reference)
+        .args(["-map", "0:v:0", "-fps_mode", "passthrough", "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::piped());
+    crate::ext::spawn(&mut cmd, "ffmpeg reference decoder")
+}
+
+pub fn encode_reference(
+    reference: &Path,
+    scene: &SceneEntry,
+    output_path: &Path,
+    config: &Config,
+    opts: &EncodeOptions,
+    overrides: EncodeOverrides,
+) -> Result<u64> {
+    let (encoder_bin, encoder_name, encoder_args) = encoder_invocation(config, output_path, opts, overrides)?;
+
+    let mut ff = spawn_reference_decoder(reference, opts, Stdio::piped())?;
+    let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
+    let ff_err_t = crate::ext::drain_text(ff.stderr.take());
+
+    let mut cmd = std::process::Command::new(&encoder_bin);
+    cmd.args(&encoder_args)
+        .args(["--input", "-"])
+        .stdin(Stdio::from(ff_out))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = match crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'")) {
+        Ok(child) => child,
+        Err(e) => {
+            crate::ext::reap(&mut ff);
+            return Err(e);
+        }
+    };
+    let enc_err_t = crate::ext::drain_text(child.stderr.take());
+
+    let ff_status  = ff.wait().context("wait for ffmpeg reference decoder")?;
+    let enc_status = child.wait().context("wait for encoder")?;
+    let ff_stderr  = ff_err_t.join().unwrap_or_default();
+    let enc_stderr = enc_err_t.join().unwrap_or_default();
+
+    if encoder_to_blame(ff_status.success(), &ff_stderr, enc_status.success(), &enc_stderr) {
+        return Err(tool_failure("encoder", enc_status, &enc_stderr, scene.index));
+    }
+    if !ff_status.success() {
+        return Err(tool_failure("ffmpeg reference decoder", ff_status, &ff_stderr, scene.index));
+    }
+    ensure_complete(output_path, scene)?;
 
     Ok(std::fs::metadata(output_path)
         .with_context(|| format!("chunk output not found: {}", output_path.display()))?
@@ -468,6 +602,29 @@ mod tests {
         assert_eq!(allowed_cpus(&status("0-23")), Some(24));
         assert_eq!(allowed_cpus(&status("0,2,4-7")), Some(6));
         assert_eq!(allowed_cpus("Name:\tavet\n"), None);
+    }
+
+    #[test]
+    fn the_reference_is_tagged_as_the_encode_is() {
+        let args = |pairs: &[(&str, &str)]| -> Vec<String> {
+            pairs.iter().flat_map(|(k, v)| [k.to_string(), v.to_string()]).collect()
+        };
+
+        let pq = args(&[
+            ("--preset", "6"), ("--color-primaries", "9"), ("--transfer-characteristics", "16"),
+            ("--matrix-coefficients", "9"), ("--chroma-sample-position", "2"),
+        ]);
+        assert_eq!(
+            reference_tags(&pq),
+            "setparams=range=tv:chroma_location=topleft:color_primaries=9:color_trc=16:colorspace=9"
+        );
+
+        // What the encode leaves unsigned stays unsigned, so FFVship guesses the same for both.
+        assert_eq!(reference_tags(&args(&[("--crf", "30")])), "setparams=range=tv:chroma_location=left");
+        assert_eq!(
+            reference_tags(&args(&[("--color-range", "1"), ("--chroma-sample-position", "1")])),
+            "setparams=range=pc:chroma_location=left"
+        );
     }
 
     #[test]

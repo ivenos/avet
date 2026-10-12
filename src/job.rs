@@ -390,16 +390,16 @@ fn run_encode(
         .collect();
     tracing::info!("[{stem}] encoder args: {}", summary.join(" "));
 
-    // FFVship compares at source resolution, so the model follows the crop, not the scale.
-    let (reference_width, reference_height) = encode_opts
+    let (cropped_width, cropped_height) = encode_opts
         .crop
         .map(|c| (c.w, c.h))
         .unwrap_or((video_info.width, video_info.height));
     let (tq_display_model, tq_gpu_id, crf_cache): (Option<Mutex<target_quality::DisplayModel>>, Option<u32>, Option<CrfCache>) =
         if let (Some(tq), Some(gpu)) = (&config.target_quality, &gpu) {
             let display_model = target_quality::display_model_for(
-                reference_width, reference_height, (video_info.width, video_info.height), &encode_opts.hdr_args,
+                cropped_width, cropped_height, (video_info.width, video_info.height), &encode_opts.hdr_args,
             );
+            let display_model = scale_target.map_or(display_model, |size| display_model.scaled(size));
             tracing::info!(
                 "[{stem}] target quality: JOD {} floor (display {}, {}, crf {}-{}, {}-{} probes, probe preset {}, max {}% size)",
                 tq.jod, display_model.describe(), gpu.describe(), tq.min_crf, tq.max_crf,
@@ -965,13 +965,19 @@ fn free_path(path: &Path) -> Result<PathBuf> {
 fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     let chunk_key    = scene.padded_index();
     let scene_frames = scene.frame_count();
-    let crf_override = resolve_crf(w, &chunk_key, scene)?;
+    let reference    = probe_context(w).map(|ctx| target_quality::Reference::write(&ctx, scene)).transpose()?.flatten();
+    let crf_override = resolve_crf(w, &chunk_key, scene, reference.as_ref())?;
 
     let overrides  = encode::EncodeOverrides { crf: crf_override, preset: None };
+    let chunk      = w.temp.chunk_path(&chunk_key);
     let t0         = std::time::Instant::now();
-    let size_bytes = encode::encode_chunk(
-        w.source, &w.temp.index_path, scene, &w.temp.chunk_path(&chunk_key), w.config, w.opts, overrides,
-    )?;
+    let size_bytes = match &reference {
+        // Dolby Vision and HDR10+ come with the source's own frames, so those are read again.
+        Some(reference) if !w.opts.dynamic_hdr.any() => {
+            encode::encode_reference(reference.path(), scene, &chunk, w.config, w.opts, overrides)?
+        }
+        _ => encode::encode_chunk(w.source, &w.temp.index_path, scene, &chunk, w.config, w.opts, overrides)?,
+    };
 
     let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
     w.done.mark_done(&chunk_key, scene_frames, size_bytes)?;
@@ -981,7 +987,7 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
         if pct > ctx.tq.max_encoded_percent {
             tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.0}% of the source, over max_encoded_percent", w.stem);
         }
-        if let Some(jod) = target_quality::measure_final(&ctx, scene, &w.temp.chunk_path(&chunk_key)) {
+        if let Some(jod) = target_quality::measure_final(&ctx, scene, &chunk, reference.as_ref()) {
             let probed = cache.probed(&chunk_key);
             cache.set_measured(&chunk_key, jod)?;
             if jod < ctx.tq.jod && probed.is_some_and(|p| p >= ctx.tq.jod) {
@@ -1023,7 +1029,12 @@ fn probe_context<'a>(w: &'a WorkerCtx) -> Option<target_quality::ProbeContext<'a
 }
 
 /// Cached CRF, else probe-and-solve; None when target quality is off.
-fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Option<f64>> {
+fn resolve_crf(
+    w: &WorkerCtx,
+    chunk_key: &str,
+    scene: &SceneEntry,
+    reference: Option<&target_quality::Reference>,
+) -> Result<Option<f64>> {
     let (Some(ctx), Some(cache)) = (probe_context(w), &w.crf_cache) else {
         return Ok(None);
     };
@@ -1032,7 +1043,7 @@ fn resolve_crf(w: &WorkerCtx, chunk_key: &str, scene: &SceneEntry) -> Result<Opt
         return Ok(Some(c));
     }
 
-    let res = target_quality::solve_chunk_crf(&ctx, scene)?;
+    let res = target_quality::solve_chunk_crf(&ctx, scene, reference)?;
 
     cache.insert(chunk_key, res.crf, res.jod)?;
     match res.outcome {
@@ -1389,7 +1400,7 @@ fn changed_fields<T: serde::Serialize + Default>(value: &T) -> String {
 /// A probe killed mid-run leaves its encode behind, and nothing else in the temp dir's
 /// housekeeping knows those names.
 fn sweep_probe_leftovers(dir: &Path, stem: &str) {
-    const PREFIXES: [&str; 3] = ["probe_", "cvvdp_", "cambi_"];
+    const PREFIXES: [&str; 4] = ["probe_", "cvvdp_", "cambi_", target_quality::Reference::PREFIX];
 
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut removed = 0;

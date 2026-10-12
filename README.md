@@ -159,7 +159,7 @@ jod = 9.5
 | `max_cambi` | - | Maximum CAMBI of the encode, at least `0` |
 | `max_cambi_diff` | - | Maximum CAMBI the encode may add on top of its input, at least `0` |
 
-- Needs `avet.video = "encode"` and cannot be combined with `avet.scale`.
+- Needs `avet.video = "encode"`. Scored against the picture after `avet.scale`.
 - `max_encoded_percent` wins over `jod`: a chunk that would grow past it gets a higher CRF, and a warning is logged. The sizes are those of the probes; a finished chunk that still comes out larger is logged too. Where the source's packet sizes cannot be read, the limit is off for that file.
 - CAMBI is `0` without banding; Netflix places slightly annoying banding at around `5`. `max_cambi` counts banding the source already has, `max_cambi_diff` does not. Both are compared with the 95th percentile of a chunk's frames and are measured without film grain.
 - A finished chunk is scored again. The `done` line gives the lowest of these scores, and a chunk that came out under `jod` although its probe held it is logged as a warning.

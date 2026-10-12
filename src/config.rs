@@ -424,14 +424,6 @@ impl Config {
             if self.avet.video == VideoMode::Copy {
                 bail!("target_quality requires avet.video = \"encode\"");
             }
-            // FFVship scores at source resolution: 1080p to 540p alone measures 0.8 JOD lower.
-            if self.avet.scale.is_some() {
-                bail!(
-                    "target_quality cannot be combined with avet.scale: the quality score \
-                     compares against the source at its own resolution, so the downscale \
-                     itself counts as a loss and no CRF reaches the floor. Remove one of them."
-                );
-            }
             // SvtAv1EncApp's --cqp overrides --crf wherever it stands.
             if self.encoder_params.contains_key("tbr")
                 || self.encoder_params.contains_key("cqp")
@@ -803,17 +795,8 @@ mod tests {
     }
 
     #[test]
-    fn target_quality_and_scale_are_refused_together() {
-        // The score compares against the source, so the downscale reads as lost quality.
-        let err = Config::from_str_for_test(
-            "encoder = \"svt-av1\"\n[avet]\nscale = 1080\n[target_quality]\njod = 9.5",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("avet.scale"), "got: {err}");
-
-        Config::from_str_for_test("encoder = \"svt-av1\"\n[target_quality]\njod = 9.5").unwrap();
-        Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\nscale = 1080").unwrap();
+    fn a_scaled_encode_takes_a_quality_target() {
+        Config::from_str_for_test("encoder = \"svt-av1\"\n[avet]\nscale = 1080\n[target_quality]\njod = 9.5").unwrap();
     }
 
     #[test]

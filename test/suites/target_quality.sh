@@ -27,12 +27,12 @@ assert_file_not_exists "$O/test.mkv"
 assert_log_contains "retrying on the next scan"
 assert_file_not_exists "$O/.avet_test/.failed"
 
-search() { # NAME SOURCE [TARGET_QUALITY_LINES]
+search() { # NAME SOURCE [TARGET_QUALITY_LINES] [AVET_LINES]
     I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"
     SRC="$2"
     cp "$SRC" "$I/p/test.mkv"
-    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 3\n%b' \
-        "${3:-}" > "$I/p/encode.toml"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n%b[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 3\n%b' \
+        "${4:-}" "${3:-}" > "$I/p/encode.toml"
     TEST_SOFTWARE_GPU=1 run_avet "$I" "$O" "$O/test.mkv" 600 || fail "$1: no output"
 }
 
@@ -60,6 +60,20 @@ $FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -vf "format=yuv420p
 search bt2020 "$WORKDIR/bt2020.mkv"
 assert_log_contains "display 320x180 SDR"
 assert_log_contains "FFVship reads the source as PQ, display 320x180 HDR"
+
+# a scaled encode is held against the scaled picture, which carries the tags of the encode
+search scaled "$WORKDIR/bt2020.mkv" '' 'scale = 90\n'
+assert_log_contains "FFVship reads the source as PQ, display 160x90 HDR"
+assert_log_contains "chunk 00001 target crf"
+assert_frames_match "$O/test.mkv" "$SRC" "scale=160:90:flags=lanczos" 20
+grep -q '"measured"' "$O/.avet_test/tq.json" 2>/dev/null || fail "scaled: the finished chunk was not measured"
+[ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_|reference_)')" ] || fail "scaled: probe files were left behind"
+
+# and CAMBI reads its reference from the same file; libvmaf returns no CAMBI below some 216 columns
+$FF -f lavfi -i "testsrc2=size=640x360:rate=24" -frames:v 24 -pix_fmt yuv420p -c:v ffv1 "$WORKDIR/sdr360.mkv"
+search scaled_cambi "$WORKDIR/sdr360.mkv" 'max_cambi = 20\n' 'scale = 180\n'
+assert_log_contains "display 320x180 SDR"
+assert_log_contains ", CAMBI "
 
 # RGB reaches the encoder as 4:2:0 YUV, which costs it the floor, and is still compared as the same picture
 $FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -c:v libx264rgb -qp 0 -preset ultrafast "$WORKDIR/rgb.mkv"
