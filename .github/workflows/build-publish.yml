@@ -16,7 +16,7 @@ on:
 env:
   GITHUB_IMAGE: ghcr.io/ivenos/avet
   DOCKERHUB_IMAGE: ivenos/avet
-  RUST_VERSION: "1.99.0"
+  RUST_VERSION: "1.99.1"
 
 permissions:
   contents: read
