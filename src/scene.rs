@@ -76,7 +76,7 @@ pub fn detect(
         lookahead_distance: 5,
     };
 
-    let results = av_scenechange::detect_scene_changes::<u8>(&mut decoder, opts, None, None);
+    let results = av_scenechange::detect_scene_changes::<u8>(&mut decoder, opts, None, None, None);
 
     // Close the read end first, or waiting on an undrained writer hangs for good.
     drop(decoder);
