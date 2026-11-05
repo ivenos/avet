@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file, in the format o
 - toml 1.1.6+spec-1.1.0 -> 1.1.7
 - rust 1.99.0 -> 1.99.1
 - av-scenechange 0.24.1 -> 0.25.0
+- AOMediaCodec/SVT-AV1 v4.2.0 -> v4.3.0
 
 ## [2.0.0] - 2026-10-07
 
