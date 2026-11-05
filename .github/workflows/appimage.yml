@@ -21,7 +21,7 @@ on:
     paths: [".github/workflows/appimage.yml", ".github/scripts/crate-licenses.sh", "packaging/**"]
 
 env:
-  SVT_AV1_VERSION: v4.2.0
+  SVT_AV1_VERSION: v4.3.0
   # Rolling-release repo: pin a main commit, bump via PR.
   SVT_AV1_HDR_REF: a46bc2d59774785f4db7341003fa23dbeb473b5a
   FFMS2_VERSION: "5.0"
