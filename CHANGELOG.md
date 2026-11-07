@@ -12,7 +12,7 @@ All notable changes to this project are documented in this file, in the format o
 
 - signal-hook 0.4.4 -> 0.4.5 (#45)
 - SVT-AV1-HDR 18327c0 -> a46bc2d
-- toml 1.1.6+spec-1.1.0 -> 1.1.7
+- toml 1.1.6+spec-1.1.0 -> 1.2.0
 - rust 1.99.0 -> 1.99.1
 - av-scenechange 0.24.1 -> 0.25.0
 - AOMediaCodec/SVT-AV1 v4.2.0 -> v4.3.0
