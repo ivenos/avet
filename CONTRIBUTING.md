@@ -27,6 +27,7 @@ cargo test --locked           # unit tests
 ./test/run.sh --verbose       # print the container logs of a failed suite
 ```
 
+- A failure proptest finds becomes a named unit test. `proptest-regressions/` is gitignored.
 - The integration suites test the binary inside the image. Rebuild it after a change.
 - `run.sh` builds the avet image and `test/tools.Dockerfile`, which adds `dovi-tool`, `hdr10plus-tool` and `mkvtoolnix` for the fixtures in `test/fixtures.sh`.
 - Assertions use the image's own ffmpeg and mkvtoolnix. `test/suites/selftest.sh` checks that every assertion fails on a broken file.
@@ -36,9 +37,14 @@ cargo test --locked           # unit tests
 - A case whose source makes avet repair its scene list sets `TEST_SCENE_REPAIR=1`.
 - `TEST_SOFTWARE_GPU=1` passes `AVET_SOFTWARE_GPU=1`, with which avet accepts the image's software Vulkan device. `target_quality.sh` runs the search that way.
 - `test/local/` is gitignored for trying the image on your own samples.
+- A new case takes a `$WORKDIR/<n>` number no other case in its suite uses.
+- Slow a suite down with `TEST_CPUS`, not `TEST_CPUSET`.
+- While `test/run.sh` runs, leave the suite files and its containers alone.
 
 ## Code style
 
+- Rust 2024, no formatter in CI: match the file you edit.
+- `rust-version` is 1.95, and CI checks that the code builds with it.
 - Errors are `anyhow::Result` with a `.context()` naming the failed step. A failed job must never stop the scan loop.
 - Failures that clear on their own carry `job::Transient` and are retried. Everything else writes a `.failed` marker, which an edit of `encode.toml` lifts.
 - Run external tools through `ext::output_with_timeout` and report a non-zero exit with `ext::tool_error`, which classifies a tool stopped from outside and a full disk as transient.
@@ -47,8 +53,6 @@ cargo test --locked           # unit tests
 - ffmpeg calls on the source name their stream: `-map 0:v:0`, `-map 0:a:<n>`.
 - Write output and state files under a scratch name, then rename them into place.
 - A comment only earns its place when it records something the code cannot. One or two lines.
-- Rust 2024, no formatter in CI: match the file you edit.
-- `rust-version` is 1.95, and CI checks that the code builds with it.
 
 ## External tools
 
@@ -60,6 +64,8 @@ cargo test --locked           # unit tests
 - A new `encode.toml` key needs its field and default in `src/config.rs`, a check in `Config::validate` if the value can be wrong, a test with an accepted and a rejected value, and a row in the README.
 - A key that is not in the README does not exist.
 - Keep `#[serde(deny_unknown_fields)]` on every config struct.
+- A bound in `Config::validate` is repeated as a `schemars` attribute on its field.
+- Each release carries `encode.schema.json`, built from the config structs and the README tables. `SCHEMA_OUT=<file> cargo test schema` writes it.
 
 ## Settled decisions
 
@@ -73,6 +79,8 @@ Reopen one of these with a case it gets wrong, not with a preference.
 - avet writes FFVship's display model itself and takes SDR or HDR from the colors FFVship reads. `--resizeToDisplay` stays unused.
 - `[target_quality]` needs a hardware GPU. `AVET_SOFTWARE_GPU` is for the suites.
 - Pixel formats are classified from libavutil's descriptor, not by name.
+- `target_quality.tolerance` defaults to 0.05.
+- Profile folders with a leading dot are scanned, folders with a dot inside a profile are not.
 - FFMS2 stays on its release tag plus the patch, not on a commit of its master.
 - MKVToolNix in the AppImage comes from mkvtoolnix.download, not from the runner's Ubuntu.
 - Renovate merges on its own only the actions listed in `.github/renovate.json`.
@@ -106,6 +114,7 @@ Fixed
 - Run the Release workflow with the new version, such as `1.5.0`. It turns `Unreleased` into that version, tags the commit, publishes the image and builds a draft release with the AppImages and the notes from `CHANGELOG.md`.
 - A tag pushed by hand publishes the image and builds the draft too, from the section of its version.
 - The git tag is the version; `Cargo.toml` stays at `0.0.0`.
+- No pre-release tags such as `v2.0.0-rc1`. Images get version tags, `dev` and `latest`, nothing else.
 - Commits on `main` publish the `dev` image.
 
 ## Dependencies
@@ -116,7 +125,10 @@ Fixed
 - FFmpeg and MKVToolNix in `appimage.yml` follow the image's Alpine versions and are bumped by hand.
 - CI fails while one of these versions differs between the image and the AppImage.
 - GitHub Actions and base images stay on version tags, never commit SHAs or digests.
-- Renovate opens the bumps and adds each one to the changelog. The release adds the numbers of their pull requests. Other PRs leave dependencies alone.
+- Pinned sources use release tags. Only a rolling-release source such as SVT-AV1-HDR pins a commit.
+- Renovate opens the bumps and adds those that reach users to the changelog, not CI or test tools. The release adds the numbers of their pull requests. Other PRs leave dependencies alone.
+- Renovate opens a pull request for a crate only when `Cargo.toml` has to change. The weekly lock file maintenance brings everything else.
+- The release adds the crates in `[dependencies]` that moved since the last one, with `.github/scripts/crate-changelog.sh`.
 
 ## Pull requests
 

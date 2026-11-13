@@ -36,6 +36,7 @@ jobs:
             echo "::error::A release is started from main"
             exit 1
           fi
+          sh .github/scripts/crate-changelog.sh
           sh .github/scripts/changelog.sh release "$VERSION"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -78,11 +79,17 @@ jobs:
           pattern: avet-*.AppImage
           merge-multiple: true
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: encode.schema.json
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.tag.outputs.name }}
           body_path: ${{ runner.temp }}/notes.md
-          files: avet-*.AppImage
+          files: |
+            avet-*.AppImage
+            encode.schema.json
           fail_on_unmatched_files: true
           draft: true

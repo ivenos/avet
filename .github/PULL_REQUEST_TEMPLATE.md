@@ -11,6 +11,8 @@
 ## Checklist
 
 - [ ] One concern per pull request
+- [ ] I understand the code in this pull request and can explain how it works
+- [ ] The change is tested and works locally
 - [ ] Tests added for the behavior that changed
 - [ ] An entry under `Unreleased` in `CHANGELOG.md` for what users will notice
 - [ ] `cargo test` and `./test/run.sh` pass

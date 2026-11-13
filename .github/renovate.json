@@ -2,8 +2,9 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:recommended"],
   "ignorePaths": [],
-  "dependencyDashboard": false,
+  "dependencyDashboard": { "enabled": false },
   "labels": ["dependencies"],
+  "commitMessageAction": "update",
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-optional",
   "platformAutomerge": false,
@@ -19,7 +20,17 @@
     {
       "matchManagers": ["github-actions"],
       "groupName": "GitHub Actions",
-      "commitMessagePrefix": "ci:"
+      "commitMessagePrefix": "ci:",
+      "postUpgradeTasks": { "commands": [] }
+    },
+    {
+      "description": "Test tools reach no user, so they get no changelog line.",
+      "matchFileNames": ["test/**", "tests/**"],
+      "postUpgradeTasks": { "commands": [] }
+    },
+    {
+      "matchDepTypes": ["devDependencies", "dev-dependencies"],
+      "postUpgradeTasks": { "commands": [] }
     },
     {
       "matchManagers": ["github-actions"],
@@ -38,6 +49,10 @@
     },
     {
       "matchManagers": ["cargo"],
+      "rangeStrategy": "replace"
+    },
+    {
+      "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true
     },
@@ -51,7 +66,8 @@
     },
     {
       "matchDepNames": ["ubuntu"],
-      "groupName": "Ubuntu runners"
+      "groupName": "Ubuntu runners",
+      "postUpgradeTasks": { "commands": [] }
     }
   ],
   "customManagers": [

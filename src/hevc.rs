@@ -352,44 +352,49 @@ mod tests {
         }
     }
 
+    fn every_picture_gets_its_message(nals: &[(Nal, bool, usize)], sizes: Vec<usize>) -> Result<(), TestCaseError> {
+        let mut stream = Vec::new();
+        let mut expected: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut pending = None;
+        for (nal, long_start, trailing_zeros) in nals {
+            stream.extend_from_slice(if *long_start { &[0, 0, 0, 1][..] } else { &[0, 0, 1][..] });
+            let (header, rbsp): ([u8; 2], Vec<u8>) = match nal {
+                Nal::FirstSlice(b) | Nal::NextSlice(b) => {
+                    let first = matches!(nal, Nal::FirstSlice(_));
+                    if first { expected.push(pending.take()); }
+                    ([0x02, 0x01], [vec![if first { 0x80 } else { 0x00 }], b.clone(), vec![0x80]].concat())
+                }
+                Nal::Prefix(m) | Nal::Suffix(m) => {
+                    let prefix = matches!(nal, Nal::Prefix(_));
+                    let messages = match m {
+                        Some(v) => {
+                            if prefix { pending = Some(v.clone()); } else if let Some(last) = expected.last_mut() { *last = Some(v.clone()); }
+                            vec![(5, vec![0x11; 20]), (4, [&HDR10PLUS_T35_HEADER[..], v].concat())]
+                        }
+                        None => vec![(4, vec![0xB5, 0x00, 0x31, 0x47])],
+                    };
+                    ([if prefix { NAL_SEI_PREFIX } else { NAL_SEI_SUFFIX } << 1, 0x01], sei(&messages))
+                }
+                Nal::Other => ([33 << 1, 0x01], vec![0x42, 0x80]),
+                Nal::EnhancementSlice => ([0x02, 0x09], vec![0x80, 0x80]),
+            };
+            stream.extend_from_slice(&header);
+            stream.extend(escape(&rbsp));
+            stream.extend(std::iter::repeat_n(0u8, *trailing_zeros));
+        }
+
+        let got = hdr10plus_by_access_unit(Chunked { data: &stream, sizes, i: 0 }).unwrap();
+        prop_assert_eq!(got, expected);
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn every_picture_gets_its_message_whatever_the_byte_layout(
             nals in prop::collection::vec((nal_strategy(), any::<bool>(), 0usize..3), 1..60),
             sizes in prop::collection::vec(prop_oneof![1usize..5, 1usize..5000], 1..8),
         ) {
-            let mut stream = Vec::new();
-            let mut expected: Vec<Option<Vec<u8>>> = Vec::new();
-            let mut pending = None;
-            for (nal, long_start, trailing_zeros) in &nals {
-                stream.extend_from_slice(if *long_start { &[0, 0, 0, 1][..] } else { &[0, 0, 1][..] });
-                let (header, rbsp): ([u8; 2], Vec<u8>) = match nal {
-                    Nal::FirstSlice(b) | Nal::NextSlice(b) => {
-                        let first = matches!(nal, Nal::FirstSlice(_));
-                        if first { expected.push(pending.take()); }
-                        ([0x02, 0x01], [vec![if first { 0x80 } else { 0x00 }], b.clone(), vec![0x80]].concat())
-                    }
-                    Nal::Prefix(m) | Nal::Suffix(m) => {
-                        let prefix = matches!(nal, Nal::Prefix(_));
-                        let messages = match m {
-                            Some(v) => {
-                                if prefix { pending = Some(v.clone()); } else if let Some(last) = expected.last_mut() { *last = Some(v.clone()); }
-                                vec![(5, vec![0x11; 20]), (4, [&HDR10PLUS_T35_HEADER[..], v].concat())]
-                            }
-                            None => vec![(4, vec![0xB5, 0x00, 0x31, 0x47])],
-                        };
-                        ([if prefix { NAL_SEI_PREFIX } else { NAL_SEI_SUFFIX } << 1, 0x01], sei(&messages))
-                    }
-                    Nal::Other => ([33 << 1, 0x01], vec![0x42, 0x80]),
-                    Nal::EnhancementSlice => ([0x02, 0x09], vec![0x80, 0x80]),
-                };
-                stream.extend_from_slice(&header);
-                stream.extend(escape(&rbsp));
-                stream.extend(std::iter::repeat_n(0u8, *trailing_zeros));
-            }
-
-            let got = hdr10plus_by_access_unit(Chunked { data: &stream, sizes, i: 0 }).unwrap();
-            prop_assert_eq!(got, expected);
+            every_picture_gets_its_message(&nals, sizes)?;
         }
 
         #[test]
@@ -408,6 +413,16 @@ mod tests {
                 prop_assert_eq!(frame.as_ref().map(|f| f[0]), current);
             }
         }
+    }
+
+    #[test]
+    fn a_message_of_zeros_read_one_byte_at_a_time_reaches_its_picture() {
+        every_picture_gets_its_message(&[(Nal::Prefix(Some(vec![0; 4])), false, 0), (Nal::FirstSlice(vec![0]), false, 0)], vec![1]).unwrap();
+    }
+
+    #[test]
+    fn a_lone_slice_read_one_byte_at_a_time_is_one_picture() {
+        every_picture_gets_its_message(&[(Nal::FirstSlice(vec![0]), false, 0)], vec![1]).unwrap();
     }
 
     #[test]

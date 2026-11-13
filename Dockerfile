@@ -130,7 +130,7 @@ RUN apk add --no-cache jq && \
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY .github/scripts/crate-licenses.sh ./
 
@@ -140,7 +140,7 @@ ARG AVET_VERSION
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
-    find src build.rs -type f -exec touch {} + && \
+    find src -type f -exec touch {} + && \
     cargo build --release --locked && \
     cp /src/target/release/avet /avet && \
     sh crate-licenses.sh /licenses/avet/crates

@@ -100,9 +100,10 @@ output/
 
 ## Configuration
 
-Only `encoder` is required. Unknown keys are rejected.
+Only `encoder` is required. Unknown keys are rejected. With the `#:schema` line at the top, editors with [Even Better TOML](https://taplo.tamasfe.dev) or [Tombi](https://tombi-toml.github.io/tombi/) suggest and check the keys.
 
 ```toml
+#:schema https://github.com/ivenos/avet/releases/latest/download/encode.schema.json
 encoder = "svt-av1"
 
 [encoder_params]

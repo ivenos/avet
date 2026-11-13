@@ -434,36 +434,40 @@ mod tests {
         })
     }
 
+    fn metadata_changes_nothing_else(tus: &[Vec<u8>], messages: &[Vec<Vec<u8>>]) -> Result<(), TestCaseError> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.ivf");
+        std::fs::write(&path, ivf(tus)).unwrap();
+
+        insert_t35_metadata(&path, messages).unwrap();
+        let out = frames(&std::fs::read(&path).unwrap());
+        prop_assert_eq!(out.len(), tus.len());
+
+        for ((got, original), wanted) in out.iter().zip(tus).zip(messages) {
+            let obus = parse_obus(got).unwrap();
+            let stripped: Vec<u8> = obus.iter().filter(|o| o.kind != OBU_METADATA).flat_map(|o| o.raw.to_vec()).collect();
+            prop_assert_eq!(&stripped, original);
+
+            let shown = obus.iter().position(|o| is_shown_frame(o, false)).unwrap();
+            let before: Vec<&[u8]> = obus[..shown].iter().rev().take_while(|o| o.kind == OBU_METADATA)
+                .map(|o| o.payload).collect::<Vec<_>>().into_iter().rev().collect();
+            prop_assert_eq!(before.len(), wanted.len());
+            for (payload, message) in before.iter().zip(wanted) {
+                let expected = [&[METADATA_TYPE_ITUT_T35][..], message, &[0x80]].concat();
+                prop_assert_eq!(*payload, expected.as_slice());
+            }
+            prop_assert_eq!(obus.iter().filter(|o| o.kind == OBU_METADATA).count(), wanted.len());
+        }
+        Ok(())
+    }
+
     proptest! {
         #[test]
         fn inserting_metadata_changes_nothing_but_the_metadata(
             tus in temporal_units(),
             seed in prop::collection::vec(prop::collection::vec(prop::collection::vec(any::<u8>(), 1..200), 0..3), 12),
         ) {
-            let dir = tempfile::TempDir::new().unwrap();
-            let path = dir.path().join("c.ivf");
-            std::fs::write(&path, ivf(&tus)).unwrap();
-            let messages: Vec<Vec<Vec<u8>>> = seed[..tus.len()].to_vec();
-
-            insert_t35_metadata(&path, &messages).unwrap();
-            let out = frames(&std::fs::read(&path).unwrap());
-            prop_assert_eq!(out.len(), tus.len());
-
-            for ((got, original), wanted) in out.iter().zip(&tus).zip(&messages) {
-                let obus = parse_obus(got).unwrap();
-                let stripped: Vec<u8> = obus.iter().filter(|o| o.kind != OBU_METADATA).flat_map(|o| o.raw.to_vec()).collect();
-                prop_assert_eq!(&stripped, original);
-
-                let shown = obus.iter().position(|o| is_shown_frame(o, false)).unwrap();
-                let before: Vec<&[u8]> = obus[..shown].iter().rev().take_while(|o| o.kind == OBU_METADATA)
-                    .map(|o| o.payload).collect::<Vec<_>>().into_iter().rev().collect();
-                prop_assert_eq!(before.len(), wanted.len());
-                for (payload, message) in before.iter().zip(wanted) {
-                    let expected = [&[METADATA_TYPE_ITUT_T35][..], message, &[0x80]].concat();
-                    prop_assert_eq!(*payload, expected.as_slice());
-                }
-                prop_assert_eq!(obus.iter().filter(|o| o.kind == OBU_METADATA).count(), wanted.len());
-            }
+            metadata_changes_nothing_else(&tus, &seed[..tus.len()])?;
         }
 
         #[test]
@@ -490,6 +494,12 @@ mod tests {
             write_leb128(value, &mut buf);
             prop_assert_eq!(read_leb128(&buf, 0), Some((value as u64, buf.len())));
         }
+    }
+
+    #[test]
+    fn a_frame_shown_again_counts_as_shown() {
+        let tu = [obu(OBU_SEQUENCE_HEADER, &[0x00, 0x00]), obu(TD, &[]), obu(OBU_FRAME_HEADER, &[0x80])].concat();
+        metadata_changes_nothing_else(&[tu], &[vec![]]).unwrap();
     }
 
     #[test]

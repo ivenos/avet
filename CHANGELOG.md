@@ -7,6 +7,7 @@ All notable changes to this project are documented in this file, in the format o
 ### Added
 
 - `[target_quality]` works together with `avet.scale`.
+- Editors can suggest and check the settings in `encode.toml`.
 
 ### Dependencies
 
@@ -215,7 +216,6 @@ All notable changes to this project are documented in this file, in the format o
 ### Dependencies
 
 - alpine 3.23 -> 3.24 (#10)
-- actions/checkout v6 -> v7 (#11)
 
 ## [0.3.1] - 2026-06-05
 

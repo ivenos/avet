@@ -126,6 +126,7 @@ pub struct FFMS_VideoProperties {
     pub flip: c_int,
 }
 
+#[link(name = "ffms2")]
 unsafe extern "C" {
     fn FFMS_Init(reserved: c_int, deprecated: c_int);
     fn FFMS_GetPixFmt(name: *const c_char) -> c_int;

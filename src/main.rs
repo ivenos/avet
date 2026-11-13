@@ -13,6 +13,8 @@ mod mkv;
 mod resume;
 mod scanner;
 mod scene;
+#[cfg(test)]
+mod schema;
 mod subtitle;
 mod target_quality;
 mod workers;

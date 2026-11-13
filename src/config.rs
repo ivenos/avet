@@ -4,10 +4,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub encoder: Option<Encoder>,
     #[serde(default)]
+    #[cfg_attr(test, schemars(with = "HashMap::<String, serde_json::Value>"))]
     pub encoder_params: HashMap<String, toml::Value>,
     #[serde(default)]
     pub avet: AvetConfig,
@@ -22,6 +24,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Encoder {
     SvtAv1,
@@ -29,6 +32,7 @@ pub enum Encoder {
 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq)]
+#[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum VideoMode {
     #[default]
@@ -37,6 +41,7 @@ pub enum VideoMode {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AvetConfig {
     #[serde(default)]
@@ -47,13 +52,16 @@ pub struct AvetConfig {
     pub crop: bool,
     #[serde(default)]
     pub keyint: bool,
+    #[cfg_attr(test, schemars(range(min = 64)))]
     pub scale: Option<u32>,
+    #[cfg_attr(test, schemars(extend("enum" = [8, 10])))]
     pub bit_depth: Option<u8>,
     #[serde(default)]
     pub keep_temp: bool,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct SubtitleConfig {
     #[serde(default)]
@@ -63,6 +71,7 @@ pub struct SubtitleConfig {
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq, Clone, Copy)]
+#[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SubtitleMode {
     #[default]
@@ -71,6 +80,7 @@ pub enum SubtitleMode {
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AudioConfig {
     #[serde(default)]
@@ -78,6 +88,7 @@ pub struct AudioConfig {
     pub codec: Option<String>,
     pub bitrate: Option<Bitrate>,
     #[serde(default)]
+    #[cfg_attr(test, schemars(with = "HashMap::<String, serde_json::Value>"))]
     pub options: HashMap<String, toml::Value>,
     #[serde(default)]
     pub language_whitelist: Vec<String>,
@@ -89,17 +100,20 @@ pub struct AudioConfig {
 
 /// Override whose unset fields inherit from [audio].
 #[derive(Debug, Deserialize, Default, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AudioProfile {
     pub mode: Option<AudioMode>,
     pub codec: Option<String>,
     pub bitrate: Option<Bitrate>,
     #[serde(default)]
+    #[cfg_attr(test, schemars(with = "HashMap::<String, serde_json::Value>"))]
     pub options: HashMap<String, toml::Value>,
 }
 
 /// A single bitrate, or a per-layout table keyed by layout name (plus `default`).
 #[derive(Debug, Deserialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(untagged, expecting = "a bitrate such as \"192k\", or a table of them keyed by layout")]
 pub enum Bitrate {
     Single(String),
@@ -137,6 +151,7 @@ pub struct ResolvedAudio<'a> {
 }
 
 #[derive(Debug, Deserialize, Default, PartialEq, Clone, Copy)]
+#[cfg_attr(test, derive(Serialize, schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum AudioMode {
     #[default]
@@ -261,6 +276,7 @@ impl AudioConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum SceneDetectionSpeedConfig {
     #[default]
@@ -269,13 +285,17 @@ pub enum SceneDetectionSpeedConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct SceneDetectionConfig {
+    #[cfg_attr(test, schemars(range(min = 1)))]
     pub min_scene_len: usize,
     pub extra_split_sec: u32,
+    #[cfg_attr(test, schemars(extend("anyOf" = [{"const": 0}, {"minimum": 24}])))]
     pub extra_split: u32,
     pub speed: SceneDetectionSpeedConfig,
+    #[cfg_attr(test, schemars(range(min = 64)))]
     pub downscale_height: Option<u32>,
 }
 
@@ -332,19 +352,31 @@ impl SceneDetectionConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
+#[cfg_attr(test, derive(schemars::JsonSchema))]
+#[cfg_attr(test, schemars(extend("required" = ["jod"])))]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct TargetQualityConfig {
     /// NaN until the profile sets it.
+    #[cfg_attr(test, schemars(extend("exclusiveMinimum" = 0, "exclusiveMaximum" = 10)))]
     pub jod: f64,
+    #[cfg_attr(test, schemars(range(min = 1, max = 69)))]
     pub min_crf: u32,
+    #[cfg_attr(test, schemars(range(min = 2, max = 70)))]
     pub max_crf: u32,
+    #[cfg_attr(test, schemars(range(min = 2)))]
     pub min_probes: u32,
+    #[cfg_attr(test, schemars(range(min = 2)))]
     pub max_probes: u32,
+    #[cfg_attr(test, schemars(range(min = 0)))]
     pub tolerance: f64,
+    #[cfg_attr(test, schemars(range(max = 13)))]
     pub probe_preset: u32,
+    #[cfg_attr(test, schemars(extend("exclusiveMinimum" = 0)))]
     pub max_encoded_percent: f64,
+    #[cfg_attr(test, schemars(range(min = 0)))]
     pub max_cambi: Option<f64>,
+    #[cfg_attr(test, schemars(range(min = 0)))]
     pub max_cambi_diff: Option<f64>,
 }
 

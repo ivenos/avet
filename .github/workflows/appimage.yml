@@ -35,6 +35,7 @@ env:
 permissions:
   contents: read
 
+# Under workflow_call, github.workflow holds the calling workflow's name.
 concurrency:
   group: ${{ github.workflow }}-appimage-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -60,7 +61,14 @@ jobs:
           sudo apt-get install -y libffms2-dev nasm
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: SCHEMA_OUT="$RUNNER_TEMP/encode.schema.json" cargo test --locked
+
+      - name: Upload schema
+        uses: actions/upload-artifact@v7
+        with:
+          name: encode.schema.json
+          path: ${{ runner.temp }}/encode.schema.json
+          if-no-files-found: error
 
   appimage:
     needs: test
@@ -208,6 +216,9 @@ jobs:
           sudo install -m755 /tmp/vmaf/libvmaf/build/tools/vmaf /usr/local/bin/vmaf
 
       - name: Build avet
+        # rust-lld, the default linker on x86_64, does not search /usr/local/lib.
+        env:
+          RUSTFLAGS: -L native=/usr/local/lib
         run: AVET_VERSION="$APP_VERSION" cargo build --release --locked
 
       - name: Stage AppDir

@@ -21,6 +21,7 @@ env:
 permissions:
   contents: read
 
+# Under workflow_call, github.workflow holds the calling workflow's name.
 concurrency:
   group: ${{ github.workflow }}-image-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
