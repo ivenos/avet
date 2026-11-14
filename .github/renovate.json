@@ -4,6 +4,7 @@
   "ignorePaths": [],
   "dependencyDashboard": { "enabled": false },
   "labels": ["dependencies"],
+  "commitMessagePrefix": "fix(deps):",
   "commitMessageAction": "update",
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-optional",
@@ -15,7 +16,7 @@
     "dataFileTemplate": "{{{depName}}}\t{{#if (equals updateType 'digest')}}{{{currentDigestShort}}}{{else}}{{#if (equals datasource 'docker')}}{{{currentValue}}}{{else}}{{#if currentVersion}}{{{currentVersion}}}{{else}}{{{currentValue}}}{{/if}}{{/if}}{{/if}}\t{{#if (equals updateType 'digest')}}{{{newDigestShort}}}{{else}}{{#if (equals datasource 'docker')}}{{{newValue}}}{{else}}{{#if newVersion}}{{{newVersion}}}{{else}}{{{newValue}}}{{/if}}{{/if}}{{/if}}\n",
     "fileFilters": ["CHANGELOG.md"]
   },
-  "lockFileMaintenance": { "enabled": true },
+  "lockFileMaintenance": { "enabled": true, "commitMessageAction": "lock file maintenance" },
   "packageRules": [
     {
       "matchManagers": ["github-actions"],
@@ -26,10 +27,12 @@
     {
       "description": "Test tools reach no user, so they get no changelog line.",
       "matchFileNames": ["test/**", "tests/**"],
+      "commitMessagePrefix": "ci:",
       "postUpgradeTasks": { "commands": [] }
     },
     {
       "matchDepTypes": ["devDependencies", "dev-dependencies"],
+      "commitMessagePrefix": "ci:",
       "postUpgradeTasks": { "commands": [] }
     },
     {
@@ -41,11 +44,8 @@
         "dtolnay/rust-toolchain",
         "Swatinem/rust-cache"
       ],
+      "groupName": "GitHub Actions (automerge)",
       "automerge": true
-    },
-    {
-      "matchManagers": ["dockerfile", "docker-compose"],
-      "commitMessagePrefix": "build(docker):"
     },
     {
       "matchManagers": ["cargo"],
@@ -67,6 +67,7 @@
     {
       "matchDepNames": ["ubuntu"],
       "groupName": "Ubuntu runners",
+      "commitMessagePrefix": "ci:",
       "postUpgradeTasks": { "commands": [] }
     }
   ],

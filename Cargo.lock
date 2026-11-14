@@ -90,6 +90,7 @@ dependencies = [
  "av-scenechange",
  "dolby_vision",
  "proptest",
+ "regex-automata",
  "schemars",
  "serde",
  "serde_json",

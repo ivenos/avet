@@ -83,7 +83,7 @@ Reopen one of these with a case it gets wrong, not with a preference.
 - Profile folders with a leading dot are scanned, folders with a dot inside a profile are not.
 - FFMS2 stays on its release tag plus the patch, not on a commit of its master.
 - MKVToolNix in the AppImage comes from mkvtoolnix.download, not from the runner's Ubuntu.
-- Renovate merges on its own only the actions listed in `.github/renovate.json`.
+- Renovate merges on its own only the actions listed in `.github/renovate.json` and minor and patch updates of crates.
 
 ## Commits
 

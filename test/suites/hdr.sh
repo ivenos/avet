@@ -270,4 +270,15 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "damaged HDR10+ cache: no output"
 assert_log_contains "reading HDR10+ from the bitstream again"
 assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" 96
 
+# HLG as DVB sends it, BT.2020 in the VUI and HLG in an alternative transfer SEI
+I="$WORKDIR/19/in"; O="$WORKDIR/19/out"; mkdir -p "$I/p" "$O"
+ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -pix_fmt yuv420p10le \
+    -c:v libx265 -preset ultrafast -x265-params "log-level=error:colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc:atc-sei=18" \
+    "$I/p/test.mkv"
+[ "$(stream_value "$I/p/test.mkv" v:0 stream=color_transfer)" = bt2020-10 ] || fail "HLG SEI: the source's VUI is not BT.2020"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HLG SEI: no output"
+assert_log_contains   "HDR: HLG"
+assert_color_transfer "$O/test.mkv" "arib-std-b67"
+
 test_done

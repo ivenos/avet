@@ -35,7 +35,8 @@ pub fn detect(source: &Path, duration_secs: f64, cache: &Path, stem: &str) -> Re
                 return Ok(Some(order));
             }
         }
-        Err(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("[{stem}] interlace: cannot read {} ({e}) - measuring again", cache.display()),
     }
     if !flagged_interlaced(source)? {
         return Ok(None);
@@ -58,7 +59,9 @@ pub fn detect(source: &Path, duration_secs: f64, cache: &Path, stem: &str) -> Re
             "[{stem}] flagged interlaced, but the frames are not (idet: {tff} tff, {bff} bff, {progressive} progressive)"
         ),
     }
-    crate::resume::write_atomic(cache, order.map_or("progressive", FieldOrder::name).as_bytes())?;
+    if let Err(e) = crate::resume::write_atomic(cache, order.map_or("progressive", FieldOrder::name).as_bytes()) {
+        tracing::warn!("[{stem}] could not write interlace cache {}: {e:#}", cache.display());
+    }
     Ok(order)
 }
 
@@ -176,5 +179,7 @@ mod tests {
         assert_eq!(counts(38, 40, 23).verdict(), None);
         assert_eq!(counts(0, 0, 600).verdict(), None);
         assert_eq!(counts(12, 0, 580).verdict(), None);
+        assert_eq!(counts(30, 10, 0).verdict(), None);
+        assert_eq!(counts(40, 10, 0).verdict(), Some(FieldOrder::Tff));
     }
 }

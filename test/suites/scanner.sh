@@ -4,14 +4,17 @@
 
 WORKDIR=$(test_workdir)
 
-# no encode.toml: profile silently skipped
+# no encode.toml: profile skipped with a hint, and so is a video outside any profile
 I="$WORKDIR/1/in"; O="$WORKDIR/1/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/loose.mkv"
 TEST_RUST_LOG=debug run_avet_timed "$I" "$O" 20 "no jobs"
 assert_file_not_exists "$O/test.mkv"
 assert_file_exists     "$I/p/test.mkv"
 assert_log_contains    "avet started version="
 assert_log_contains    "no jobs"
+assert_log_contains    "/input/p: it holds videos but no encode.toml"
+assert_log_contains    "/input/loose.mkv: a video goes into a folder with an encode.toml"
 assert_log_not_contains "ERROR"
 
 # existing output: job skipped, source not moved

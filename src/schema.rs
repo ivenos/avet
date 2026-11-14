@@ -116,6 +116,7 @@ fn describe(table: &mut Value, path: &str, section: &Section) {
     if let Some(inner) = table.get_mut("additionalProperties").filter(|v| v.is_object()) {
         describe(inner, path, section);
     }
+    let open = table.get("additionalProperties") == Some(&Value::Bool(true));
     let Some(Value::Object(props)) = table.get_mut("properties") else {
         return;
     };
@@ -123,7 +124,7 @@ fn describe(table: &mut Value, path: &str, section: &Section) {
         let nested = is_table(prop);
         match section.rows.get(key) {
             Some(row) => prop["description"] = json!(row.description),
-            None if nested => {}
+            None if nested || open => {}
             None => panic!("README has no row for `{path}.{key}`"),
         }
         if nested {
@@ -282,4 +283,90 @@ fn schema_bounds_match_validate() {
         }
     }
     assert!(checked > 40, "only {checked} values checked");
+}
+
+/// The draft-07 keywords the generated schema uses, as an editor applies them.
+fn fits(schema: &Value, value: &Value) -> bool {
+    let Some(schema) = schema.as_object() else {
+        return schema != &Value::Bool(false);
+    };
+    let typed = |t: &Value| match t.as_str() {
+        Some("integer") => value.is_i64() || value.is_u64(),
+        Some("number") => value.is_number(),
+        Some("string") => value.is_string(),
+        Some("boolean") => value.is_boolean(),
+        Some("array") => value.is_array(),
+        Some("object") => value.is_object(),
+        _ => false,
+    };
+    let bound = |key: &str, holds: fn(f64, f64) -> bool| {
+        schema.get(key).and_then(Value::as_f64).is_none_or(|b| value.as_f64().is_none_or(|v| holds(v, b)))
+    };
+    let pattern = schema.get("pattern").and_then(Value::as_str).is_none_or(|p| {
+        value.as_str().is_none_or(|text| regex_automata::meta::Regex::new(p).unwrap().is_match(text))
+    });
+    let items = schema.get("items").is_none_or(|s| value.as_array().is_none_or(|a| a.iter().all(|v| fits(s, v))));
+    let members = value.as_object().is_none_or(|object| {
+        let props = schema.get("properties").and_then(Value::as_object);
+        let required = schema.get("required").and_then(Value::as_array).into_iter().flatten();
+        required.filter_map(Value::as_str).all(|k| object.contains_key(k))
+            && object.iter().all(|(k, v)| match props.and_then(|p| p.get(k)) {
+                Some(s) => fits(s, v),
+                None => schema.get("additionalProperties").is_none_or(|s| fits(s, v)),
+            })
+    });
+    schema.get("type").is_none_or(|t| t.as_array().map_or_else(|| typed(t), |ts| ts.iter().any(typed)))
+        && schema.get("enum").and_then(Value::as_array).is_none_or(|e| e.contains(value))
+        && schema.get("const").is_none_or(|c| c == value)
+        && schema.get("anyOf").and_then(Value::as_array).is_none_or(|b| b.iter().any(|b| fits(b, value)))
+        && bound("minimum", |v, b| v >= b)
+        && bound("maximum", |v, b| v <= b)
+        && bound("exclusiveMinimum", |v, b| v > b)
+        && bound("exclusiveMaximum", |v, b| v < b)
+        && pattern
+        && items
+        && members
+}
+
+#[test]
+fn the_schema_takes_the_values_validate_takes() {
+    let schema = generate();
+    let node = |path: &[&str]| path.iter().fold(&schema, |s, key| &s["properties"][key]);
+    let languages = [
+        json!(["eng"]), json!([" deu "]), json!(["por-BR", "deu_DE"]), json!(["ENG"]), json!([]),
+        json!(["en"]), json!(["de-DE"]), json!([""]), json!(["english"]), json!(["e1g"]), json!(["eng", "de"]),
+    ];
+    let bitrates = [
+        json!("192k"), json!("192K"), json!(" 256k "), json!("1.5k"), json!("192000"), json!("1000"), json!("1M"), json!("0.001M"),
+        json!("192"), json!("999"), json!("0.5k"), json!("0.0009M"), json!("loud"), json!("1m"), json!("k"), json!(""), json!(192),
+        json!("+192k"), json!("1e3"), json!("2e2k"),
+        json!({ "stereo": "192k", "5.1": "320k", "default": "128k" }), json!({ "5,1": "320k" }), json!({ "stereo": "128" }),
+        json!({ "stereo": 128 }),
+    ];
+    let mut cases: Vec<(Vec<&str>, Value)> = Vec::new();
+    for section in ["audio", "subtitles"] {
+        cases.extend(languages.iter().map(|v| (vec![section, "language_whitelist"], v.clone())));
+    }
+    for v in &bitrates {
+        cases.push((vec!["audio", "bitrate"], v.clone()));
+        cases.push((vec!["audio", "lossless"], json!({ "bitrate": v })));
+        cases.push((vec!["audio", "codec_rules"], json!({ "opus": { "bitrate": v } })));
+    }
+    for v in [json!(30), json!(27.5), json!("30"), json!("-1"), json!("1e3"), json!("thirty"), json!(""), json!("nan"), json!("inf"), json!(true)] {
+        cases.push((vec!["encoder_params", "crf"], v));
+    }
+    for key in crate::config::COLOR_KEYS {
+        for v in [json!(9), json!(0), json!("16"), json!("+9"), json!(-1), json!(9.5), json!(true), json!("bt2020"), json!(""), json!([1])] {
+            cases.push((vec!["encoder_params", key], v));
+        }
+    }
+    for name in schema["properties"].as_object().unwrap().keys().filter(|k| is_table(&schema["properties"][k])) {
+        cases.push((vec![name.as_str()], json!({})));
+    }
+    for (path, value) in cases {
+        let field = if path.len() == 1 { &schema["properties"][path[0]] } else { node(&path) };
+        let (editor, avet) = (fits(field, &value), validate_accepts(&path, &value));
+        assert_eq!(editor, avet, "{} = {value}: the schema {}, avet {}", path.join("."),
+            if editor { "takes it" } else { "refuses it" }, if avet { "takes it" } else { "refuses it" });
+    }
 }

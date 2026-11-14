@@ -1,7 +1,5 @@
 name: AppImage
 
-# Also on changes to this file: the pinned tool versions live here, and a bump that
-# breaks the build would otherwise surface at the next release and nowhere else.
 on:
   workflow_dispatch:
     inputs:
@@ -22,7 +20,7 @@ on:
 
 env:
   SVT_AV1_VERSION: v4.3.0
-  # Rolling-release repo: pin a main commit, bump via PR.
+  # Rolling-release repo.
   SVT_AV1_HDR_REF: a46bc2d59774785f4db7341003fa23dbeb473b5a
   FFMS2_VERSION: "5.0"
   FFMPEG_VERSION: n8.1.3
@@ -164,7 +162,7 @@ jobs:
 
       - name: Build FFmpeg
         # Ubuntu 24.04 ships 6.1, too old for Vship (AVCOL_SPC_YCGCO_RE), and the Docker
-        # image gets its FFmpeg from Alpine. Both artifacts run the same version this way.
+        # image gets its FFmpeg from Alpine.
         run: |
           git clone --depth 1 --branch "$FFMPEG_VERSION" \
             https://github.com/FFmpeg/FFmpeg.git /tmp/ffmpeg
@@ -242,7 +240,7 @@ jobs:
 
           LICENSES="$APPDIR/usr/share/licenses"
           install -Dm644 LICENSE "$LICENSES/avet/LICENSE"
-          .github/scripts/crate-licenses.sh "$LICENSES/avet/crates"
+          sh .github/scripts/crate-licenses.sh "$LICENSES/avet/crates"
           install -Dm644 -t "$LICENSES/svt-av1"     /tmp/svt-av1/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md}
           install -Dm644 -t "$LICENSES/svt-av1-hdr" /tmp/svt-av1-hdr/{LICENSE.md,LICENSE-BSD2.md,PATENTS.md}
           install -Dm644 -t "$LICENSES/ffmpeg"      /tmp/ffmpeg/{LICENSE.md,COPYING.GPLv2,COPYING.LGPLv2.1}

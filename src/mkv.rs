@@ -109,7 +109,7 @@ pub fn trim_av1_codec_private(path: &Path) -> Result<bool> {
         .with_context(|| format!("open {}", path.display()))?;
     let file_len = f.metadata()?.len();
 
-    // Enough for any element header: an 4-byte ID and an 8-byte size.
+    // Enough for any element header: a 4-byte ID and an 8-byte size.
     let mut head = [0u8; 12];
     let mut read_header = |f: &mut File, pos: u64| -> Result<Element> {
         f.seek(SeekFrom::Start(pos))?;

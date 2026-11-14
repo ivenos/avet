@@ -75,6 +75,41 @@ search scaled_cambi "$WORKDIR/sdr360.mkv" 'max_cambi = 20\n' 'scale = 180\n'
 assert_log_contains "display 320x180 SDR"
 assert_log_contains ", CAMBI "
 
+# a mirrored encode is held against the mirrored picture
+$FF -display_hflip -i "$WORKDIR/sdr.mkv" -c copy "$WORKDIR/hflip.mkv"
+search mirrored "$WORKDIR/hflip.mkv"
+assert_log_contains "the display matrix mirrors the picture"
+assert_log_not_contains "floor unreachable"
+assert_frames_match "$O/test.mkv" "$SRC" null 20
+JOD=$(printf '%s\n' "$RUN_LOGS" | grep -o 'lowest JOD [0-9.]*' | tail -n 1 | cut -d ' ' -f 3)
+awk -v jod="${JOD:-0}" 'BEGIN { exit !(jod >= 8.5) }' || fail "mirrored: the finished chunk scored JOD '$JOD'"
+[ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_|reference_)')" ] || fail "mirrored: probe files were left behind"
+
+# an untagged source over 650 rows cropped to fewer: the finished chunk is measured
+$FF -f lavfi -i "testsrc2=size=192x536:rate=24" -frames:v 24 -vf "pad=192:720:0:92:black,format=yuv420p" -c:v ffv1 "$WORKDIR/hd_bars.mkv"
+search crop_hd "$WORKDIR/hd_bars.mkv" '' 'crop = true\n'
+assert_log_contains "display 192x536 SDR"
+assert_log_not_contains "not measured"
+grep -q '"measured"' "$O/.avet_test/tq.json" 2>/dev/null || fail "crop_hd: the finished chunk was not measured"
+[ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_)')" ] || fail "crop_hd: probe files were left behind"
+
+# a chunk finished but not yet measured when avet stops is measured on the next start, not encoded again
+$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 48 -pix_fmt yuv420p -c:v ffv1 "$WORKDIR/sdr48.mkv"
+I="$WORKDIR/resume/in"; O="$WORKDIR/resume/out"; mkdir -p "$I/p" "$O"
+cp "$WORKDIR/sdr48.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n[scene_detection]\nextra_split = 24\n[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 3\n' > "$I/p/encode.toml"
+TEST_SOFTWARE_GPU=1 start_avet "$I" "$O" 999999
+n=0
+until grep -q '"00001"' "$O/.avet_test/done.json" 2>/dev/null || [ $n -ge 3000 ]; do sleep 0.1; n=$((n + 1)); done
+kill_avet
+grep -q '"00001"' "$O/.avet_test/done.json" || fail "resume: chunk 1 never finished"
+measured_1() { sed -n '/"00001"/,/}/p' "$O/.avet_test/tq.json" | grep -q '"measured"'; }
+measured_1 && fail "resume: chunk 1 was measured before avet was stopped"
+TEST_SOFTWARE_GPU=1 run_avet "$I" "$O" "$O/test.mkv" 600 || fail "resume: no output"
+assert_log_contains "chunk 00001 already done, measuring it"
+assert_log_not_contains "chunk 00001 using cached target crf"
+measured_1 || fail "resume: chunk 1 is still not measured"
+
 # RGB reaches the encoder as 4:2:0 YUV, which costs it the floor, and is still compared as the same picture
 $FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -c:v libx264rgb -qp 0 -preset ultrafast "$WORKDIR/rgb.mkv"
 [ "$(stream_value "$WORKDIR/rgb.mkv" v:0 stream=pix_fmt)" = gbrp ] || fail "rgb: the source is not planar RGB"
@@ -82,6 +117,14 @@ search rgb "$WORKDIR/rgb.mkv"
 assert_log_contains "chunk 00001 probe 1/3 crf"
 assert_log_contains "floor unreachable"
 assert_log_not_contains "two different pictures"
+
+# an option the encoder refuses fails the job when the probes encode from the scaled reference
+I="$WORKDIR/refused/in"; O="$WORKDIR/refused/out"; mkdir -p "$I/p" "$O"
+cp "$WORKDIR/sdr.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\nfilm-grain = 99\n[avet]\nscale = 90\n[target_quality]\njod = 9.0\n' > "$I/p/encode.toml"
+TEST_SOFTWARE_GPU=1 run_avet_timed "$I" "$O" 120 "job failed"
+assert_file_exists     "$O/.avet_test/.failed"
+assert_file_not_exists "$O/test.mkv"
 
 docker run --rm --entrypoint vmaf "$TEST_IMAGE" --version >/dev/null 2>&1 || \
     fail "bundled vmaf does not start"

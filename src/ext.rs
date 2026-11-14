@@ -53,7 +53,7 @@ pub fn spawn(cmd: &mut Command, what: &str) -> Result<Child> {
     cmd.spawn().with_context(|| format!("start {what}")).context(crate::job::Transient)
 }
 
-/// Kills the command if it overruns; nothing else would notice a hung tool.
+/// Kills the command if it overruns.
 pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<Output> {
     let mut child = spawn(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()), what)?;
     let stdout = drain(child.stdout.take());
@@ -145,11 +145,8 @@ pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -
 }
 
 fn stopped_from_outside(status: std::process::ExitStatus) -> bool {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGKILL, SIGTERM};
     use std::os::unix::process::ExitStatusExt;
-    const SIGHUP: i32 = 1;
-    const SIGINT: i32 = 2;
-    const SIGKILL: i32 = 9;
-    const SIGTERM: i32 = 15;
     matches!(status.signal(), Some(SIGHUP | SIGINT | SIGKILL | SIGTERM))
 }
 
@@ -234,7 +231,6 @@ mod tests {
 
     #[test]
     fn what_a_wedged_tool_said_before_the_kill_is_in_the_error() {
-        // Without it the operator is left with the timeout alone and no idea what it hung on.
         let err = output_with_timeout(
             Command::new("sh").args(["-c", "echo 'Cannot open display' >&2; exec sleep 30"]),
             1,

@@ -33,10 +33,24 @@ const VERSION: &str = match option_env!("AVET_VERSION") {
     _ => "dev",
 };
 
+const USAGE: &str = "usage: avet [--version | --help]\nIt watches INPUT_DIR (./input) and writes to OUTPUT_DIR (./output).";
+
 fn main() -> Result<()> {
-    if std::env::args_os().nth(1).is_some_and(|a| a == "--version" || a == "-V") {
-        println!("avet {VERSION}");
-        return Ok(());
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match args.first().and_then(|a| a.to_str()) {
+        None => {}
+        Some("--version" | "-V") if args.len() == 1 => {
+            println!("avet {VERSION}");
+            return Ok(());
+        }
+        Some("--help" | "-h") if args.len() == 1 => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        _ => {
+            let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+            anyhow::bail!("avet takes no argument other than --version or --help, got: {}\n{USAGE}", args.join(" "));
+        }
     }
     init_logging();
     let default_hook = std::panic::take_hook();
@@ -48,7 +62,7 @@ fn main() -> Result<()> {
 
     let input_dir = env_path("INPUT_DIR", "./input");
     let output_dir = env_path("OUTPUT_DIR", "./output");
-    let poll_interval = env_u64("POLL_INTERVAL", 60).max(1);
+    let poll_interval = env_u64("POLL_INTERVAL", 60).clamp(1, u32::MAX.into());
 
     tracing::info!(
         version = %VERSION,
@@ -80,7 +94,6 @@ fn main() -> Result<()> {
             Ok(jobs) => {
                 tracing::info!("{} job(s) queued", jobs.len());
                 for j in &jobs {
-                    // A signal during the scan must not start a multi-hour encode.
                     if shutdown.load(Ordering::Relaxed) {
                         return Ok(());
                     }
@@ -121,7 +134,8 @@ fn main() -> Result<()> {
 fn shutdown_signal() -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
 
-    let mut signals = match Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+    let watched: &[i32] = if hangup_ignored() { &[SIGTERM, SIGINT] } else { &[SIGTERM, SIGINT, SIGHUP] };
+    let mut signals = match Signals::new(watched) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("could not install signal handlers ({e}) - avet will keep running on SIGTERM until it is killed");
@@ -212,16 +226,66 @@ fn env_u64(var: &str, default: u64) -> u64 {
 }
 
 fn ensure_dirs(input_dir: &std::path::Path, output_dir: &std::path::Path) -> Result<()> {
-    for dir in [input_dir, output_dir] {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create directory: {}", dir.display()))?;
+    let create = |dir: &std::path::Path| std::fs::create_dir_all(dir).with_context(|| format!("create directory: {}", dir.display()));
+    create(input_dir)?;
+    if resolved(output_dir)?.starts_with(resolved(input_dir)?) {
+        anyhow::bail!(
+            "OUTPUT_DIR {} is inside INPUT_DIR {}, which would queue every output again",
+            output_dir.display(), input_dir.display()
+        );
     }
-    Ok(())
+    create(output_dir)
+}
+
+/// Where `path` leads once created: its existing part resolved, the folders still to make taken as written.
+fn resolved(path: &std::path::Path) -> Result<PathBuf> {
+    let existing = path.ancestors().find(|a| a.as_os_str().is_empty() || a.exists()).unwrap_or(path);
+    let start = if existing.as_os_str().is_empty() { std::path::Path::new(".") } else { existing };
+    let mut real = start.canonicalize().with_context(|| format!("resolve {}", start.display()))?;
+    for part in path.strip_prefix(existing).unwrap_or(path).components() {
+        match part {
+            std::path::Component::ParentDir => { real.pop(); }
+            std::path::Component::Normal(name) => real.push(name),
+            _ => {}
+        }
+    }
+    Ok(real)
+}
+
+/// `nohup` starts a program with SIGHUP ignored, as the SigIgn mask in /proc shows.
+fn hangup_ignored() -> bool {
+    std::fs::read_to_string("/proc/self/status").ok()
+        .and_then(|status| status.lines().find_map(|l| l.strip_prefix("SigIgn:").map(|m| m.trim().to_owned())))
+        .and_then(|mask| u64::from_str_radix(&mask, 16).ok())
+        .is_some_and(|mask| mask & (1 << (SIGHUP - 1)) != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_output_folder_inside_the_input_folder_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("input");
+        assert!(ensure_dirs(&input, &dir.path().join("output")).is_ok());
+        assert!(ensure_dirs(&input, &input.join("movies/out")).is_err());
+        assert!(ensure_dirs(&input, &input).is_err());
+        assert!(ensure_dirs(&input, &dir.path().join("input-out")).is_ok());
+    }
+
+    #[test]
+    fn a_refused_output_folder_is_not_created_and_links_and_dots_are_followed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let input = dir.path().join("input");
+        assert!(ensure_dirs(&input, &input.join("movies/out")).is_err());
+        assert!(!input.join("movies").exists());
+
+        std::os::unix::fs::symlink(&input, dir.path().join("link")).unwrap();
+        assert!(ensure_dirs(&input, &dir.path().join("link/out")).is_err());
+        assert!(ensure_dirs(&input, &input.join("new/../../out")).is_ok());
+        assert!(dir.path().join("out").is_dir());
+    }
 
     #[test]
     fn a_second_instance_on_the_same_output_waits_and_stops_on_a_signal() {

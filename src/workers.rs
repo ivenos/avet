@@ -162,6 +162,7 @@ mod tests {
                 bit_depth: 10,
                 subsampling: PixelSubsampling::Yuv420,
             },
+            orientation: Default::default(),
         }
     }
 

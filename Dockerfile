@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 ARG SVT_AV1_VERSION=v4.3.0
-# Rolling-release repo: pin a main commit, bump via PR.
+# Rolling-release repo.
 ARG SVT_AV1_HDR_REF=a46bc2d59774785f4db7341003fa23dbeb473b5a
 ARG FFMS2_VERSION=5.0
 ARG VSHIP_VERSION=v5.1.2
@@ -12,7 +12,7 @@ FROM alpine:3.24 AS base
 
 ARG TARGETARCH
 
-# clang + vulkan build FFVship; nasm is x86-only, arm64 uses NEON.
+# nasm is x86-only, arm64 uses NEON.
 RUN apk add --no-cache \
         build-base \
         clang \
@@ -136,7 +136,7 @@ COPY .github/scripts/crate-licenses.sh ./
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 ARG AVET_VERSION
-# The touch is load-bearing: with host mtimes and a cached /src/target, cargo would ship a stale binary.
+# cargo compares the host's mtimes with the cached /src/target and can skip the rebuild.
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
     --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
@@ -148,7 +148,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETAR
 FROM alpine:3.24 AS runtime
 
 ARG TARGETARCH
-# Also here, so every version pulls the Alpine packages current at its build.
+# A new version invalidates the cached apk layer below.
 ARG AVET_VERSION
 
 RUN apk add --no-cache \
@@ -177,7 +177,6 @@ COPY --from=ffms2       /usr/local/lib/libffms2.so*     /usr/local/lib/
 COPY --from=vship       /usr/local/bin/FFVship          /usr/local/bin/FFVship
 COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
 COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
-# musl searches /usr/local/lib itself, so no /etc/ld-musl-<arch>.path is needed.
 
 COPY LICENSE                                  /usr/share/licenses/avet/LICENSE
 COPY --from=builder     /licenses/avet/crates /usr/share/licenses/avet/crates

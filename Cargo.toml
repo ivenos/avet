@@ -21,6 +21,7 @@ signal-hook        = "0.4"
 tempfile = "3.27"
 proptest = "1.11"
 schemars = "1.2"
+regex-automata = "0.4"
 
 [profile.release]
 opt-level     = 3

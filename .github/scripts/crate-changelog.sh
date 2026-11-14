@@ -36,18 +36,16 @@ pulls() {
     done
 }
 
-numbered() {
-    NAME="$1" PULLS="$2" awk '
+stamp() {
+    NAME="$1" FROM="$2" TO="$3" PULLS="$4" awk '
         /^## \[/ { unreleased = ($0 ~ /^## \[Unreleased\]/) }
         /^### / { deps = ($0 == "### Dependencies") }
         unreleased && deps && /^- / {
             split($0, part, " ")
             if (part[2] == ENVIRON["NAME"] && part[4] == "->") {
                 all = ENVIRON["PULLS"]
-                if (match($0, / \(#[0-9, #]+\)$/)) {
-                    all = all " " substr($0, RSTART + 2, RLENGTH - 3)
-                    $0 = substr($0, 1, RSTART - 1)
-                }
+                if (match($0, / \(#[0-9, #]+\)$/)) all = all " " substr($0, RSTART + 2, RLENGTH - 3)
+                $0 = "- " part[2] " " ENVIRON["FROM"] " -> " ENVIRON["TO"]
                 gsub(/[#,]/, " ", all)
                 count = split(all, found, " ")
                 for (i = 1; i <= count; i++) {
@@ -59,7 +57,7 @@ numbered() {
                 for (i = 1; i <= count; i++) {
                     if (i == 1 || found[i] != found[i - 1]) list = list (list ? ", " : "") "#" found[i]
                 }
-                $0 = $0 " (" list ")"
+                if (list != "") $0 = $0 " (" list ")"
             }
         }
         { print }' "$FILE" > "$FILE.tmp"
@@ -71,6 +69,5 @@ for crate in $(awk '/^\[/ { on = ($0 == "[dependencies]"); next } on && /^[A-Za-
     to=$(locked "$crate" < Cargo.lock)
     if [ -z "$from" ] || [ -z "$to" ] || [ "$from" = "$to" ]; then continue; fi
     CHANGELOG="$FILE" sh "$scripts/changelog.sh" dependency "$crate" "$from" "$to"
-    found=$(pulls "$crate")
-    [ -z "$found" ] || numbered "$crate" "$found"
+    stamp "$crate" "$from" "$to" "$(pulls "$crate")"
 done

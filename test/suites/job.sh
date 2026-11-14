@@ -267,4 +267,12 @@ assert_file_not_exists "$I/p/test.mkv"
 assert_dir_not_exists  "$O/.avet_test"
 unset TEST_PROCESSED
 
+# an option the encoder refuses fails the job behind the scale filter as well
+I="$WORKDIR/19/in"; O="$WORKDIR/19/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\nfilm-grain = 99\n[avet]\nscale = 90\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_file_exists     "$O/.avet_test/.failed"
+assert_file_not_exists "$O/test.mkv"
+
 test_done

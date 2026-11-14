@@ -9,7 +9,7 @@ use std::path::Path;
 pub struct Config {
     pub encoder: Option<Encoder>,
     #[serde(default)]
-    #[cfg_attr(test, schemars(with = "HashMap::<String, serde_json::Value>"))]
+    #[cfg_attr(test, schemars(schema_with = "encoder_params_schema"))]
     pub encoder_params: HashMap<String, toml::Value>,
     #[serde(default)]
     pub avet: AvetConfig,
@@ -67,6 +67,7 @@ pub struct SubtitleConfig {
     #[serde(default)]
     pub mode: SubtitleMode,
     #[serde(default)]
+    #[cfg_attr(test, schemars(inner(regex(pattern = LANGUAGE_CODE))))]
     pub language_whitelist: Vec<String>,
 }
 
@@ -91,6 +92,7 @@ pub struct AudioConfig {
     #[cfg_attr(test, schemars(with = "HashMap::<String, serde_json::Value>"))]
     pub options: HashMap<String, toml::Value>,
     #[serde(default)]
+    #[cfg_attr(test, schemars(inner(regex(pattern = LANGUAGE_CODE))))]
     pub language_whitelist: Vec<String>,
     /// Override for lossless sources; unset fields inherit from [audio].
     pub lossless: Option<AudioProfile>,
@@ -113,12 +115,52 @@ pub struct AudioProfile {
 
 /// A single bitrate, or a per-layout table keyed by layout name (plus `default`).
 #[derive(Debug, Deserialize, Clone)]
-#[cfg_attr(test, derive(schemars::JsonSchema))]
 #[serde(untagged, expecting = "a bitrate such as \"192k\", or a table of them keyed by layout")]
 pub enum Bitrate {
     Single(String),
     PerLayout(HashMap<String, String>),
 }
+
+/// The bases `validate_languages` takes.
+#[cfg(test)]
+const LANGUAGE_CODE: &str = r"^\s*[A-Za-z]{3}([-_][\s\S]*)?\s*$";
+
+/// What `parse_bitrate` reads as 1000 bit/s or more.
+#[cfg(test)]
+const BITRATE: &str = r"^\s*(0*[1-9][0-9]{3,}(\.[0-9]*)?|0*[1-9][0-9]*(\.[0-9]*)?[kK]|(0*[1-9][0-9]*(\.[0-9]*)?|0*\.0{0,2}[1-9][0-9]*)M)\s*$";
+
+#[cfg(test)]
+impl schemars::JsonSchema for Bitrate {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Bitrate".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let single = serde_json::json!({ "type": "string", "pattern": BITRATE });
+        let layouts: serde_json::Map<String, serde_json::Value> =
+            (0..=8).map(layout_name).chain(["default"]).map(|l| (l.to_string(), single.clone())).collect();
+        schemars::json_schema!({
+            "anyOf": [single, { "type": "object", "properties": layouts, "additionalProperties": false }]
+        })
+    }
+}
+
+/// Any key, and those `Config::validate` checks with their checks.
+#[cfg(test)]
+fn encoder_params_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let code = serde_json::json!({ "type": ["integer", "string"], "minimum": 0, "maximum": u32::MAX, "pattern": r"^\+?[0-9]+$" });
+    let mut properties = serde_json::Map::new();
+    properties.insert(
+        "crf".into(),
+        serde_json::json!({ "type": ["number", "string"], "pattern": r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$" }),
+    );
+    for key in COLOR_KEYS {
+        properties.insert(key.into(), code.clone());
+    }
+    schemars::json_schema!({ "type": "object", "properties": properties, "additionalProperties": true })
+}
+
+pub(crate) const COLOR_KEYS: [&str; 5] = ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range", "chroma-sample-position"];
 
 impl Bitrate {
     pub fn resolve(&self, channels: Option<u32>) -> Option<&str> {
@@ -445,9 +487,9 @@ impl Config {
                 bail!("encoder_params.crf must be a number (got {crf})");
             }
         }
-        for key in ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range", "chroma-sample-position"] {
+        for key in COLOR_KEYS {
             if let Some(v) = self.encoder_params.get(key)
-                && toml_value_to_arg(v).parse::<u32>().is_err()
+                && (matches!(v, toml::Value::Boolean(_)) || toml_value_to_arg(v).parse::<u32>().is_err())
             {
                 bail!("encoder_params.{key} must be its numeric code, such as 9 for BT.2020 primaries (got {v})");
             }
@@ -463,8 +505,8 @@ impl Config {
             {
                 bail!("target_quality sets a CRF per chunk and cannot be combined with encoder_params.rc, tbr or cqp");
             }
-            if let Some(key) = ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range"]
-                .into_iter()
+            if let Some(key) = COLOR_KEYS.into_iter()
+                .filter(|k| *k != "chroma-sample-position")
                 .find(|k| self.encoder_params.contains_key(*k))
             {
                 bail!(
@@ -604,6 +646,9 @@ pub(crate) fn parse_bitrate(value: &str) -> Result<u64> {
         Some(b'm') => bail!("a lowercase m is milli to ffmpeg; write M for megabits"),
         _ => (text, 1),
     };
+    if !digits.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        bail!("not a number");
+    }
     let number: f64 = digits.parse().map_err(|_| anyhow::anyhow!("not a number"))?;
     if !number.is_finite() || number <= 0.0 {
         bail!("not a positive number");
@@ -912,6 +957,22 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_missing_from_the_bitrate_table_takes_its_default() {
+        let table = Bitrate::PerLayout(HashMap::from([
+            ("stereo".to_string(), "192k".to_string()),
+            ("default".to_string(), "128k".to_string()),
+        ]));
+        assert_eq!(table.resolve_layout("stereo"), Some("192k"));
+        assert_eq!(table.resolve_layout("mono"), Some("128k"));
+        assert_eq!(table.resolve(Some(2)), Some("192k"));
+        assert_eq!(table.resolve(Some(1)), Some("128k"));
+        assert_eq!(table.resolve(None), Some("128k"));
+
+        let without_default = Bitrate::PerLayout(HashMap::from([("stereo".to_string(), "192k".to_string())]));
+        assert_eq!(without_default.resolve_layout("5.1"), None);
+    }
+
+    #[test]
     fn a_bitrate_missing_its_k_is_rejected_before_anything_is_encoded() {
         let profile = |bitrate: &str| format!(
             "encoder = \"svt-av1\"\n[audio]\nmode = \"encode\"\ncodec = \"libopus\"\nbitrate = {bitrate}"
@@ -984,10 +1045,16 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_rejected_rather_than_ignored() {
-        // A misspelled section used to parse as "feature not configured".
         assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_qualtiy]\njod = 9.5\n").is_err());
-        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[avet]\nbitdepth = 10\n").is_err());
-        assert!(toml::from_str::<Config>("encoder = \"svt-av1\"\n[target_quality]\nmax_probe = 2\n").is_err());
+    }
+
+    #[test]
+    fn every_table_refuses_a_key_it_does_not_have() {
+        for table in ["avet", "audio", "audio.lossless", "audio.codec_rules.opus", "subtitles", "scene_detection", "target_quality"] {
+            let err = toml::from_str::<Config>(&format!("encoder = \"svt-av1\"\n[{table}]\nmisspelled = 1\n"))
+                .err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(err.contains("unknown field `misspelled`"), "[{table}] took an unknown key: {err}");
+        }
     }
 
     #[test]

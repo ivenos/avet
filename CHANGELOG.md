@@ -4,10 +4,42 @@ All notable changes to this project are documented in this file, in the format o
 
 ## [Unreleased]
 
+### Breaking changes
+
+- avet no longer starts when it is given an argument it does not know.
+
 ### Added
 
 - `[target_quality]` works together with `avet.scale`.
 - Editors can suggest and check the settings in `encode.toml`.
+- avet logs a hint for a folder that holds videos but no `encode.toml`.
+
+### Changed
+
+- avet refuses to start with its output folder inside the input folder.
+- Started with `nohup`, avet keeps running when the terminal closes.
+- The warning about a language filter that keeps no track names the file and the languages it has.
+- `encode.toml` values the editor marks as wrong, such as the bitrate `+192k`, are refused.
+- The log no longer says that a typo in `encode.toml` clears on its own.
+
+### Fixed
+
+- avet no longer hangs when the encoder stops while scaling or deinterlacing.
+- HLG from TV broadcasts stays HLG instead of turning into SDR.
+- Colors of 4:2:2 sources no longer sit half a line off.
+- A picture the file crops by an odd number of lines no longer shows a hidden line.
+- Sources with very long names are archived.
+- A stop signal ends avet at once while a file is still being copied in.
+- Audio and subtitle tracks tagged with a two-letter language such as `en` pass the language filter.
+- An audio track that starts late in a TS recording is kept.
+- Target quality no longer reports a missed quality floor when only the size limit is missed.
+- Target quality also scores the finished chunks of cropped HD videos without color tags.
+- Target quality scores a chunk that was finished right before a stop.
+- An untagged HD video cropped or scaled below 651 lines keeps its colors.
+- Mirrored videos no longer play upside down or the wrong way round.
+- A failure avet cannot record is no longer retried on every scan.
+- The output no longer gets wrong track flags when reading them is interrupted.
+- Target quality says when it ran out of probes instead of blaming the floor or the size limit.
 
 ### Dependencies
 

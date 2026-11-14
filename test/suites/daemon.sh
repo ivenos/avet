@@ -81,10 +81,10 @@ wait_for_log "no jobs" 30 || fail "waiting: avet never reported an idle scan"
     done
 ) &
 wait_for_log "still being written" 90 || fail "waiting: avet did not wait for the copy"
+stop_avet 20
 touch "$WORKDIR/waiting.done"
-stop_avet 60
 wait
-[ "$AVET_RC" = 0 ] || fail "waiting: avet exited with $AVET_RC, expected 0"
+[ "$AVET_RC" = 0 ] || fail "waiting: avet exited with $AVET_RC while the copy still grew, expected 0"
 assert_log_contains   "not starting, avet is stopping"
 assert_dir_not_exists "$O/.avet_test"
 
@@ -175,6 +175,52 @@ AVET_CID=$SECOND
 wait_for_log "no jobs" 30 || fail "twin: the second avet did not take over"
 stop_avet 20
 [ "$AVET_RC" = 0 ] || fail "twin: the second avet exited with $AVET_RC"
+
+# a failure that clears on its own waits twice as long each time, not just for the next scan
+setup backoff 'encoder = "nope"\n'
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+started=$(date +%s)
+start_avet "$I" "$O" 1
+wait_for_log "retrying in 16s" 60 || fail "backoff: no fifth attempt within 60 s"
+elapsed=$(( $(date +%s) - started ))
+kill_avet
+[ "$elapsed" -ge 12 ] || fail "backoff: five attempts within ${elapsed}s at a 1 s poll"
+assert_log_not_contains "clears on its own"
+
+# started with nohup, a hangup leaves avet running
+setup nohup
+AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" --user "$(id -u):$(id -g)" \
+    -v "$I:/input:z" -v "$O:/output:z" -e POLL_INTERVAL=2 -e RUST_LOG=debug --entrypoint nohup "$TEST_IMAGE" avet)
+wait_for_log "no jobs" 30 || fail "nohup: avet never reported an idle scan"
+docker kill --signal=HUP "$AVET_CID" >/dev/null 2>&1
+sleep 5
+[ "$(docker inspect -f '{{.State.Running}}' "$AVET_CID" 2>/dev/null)" = true ] || fail "nohup: a hangup stopped avet"
+stop_avet 20
+[ "$AVET_RC" = 0 ] || fail "nohup: avet did not stop on SIGTERM (rc $AVET_RC)"
+
+# avet refuses at the start what would run it on the wrong folders
+start_once() { # DOCKER_ARGS...: until avet exits on its own, at most 10 s
+    AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" --user "$(id -u):$(id -g)" "$@")
+    waited=0
+    while [ "$(docker inspect -f '{{.State.Running}}' "$AVET_CID" 2>/dev/null)" = true ] && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    stop_avet 20
+}
+setup nested
+start_once -v "$I:/input:z" -e OUTPUT_DIR=/input/p/out "$TEST_IMAGE"
+[ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "nested: avet started anyway (rc $AVET_RC)"
+assert_log_contains "is inside INPUT_DIR"
+[ -e "$I/p/out" ] && fail "nested: the refused output folder was created"
+start_once --entrypoint avet "$TEST_IMAGE" --help-me
+[ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "argument: avet started anyway (rc $AVET_RC)"
+assert_log_contains "takes no argument other than --version or --help, got: --help-me"
+start_once --entrypoint avet "$TEST_IMAGE" --version --version
+[ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "two arguments: avet took them (rc $AVET_RC)"
+start_once --entrypoint avet "$TEST_IMAGE" --help
+[ "$AVET_RC" = 0 ] || fail "--help: exited with $AVET_RC"
+assert_log_contains "usage: avet [--version | --help]"
 
 # SIGTERM while idle: the poll sleep ends with it, it is not slept out
 setup idle

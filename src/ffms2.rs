@@ -1,4 +1,4 @@
-#![allow(non_camel_case_types, non_snake_case, dead_code)]
+#![allow(non_camel_case_types, non_snake_case)]
 
 use anyhow::{bail, Context, Result};
 use std::ffi::CString;
@@ -257,6 +257,53 @@ impl Crop {
         let right  = self.x.saturating_add(self.w).max(other.x.saturating_add(other.w));
         let bottom = self.y.saturating_add(self.h).max(other.y.saturating_add(other.h));
         Crop { w: right - x, h: bottom - y, x, y }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mirror {
+    Horizontal,
+    Vertical,
+}
+
+impl Mirror {
+    pub fn filter(self) -> &'static str {
+        match self {
+            Mirror::Horizontal => "hflip",
+            Mirror::Vertical => "vflip",
+        }
+    }
+
+    /// Chroma sited at the left or top edge of its luma pair lands at the far edge once flipped.
+    pub fn moves_chroma(self, loc: &str, subsampling: PixelSubsampling) -> bool {
+        match self {
+            Mirror::Horizontal => subsampling != PixelSubsampling::Yuv444 && loc.ends_with("left"),
+            Mirror::Vertical => subsampling == PixelSubsampling::Yuv420 && (loc.starts_with("top") || loc.starts_with("bottom")),
+        }
+    }
+}
+
+/// How a player shows the stored picture: mirrored first, then turned counter-clockwise by `roll` degrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Orientation {
+    pub mirror: Option<Mirror>,
+    pub roll: i64,
+}
+
+impl Orientation {
+    /// FFMS2 applies `flip` before its clockwise `rotation`.
+    pub fn from_ffms2(flip: c_int, rotation: c_int) -> Self {
+        let clockwise = i64::from(rotation).rem_euclid(360);
+        // FFMS2 reports a vertical mirror as a horizontal one turned by 180 degrees.
+        let (mirror, clockwise) = match flip.signum() {
+            0 => (None, clockwise),
+            1 if clockwise == 180 => (Some(Mirror::Vertical), 0),
+            1 => (Some(Mirror::Horizontal), clockwise),
+            _ if clockwise == 180 => (Some(Mirror::Horizontal), 0),
+            _ => (Some(Mirror::Vertical), clockwise),
+        };
+        let roll = (360 - clockwise) % 360;
+        Orientation { mirror, roll: if roll > 180 { roll - 360 } else { roll } }
     }
 }
 
@@ -547,6 +594,7 @@ pub struct VideoInfo {
     pub sar_den: u32,
     pub num_frames: u32,
     pub pixel_format: PixelFormat,
+    pub orientation: Orientation,
 }
 
 pub struct VideoSource {
@@ -662,6 +710,7 @@ impl VideoSource {
             sar_den:    props.sar_den.max(1) as u32,
             num_frames: props.num_frames as u32,
             pixel_format,
+            orientation: Orientation::from_ffms2(props.flip, props.rotation),
         };
 
         Ok(VideoSource { ptr, info })
@@ -885,5 +934,20 @@ mod tests {
             assert_eq!(layout(name).log2_chroma_w == 0, full_width, "{name}");
         }
         assert_eq!(pixel_layout_of("no-such-format"), None);
+    }
+
+    #[test]
+    fn the_display_matrix_is_a_mirror_of_the_pixels_and_a_counter_clockwise_roll() {
+        use Mirror::*;
+        let o = |mirror, roll| Orientation { mirror, roll };
+        for (flip, rotation, expected) in [
+            (0, 0, o(None, 0)), (0, 90, o(None, -90)), (0, 180, o(None, 180)), (0, 270, o(None, 90)),
+            (1, 0, o(Some(Horizontal), 0)), (1, 90, o(Some(Horizontal), -90)),
+            (1, 180, o(Some(Vertical), 0)), (1, 270, o(Some(Horizontal), 90)),
+            (-1, 0, o(Some(Vertical), 0)), (-1, 180, o(Some(Horizontal), 0)),
+            (0, -90, o(None, 90)), (0, 360, o(None, 0)),
+        ] {
+            assert_eq!(Orientation::from_ffms2(flip, rotation), expected, "flip {flip}, rotation {rotation}");
+        }
     }
 }

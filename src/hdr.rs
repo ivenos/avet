@@ -5,7 +5,7 @@ use dolby_vision::rpu::ConversionMode;
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::ffms2::{Crop, FrameHdrMetadata};
+use crate::ffms2::{Crop, FrameHdrMetadata, Mirror};
 
 #[derive(Debug, Default, Clone)]
 pub struct HdrInfo {
@@ -127,6 +127,7 @@ struct ProbeStream {
 struct ProbeFrame {
     #[serde(default)]
     side_data_list: Vec<SideData>,
+    color_transfer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -161,7 +162,7 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
             // Sections accumulate, so this does not replace the two around it.
             "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
             "-show_frames",
-            "-show_entries", "frame=side_data_list",
+            "-show_entries", "frame=side_data_list,color_transfer",
             "-print_format", "json",
         ],
         source_file,
@@ -177,13 +178,24 @@ impl HdrInfo {
         let not_yuv = layout.is_some_and(|l| l.not_yuv());
         // FFMS2 subsamples full-width chroma between two samples, a siting AV1 has no code for.
         let full_chroma = not_yuv || layout.is_some_and(|l| l.log2_chroma_w == 0);
+        // Full-height chroma it halves between two rows, which is `left` whatever the source's siting.
+        let full_height = layout.is_some_and(|l| l.log2_chroma_h == 0);
+        // HLG for DVB and some cameras: the VUI says BT.2020 and an alternative transfer SEI says HLG.
+        let transfer = probe.frames.first()
+            .and_then(|f| f.color_transfer.clone())
+            .filter(|t| t == "smpte2084" || t == "arib-std-b67")
+            .unwrap_or_else(|| stream.color_transfer.clone());
 
         let mut info = HdrInfo {
             codec_name: stream.codec_name.clone(),
             color_primaries: map_color_primaries(&stream.color_primaries),
-            transfer_characteristics: map_transfer(&stream.color_transfer),
+            transfer_characteristics: map_transfer(&transfer),
             matrix_coefficients: map_matrix(&stream.color_space),
-            chroma_sample_position: if full_chroma { None } else { map_chroma(&stream.chroma_location) },
+            chroma_sample_position: match map_chroma(&stream.chroma_location) {
+                _ if full_chroma => None,
+                Some(2) if full_height => Some(1),
+                csp => csp,
+            },
             chroma_center: full_chroma || stream.chroma_location == "center",
             color_range: map_color_range(&stream.color_range),
             not_yuv,
@@ -217,9 +229,9 @@ impl HdrInfo {
             "Dolby Vision".into()
         } else if info.hdr10plus {
             "HDR10+".into()
-        } else if stream.color_transfer == "smpte2084" {
+        } else if transfer == "smpte2084" {
             "HDR10".into()
-        } else if stream.color_transfer == "arib-std-b67" {
+        } else if transfer == "arib-std-b67" {
             "HLG".into()
         } else {
             "SDR".into()
@@ -274,6 +286,7 @@ pub struct Geometry {
     pub height: u32,
     pub crop: Option<Crop>,
     pub scale: Option<(u32, u32)>,
+    pub mirror: Option<Mirror>,
 }
 
 /// ST 2094-40's T.35 header up to the application identifier. `hevc.rs` strips exactly these
@@ -351,12 +364,17 @@ fn remap_active_area((left, right, top, bottom): (u16, u16, u16, u16), g: Geomet
         let kept = u64::from(kept.max(1));
         ((px * u64::from(out) + kept / 2) / kept) as u16
     };
-    (
+    let (left, right, top, bottom) = (
         fit(left, c.x, c.w, out_w),
         fit(right, g.width.saturating_sub(c.x.saturating_add(c.w)), c.w, out_w),
         fit(top, c.y, c.h, out_h),
         fit(bottom, g.height.saturating_sub(c.y.saturating_add(c.h)), c.h, out_h),
-    )
+    );
+    match g.mirror {
+        Some(Mirror::Horizontal) => (right, left, top, bottom),
+        Some(Mirror::Vertical) => (left, right, bottom, top),
+        None => (left, right, top, bottom),
+    }
 }
 
 /// The color flags among `encoder_args` as mkvmerge options for `track`. mkvmerge takes
@@ -644,6 +662,22 @@ mod tests {
     }
 
     #[test]
+    fn hlg_from_the_alternative_transfer_sei_is_kept() {
+        let info = HdrInfo::from_probe(serde_json::from_str(r#"{
+            "streams": [{"color_transfer": "bt2020-10", "color_primaries": "bt2020", "color_space": "bt2020nc"}],
+            "frames": [{"color_transfer": "arib-std-b67"}]
+        }"#).unwrap());
+        assert_eq!((info.transfer_characteristics, info.hdr_type.as_str()), (Some(18), "HLG"));
+        assert_eq!((info.color_primaries, info.matrix_coefficients), (Some(9), Some(9)));
+
+        let sdr = HdrInfo::from_probe(serde_json::from_str(r#"{
+            "streams": [{"color_transfer": "bt709"}],
+            "frames": [{"color_transfer": "bt470bg"}]
+        }"#).unwrap());
+        assert_eq!((sdr.transfer_characteristics, sdr.hdr_type.as_str()), (Some(1), "SDR"));
+    }
+
+    #[test]
     fn chroma_that_ffms2_subsamples_is_described_as_centered() {
         let info = |pix_fmt: &str, location: &str| HdrInfo::from_probe(serde_json::from_str(&format!(
             r#"{{"streams": [{{"pix_fmt": "{pix_fmt}", "chroma_location": "{location}"}}]}}"#
@@ -658,11 +692,13 @@ mod tests {
         assert_eq!(info("yuv420p10le", "topleft").chroma_loc(), "topleft");
         assert_eq!(info("yuv420p", "unspecified").chroma_loc(), "left");
         assert_eq!(info("yuv422p", "left").chroma_loc(), "left");
+        assert_eq!(info("yuv422p10le", "topleft").chroma_loc(), "left");
+        assert_eq!(info("yuv422p10le", "topleft").chroma_sample_position, Some(1));
         assert_eq!(info("yuvj420p", "center").chroma_loc(), "center");
     }
 
     fn geometry(crop: Option<Crop>, scale: Option<(u32, u32)>) -> Geometry {
-        Geometry { width: 1920, height: 1080, crop, scale }
+        Geometry { width: 1920, height: 1080, crop, scale, mirror: None }
     }
 
     use proptest::prelude::*;
@@ -678,12 +714,12 @@ mod tests {
         ) {
             let crop = Crop { w: cw, h: ch, x, y };
             let out = scale.map(|f| (((cw as f64 * f) as u32).max(1), ((ch as f64 * f) as u32).max(1)));
-            let g = Geometry { width: w, height: h, crop: Some(crop), scale: out };
+            let g = Geometry { width: w, height: h, crop: Some(crop), scale: out, mirror: None };
             let (l, r, t, b) = remap_active_area(offsets, g);
             let (ow, oh) = out.unwrap_or((cw, ch));
             prop_assert!(u32::from(l) <= ow && u32::from(r) <= ow && u32::from(t) <= oh && u32::from(b) <= oh);
 
-            let untouched = Geometry { width: w, height: h, crop: None, scale: None };
+            let untouched = Geometry { width: w, height: h, crop: None, scale: None, mirror: None };
             let clamp = |v: u16, max: u32| v.min(max as u16);
             prop_assert_eq!(remap_active_area(offsets, untouched), (clamp(offsets.0, w), clamp(offsets.1, w), clamp(offsets.2, h), clamp(offsets.3, h)));
         }
@@ -713,6 +749,18 @@ mod tests {
 
         assert_eq!(remap_active_area(bars, geometry(None, Some((1280, 720)))), (0, 0, 93, 93));
         assert_eq!(remap_active_area(bars, geometry(Some(partial), Some((960, 500)))), (0, 0, 50, 50));
+    }
+
+    #[test]
+    fn active_area_is_mirrored_with_the_picture_after_the_crop() {
+        let offsets = (10, 30, 140, 100);
+        let crop = Crop { w: 1910, h: 1000, x: 0, y: 40 };
+        let mirrored = |mirror| Geometry { mirror: Some(mirror), ..geometry(Some(crop), None) };
+        assert_eq!(remap_active_area(offsets, geometry(Some(crop), None)), (10, 20, 100, 60));
+        assert_eq!(remap_active_area(offsets, mirrored(Mirror::Horizontal)), (20, 10, 100, 60));
+        assert_eq!(remap_active_area(offsets, mirrored(Mirror::Vertical)), (10, 20, 60, 100));
+        let uncropped = Geometry { mirror: Some(Mirror::Horizontal), ..geometry(None, None) };
+        assert_eq!(remap_active_area(offsets, uncropped), (30, 10, 140, 100));
     }
 
     fn ffms2_rpu(offsets: (u16, u16, u16, u16)) -> Vec<u8> {

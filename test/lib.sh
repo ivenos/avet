@@ -3,8 +3,11 @@
 #   TEST_IMAGE      Docker image to use (default: avet:test)
 #   TEST_CPUS       CPU share for the avet container, e.g. 0.5 to slow a job down
 #   TEST_CPUSET     CPUs the avet container may run on, e.g. 0 for a single one
+#   TEST_PROCESSED  Host folder mounted as /input/processed
+#   TEST_RUST_LOG   RUST_LOG of avet (default: info)
+#   TEST_SOFTWARE_GPU  Passes AVET_SOFTWARE_GPU=1
+#   TEST_SCENE_REPAIR  The case expects avet to repair its scene list
 #   FIXTURES_DIR    Path to the fixtures run.sh generates
-#   VERBOSE=1       Print Docker logs on failure
 
 TEST_IMAGE="${TEST_IMAGE:-avet:test}"
 # run.sh generates the fixtures and exports this; a suite run on its own has no source
@@ -679,8 +682,7 @@ assert_audio_samples_identical() {
     if [ ! -s "$b" ]; then
         fail "samples: the source $src has no audio $src_index"
     elif ! cmp -s -n "$(stat -c %s "$a")" "$a" "$b" || \
-        [ $(( ($(stat -c %s "$b") - $(stat -c %s "$a")) / 4 / channels )) -gt "$missing" ] || \
-        [ "$(stat -c %s "$a")" -gt "$(stat -c %s "$b")" ]; then
+        [ $(( ($(stat -c %s "$b") - $(stat -c %s "$a")) / 4 / channels )) -gt "$missing" ]; then
         fail "samples: $out audio $index is not bit-exact against source audio $src_index ($(stat -c %s "$a") against $(stat -c %s "$b") bytes)"
     fi
 }

@@ -1,5 +1,4 @@
 #!/bin/sh
-# Generates every fixture into $FIXTURES_DIR. Called by run.sh.
 
 set -u
 : "${FIXTURES_DIR:?}" "${TEST_IMAGE:?}" "${TOOLS_IMAGE:?}"
@@ -371,10 +370,13 @@ echo "  pattern_119.mkv"
 $FF -f lavfi -i "$(pattern 160x90 120000/1001 yuv420p)" -frames:v 1199 \
     -c:v libx264 -qp 0 -preset ultrafast pattern_119.mkv
 
-echo "  pattern_rot90.mp4, pattern_rot270.mp4"
+echo "  pattern_rot90.mp4, pattern_rot270.mp4, pattern_hflip.mp4, pattern_vflip.mp4, pattern_rot90_hflip.mp4"
 $FF -i pattern_av.mkv -map 0:v -c:v copy pattern_plain.mp4
 $FF -display_rotation 90 -i pattern_plain.mp4 -c copy pattern_rot90.mp4
 $FF -display_rotation 270 -i pattern_plain.mp4 -c copy pattern_rot270.mp4
+$FF -display_hflip -i pattern_plain.mp4 -c copy pattern_hflip.mp4
+$FF -display_vflip -i pattern_plain.mp4 -c copy pattern_vflip.mp4
+$FF -display_rotation 90 -display_hflip -i pattern_plain.mp4 -c copy pattern_rot90_hflip.mp4
 
 echo "  pattern_anamorphic.mkv"
 $FF -f lavfi -i "$(pattern 360x288 25 yuv420p),setsar=64/45" -frames:v 100 \
@@ -386,10 +388,11 @@ $FF -f lavfi -i "nullsrc=size=640x276:rate=24,$PATTERN,format=yuv420p,pad=640:36
     -c:v libx264 -qp 0 -preset ultrafast pattern_bars.mkv
 $FF -display_rotation 90 -i pattern_bars.mkv -map 0:v -c:v copy pattern_bars_rot90.mp4
 
-echo "  pattern_pixcrop.mkv"
+echo "  pattern_pixcrop.mkv, pattern_pixcrop_odd.mkv"
 $FF -f lavfi -i "nullsrc=size=480x276:rate=24,$PATTERN,format=yuv420p,pad=640:276:72:0:black,pad=640:296:0:8:red" \
     -frames:v 24 -c:v libx264 -qp 0 -preset ultrafast pixcrop_full.mkv
 mkvmerge -q -o pattern_pixcrop.mkv --cropping 0:0,8,0,12 pixcrop_full.mkv
+mkvmerge -q -o pattern_pixcrop_odd.mkv --cropping 0:0,7,0,13 pixcrop_full.mkv
 rm pixcrop_full.mkv
 
 echo "  pattern_dark.mkv"
@@ -532,6 +535,12 @@ $FF -i pattern.mkv -map 0:v -c:v copy \
     -c:a:5 aac -strict -2 -mpegts_m2ts_mode 1 -mpegts_flags latm audio_codecs.m2ts
 $FF -i pattern.mkv -map 0:v -c:v copy -map 0:a:0 -map 0:a:0 -c:a:0 aac -c:a:1 ac3 \
     -metadata:s:a:0 language=ger -metadata:s:a:1 language=eng -mpegts_flags latm audio_latm.ts
+# The second track starts 10 s in, after the 7 s ffmpeg reads of an MPEG-TS by default.
+$FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=16" \
+    -frames:v 400 -map 0:v -map 1:a -c:v mpeg2video -q:v 2 -c:a ac3 -metadata:s:a:0 language=ger -f mpegts late_main.ts
+$FF -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=5" -c:a ac3 -f ac3 audio_late.ac3
+$FF -i late_main.ts -itsoffset 10 -i audio_late.ac3 -map 0 -map 1 -c copy -metadata:s:a:1 language=eng -f mpegts audio_late.ts
+$FF -i late_main.ts -itsoffset 10 -i audio_late.ac3 -map 0:v -map 1 -map 0:a -c copy -metadata:s:a:0 language=eng -f mpegts audio_late_first.ts
 $FF -i pattern.mkv -map 0:v -c:v copy -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 \
     -c:a:0 aac -c:a:1 aac -ar:a:1 44100 -c:a:2 alac -c:a:3 libmp3lame -c:a:4 ac3 audio_codecs.mp4
 
@@ -624,7 +633,7 @@ $FF -i one_picture.mkv -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:
     -map 0:v -map 1:a -c:v copy -c:a flac one_frame.mkv
 $FF -i pattern.mkv -map 0:a:0 -c:a copy audio_only.mkv
 
-rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts switch*.ac3
+rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts switch*.ac3 late_main.ts
 GEN
 
 GEN_RC=$?

@@ -60,6 +60,8 @@ encode interlaced_bff pattern_interlaced_bff.mkv
 assert_log_contains "interlaced, bottom field first"
 assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=bff:deint=all"
 assert_frame_times_match "$O/test.mkv" "$SRC"
+encode interlaced_scaled pattern_interlaced.mkv 'scale = 90'
+assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=tff:deint=all,scale=160:90:flags=lanczos"
 encode flagged pattern_flagged.mkv 'keep_temp = true'
 assert_log_contains "flagged interlaced, but the frames are not"
 assert_frames_match "$O/test.mkv" "$SRC"

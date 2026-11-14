@@ -89,7 +89,6 @@ struct WorkerCtx<'a> {
 
 pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
     let started = Instant::now();
-    // Marking every video in the folder would keep them all skipped after the fix.
     let config = Config::from_file(&job.encode_toml).context(Transient)?;
     // Before indexing and scene detection, which a setup without a GPU would pay every scan.
     let gpu = match &config.target_quality {
@@ -99,12 +98,13 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
 
     let stem = job.stem();
 
-    if !wait_for_stable(&job.source_file, stem)? {
-        tracing::info!("[{stem}] still being written - looking again on the next scan");
-        return Ok(());
-    }
+    let stable = wait_for_stable(&job.source_file, stem)?;
     if ATTEMPTS.stopping() {
         tracing::info!("[{stem}] not starting, avet is stopping");
+        return Ok(());
+    }
+    if !stable {
+        tracing::info!("[{stem}] still being written - looking again on the next scan");
         return Ok(());
     }
 
@@ -232,7 +232,7 @@ fn run_encode(
         hdr10plus: hdr.hdr10plus,
         dolby_vision: dv && hdr.hdr_type == "Dolby Vision",
     };
-    let hdr_args = hdr.encoder_args();
+    let mut hdr_args = hdr.encoder_args();
 
     let hdr10plus_frames = if dynamic_hdr.hdr10plus && hevc_source {
         tracing::info!("[{stem}] HDR10+: reading it from the bitstream");
@@ -270,6 +270,9 @@ fn run_encode(
         })
     });
     let deinterlace = crate::interlace::detect(&video_file, duration_secs, &temp.interlace_cache, stem)?;
+    if let Some(mirror) = video_info.orientation.mirror {
+        tracing::info!("[{stem}] the display matrix mirrors the picture, so the frames get {}", mirror.filter());
+    }
 
     let (scale_target, crop, scene_vf) = compute_output_params(
         video_info.width,
@@ -279,6 +282,14 @@ fn run_encode(
         deinterlace,
         stem,
     );
+
+    let output_height = scale_target.map(|(_, h)| h).or(crop.map(|c| c.h)).unwrap_or(video_info.height);
+    let tags: Vec<String> = hdr_args.iter().cloned().chain(config.encoder_params.keys().map(|k| format!("--{k}"))).collect();
+    let colors = untagged_hd_colors(&tags, hdr.not_yuv, video_info.height, output_height);
+    if !colors.is_empty() {
+        tracing::info!("[{stem}] untagged HD source encoded at {output_height} lines: tagged as BT.709");
+        hdr_args.extend(colors);
+    }
 
     let auto_keyint: Option<u32> = if config.avet.keyint {
         let ki = (fps * 5.0).round().max(1.0) as u32;
@@ -294,6 +305,7 @@ fn run_encode(
         scale: scale_target,
         crop,
         deinterlace,
+        mirror: video_info.orientation.mirror,
         chroma_loc: Some(hdr.chroma_loc()),
         fps_num,
         fps_den: fps_den * fps_divisor,
@@ -437,6 +449,11 @@ fn run_encode(
         tracing::debug!("[{stem}] chunk {} already done", scene.padded_index());
     }
     let resumed_frames: u64 = resumed.iter().map(|s| s.frame_count()).sum();
+    let unmeasured: Vec<&SceneEntry> = match &crf_cache {
+        Some(cache) if target_quality::measurable(&encode_opts) => resumed.iter().copied().filter(|s| cache.unmeasured(&s.padded_index())).collect(),
+        Some(_) => Vec::new(),
+        None => Vec::new(),
+    };
 
     let wctx = WorkerCtx {
         source: &video_file,
@@ -463,7 +480,7 @@ fn run_encode(
         cancel: AtomicBool::new(false),
     };
 
-    let queue = Mutex::new(pending.into_iter());
+    let queue = Mutex::new(unmeasured.into_iter().map(|s| (s, false)).chain(pending.into_iter().map(|s| (s, true))));
     let first_err = Mutex::new(None);
     std::thread::scope(|s| {
         for _ in 0..num_workers {
@@ -471,8 +488,9 @@ fn run_encode(
                 if wctx.cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let Some(scene) = queue.lock().unwrap().next() else { break };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_one(&wctx, scene)))
+                let Some((scene, encode)) = queue.lock().unwrap().next() else { break };
+                let work = || if encode { encode_one(&wctx, scene) } else { measure_finished(&wctx, scene) };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
                     .unwrap_or_else(|panic| Err(anyhow::anyhow!(
                         "chunk {:05} panicked: {}", scene.index + 1, crate::panic_message(&*panic)
                     )));
@@ -522,7 +540,7 @@ fn run_encode(
     let (out_w, out_h) = scale_target
         .or(encode_opts.crop.map(|c| (c.w, c.h)))
         .unwrap_or((video_info.width, video_info.height));
-    video_args.extend(source_video.display_args(out_w, out_h));
+    video_args.extend(source_video.display_args(out_w, out_h, video_info.orientation.roll));
     let video = MuxVideo {
         path: &video_only,
         args: video_args,
@@ -559,7 +577,7 @@ fn leading_frames(source: &Path, timestamps_ms: &[f64], gap: u64) -> Result<u64>
 
     let packets = format!("%+#{}", gap + 100);
     let probe: Probe = crate::ext::ffprobe_json(
-        &["-v", "quiet", "-select_streams", "v:0", "-read_intervals", &packets,
+        &["-v", "error", "-select_streams", "v:0", "-read_intervals", &packets,
           "-show_entries", "frame=best_effort_timestamp_time", "-of", "json"],
         source,
     )
@@ -697,7 +715,7 @@ fn finalize(
         tracing::error!("[{stem}] output is in place, but archiving the source failed - trying again on the next scan: {e:#}");
     }
 
-    if output_bytes > source_bytes {
+    if output_bytes > source_bytes && format_size(output_bytes) != format_size(source_bytes) {
         tracing::warn!(
             "[{stem}] the output is larger than the source: {} against {}",
             format_size(output_bytes), format_size(source_bytes)
@@ -793,7 +811,6 @@ fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<Pa
 
 /// mkvmerge's time zero for a copied FLV, MP4 edit list or wrapping MPEG-TS is not ffmpeg's,
 /// which the audio and extracted subtitles are on.
-/// `from_tracks` marks the output tracks of tracks.mkv, where mux_final reordered them.
 fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str, from_tracks: Option<&[bool]>) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct Format { #[serde(default)] format: FormatStart }
@@ -820,7 +837,10 @@ fn realign_copied_video(source: &Path, temp: &TempDir, stem: &str, from_tracks: 
     tracing::info!("[{stem}] moving the copied video by {video_ms} ms and the rest by {others_ms} ms");
 
     let muxed = track_types(&temp.mux_path)?;
-    let extracted = if temp.tracks_path.exists() { track_types(&temp.tracks_path)?.len() } else { 0 };
+    let extracted = match from_tracks {
+        None if temp.tracks_path.exists() => track_types(&temp.tracks_path)?.len(),
+        _ => 0,
+    };
     let videos = muxed.iter().take_while(|t| *t == "video").count();
 
     let realigned = temp.path.join("realigned.mkv");
@@ -908,9 +928,7 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
         other => return Ok(other?),
     }
-    let mut part = to.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
+    let part = to.with_file_name(crate::scanner::fit_name(&to.file_name().unwrap_or_default().to_string_lossy(), ".part"));
     let copied = std::fs::copy(from, &part)
         .and_then(|_| std::fs::File::open(&part)?.sync_all())
         .and_then(|()| std::fs::rename(&part, to));
@@ -954,7 +972,7 @@ fn free_path(path: &Path) -> Result<PathBuf> {
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
 
     for n in 2..=1000u32 {
-        let candidate = dir.join(format!("{stem}.{n}{ext}"));
+        let candidate = dir.join(crate::scanner::fit_name(&stem, &format!(".{n}{ext}")));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -982,21 +1000,12 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     let enc_fps = scene_frames as f64 / t0.elapsed().as_secs_f64();
     w.done.mark_done(&chunk_key, scene_frames, size_bytes)?;
 
-    if let (Some(ctx), Some(cache)) = (probe_context(w), &w.crf_cache) {
+    if let Some(ctx) = probe_context(w) {
         let pct = target_quality::chunk_size_pct(size_bytes, &w.source_byte_index, scene.start_frame, scene.end_frame);
         if pct > ctx.tq.max_encoded_percent {
             tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.0}% of the source, over max_encoded_percent", w.stem);
         }
-        if let Some(jod) = target_quality::measure_final(&ctx, scene, &chunk, reference.as_ref()) {
-            let probed = cache.probed(&chunk_key);
-            cache.set_measured(&chunk_key, jod)?;
-            if jod < ctx.tq.jod && probed.is_some_and(|p| p >= ctx.tq.jod) {
-                tracing::warn!(
-                    "[{}] chunk {chunk_key} came out at JOD {jod:.3}, under the floor of {} its probe held with {:.3}",
-                    w.stem, ctx.tq.jod, probed.unwrap_or(jod)
-                );
-            }
-        }
+        record_measured(w, &ctx, scene, &chunk, reference.as_ref())?;
     }
 
     let n_chunks = w.completed_chunks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1013,6 +1022,36 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
         "[{}] chunk {n_chunks}/{} - {pct}% - {enc_fps:.1} fps - {:.1} MB{eta}",
         w.stem, w.total_chunks, size_bytes as f64 / 1_048_576.0
     );
+    Ok(())
+}
+
+/// A chunk finished before an abort, scored now instead of encoded again.
+fn measure_finished(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
+    let Some(ctx) = probe_context(w) else { return Ok(()) };
+    tracing::info!("[{}] chunk {} already done, measuring it", w.stem, scene.padded_index());
+    let reference = target_quality::Reference::write(&ctx, scene)?;
+    record_measured(w, &ctx, scene, &w.temp.chunk_path(&scene.padded_index()), reference.as_ref())
+}
+
+fn record_measured(
+    w: &WorkerCtx,
+    ctx: &target_quality::ProbeContext,
+    scene: &SceneEntry,
+    chunk: &Path,
+    reference: Option<&target_quality::Reference>,
+) -> Result<()> {
+    let (Some(cache), Some(jod)) = (&w.crf_cache, target_quality::measure_final(ctx, scene, chunk, reference)) else {
+        return Ok(());
+    };
+    let chunk_key = scene.padded_index();
+    let probed = cache.probed(&chunk_key);
+    cache.set_measured(&chunk_key, jod)?;
+    if jod < ctx.tq.jod && probed.is_some_and(|p| p >= ctx.tq.jod) {
+        tracing::warn!(
+            "[{}] chunk {chunk_key} came out at JOD {jod:.3}, under the floor of {} its probe held with {:.3}",
+            w.stem, ctx.tq.jod, probed.unwrap_or(jod)
+        );
+    }
     Ok(())
 }
 
@@ -1059,16 +1098,17 @@ fn resolve_crf(
             "[{}] chunk {chunk_key} floor unreachable, using crf {} ({})",
             w.stem, res.crf, res.scores()
         ),
+        target_quality::SolveOutcome::ProbesSpent => tracing::warn!(
+            "[{}] chunk {chunk_key} used up max_probes before every limit held, using crf {} ({}, {:.0}% size)",
+            w.stem, res.crf, res.scores(), res.size_pct
+        ),
+        target_quality::SolveOutcome::OverCap { floor_held } => tracing::warn!(
+            "[{}] chunk {chunk_key} over max_encoded_percent even at the smallest probe, using crf {}{} ({}, {:.0}% size)",
+            w.stem, res.crf, if floor_held { "" } else { ", floor not held" }, res.scores(), res.size_pct
+        ),
     }
     Ok(Some(res.crf))
 }
-
-const MAX_UNRETURNED_STARTS: u32 = 3;
-
-/// Starts of a job that never returned, counted in its temp dir. Only avet dying with the job leaves one.
-pub struct Attempts(Mutex<AttemptState>);
-
-pub static ATTEMPTS: Attempts = Attempts::new();
 
 /// When a job that failed for a reason that clears on its own is tried again: a poll interval
 /// later, then two, then four, at most `MAX_RETRY_POLLS`. An edit of encode.toml ends the wait.
@@ -1111,6 +1151,13 @@ impl Retries {
         self.state().remove(&job.source_file);
     }
 }
+
+const MAX_UNRETURNED_STARTS: u32 = 3;
+
+/// Starts of a job that never returned, counted in its temp dir. Only avet dying with the job leaves one.
+pub struct Attempts(Mutex<AttemptState>);
+
+pub static ATTEMPTS: Attempts = Attempts::new();
 
 struct AttemptState {
     stopping: bool,
@@ -1194,32 +1241,43 @@ pub fn handle_failure(
     // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
     if shutting_down || source_moved || is_transient(err) {
         let wait = if shutting_down { ctx.poll } else { RETRIES.failed(job, profile, ctx.poll, Instant::now()) };
-        let when = if wait > ctx.poll { format!("in {}", format_duration(wait.as_secs())) } else { "on the next scan".into() };
-        tracing::error!("[{stem}] job failed - retrying {when}\n{err:#}");
+        tracing::error!("[{stem}] job failed - retrying {}\n{}", retry_when(wait, ctx.poll), reason(err));
+        return;
+    }
+
+    let marked = temp.create_dirs().and_then(|()| {
+        if temp.recorded_id().is_none()
+            && let Err(e) = crate::resume::source_id(&job.source_file)
+                .and_then(|id| crate::resume::write_atomic(&temp.source_id_path, id.as_bytes()))
+        {
+            tracing::warn!("[{stem}] could not record source path: {e:#}");
+        }
+        let _ = std::fs::remove_file(&temp.failed_profile_path);
+        if let Some(profile) = profile
+            && let Err(e) = crate::resume::write_atomic(&temp.failed_profile_path, profile.as_bytes())
+        {
+            tracing::warn!("[{stem}] could not record the profile of the failure: {e:#}");
+        }
+        crate::resume::write_atomic(&temp.failed_path, format!("{err:#}").as_bytes())
+    });
+    if let Err(e) = marked {
+        tracing::warn!("[{stem}] could not write failure marker: {e:#}");
+        let wait = RETRIES.failed(job, profile, ctx.poll, Instant::now());
+        tracing::error!("[{stem}] job failed - retrying {}\n{}", retry_when(wait, ctx.poll), reason(err));
         return;
     }
     RETRIES.clear(job);
-
-    if let Err(e) = temp.create_dirs() {
-        tracing::warn!("[{stem}] could not create temp dir for failure marker: {e:#}");
-    }
-    // So the marker locks out this file, not the next one with the same name.
-    if temp.recorded_id().is_none()
-        && let Err(e) = crate::resume::source_id(&job.source_file)
-            .and_then(|id| crate::resume::write_atomic(&temp.source_id_path, id.as_bytes()))
-    {
-        tracing::warn!("[{stem}] could not record source path: {e:#}");
-    }
-    let _ = std::fs::remove_file(&temp.failed_profile_path);
-    if let Some(profile) = profile
-        && let Err(e) = crate::resume::write_atomic(&temp.failed_profile_path, profile.as_bytes())
-    {
-        tracing::warn!("[{stem}] could not record the profile of the failure: {e:#}");
-    }
-    if let Err(e) = crate::resume::write_atomic(&temp.failed_path, format!("{err:#}").as_bytes()) {
-        tracing::warn!("[{stem}] could not write failure marker: {e:#}");
-    }
     tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
+}
+
+/// `{err:#}` without the Transient marker.
+fn reason(err: &anyhow::Error) -> String {
+    let marker = Transient.to_string();
+    err.chain().map(ToString::to_string).filter(|link| *link != marker).collect::<Vec<_>>().join(": ")
+}
+
+fn retry_when(wait: std::time::Duration, poll: std::time::Duration) -> String {
+    if wait > poll { format!("in {}", format_duration(wait.as_secs())) } else { "on the next scan".into() }
 }
 
 fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &TempDir, started: Instant) -> Result<()> {
@@ -1254,6 +1312,19 @@ fn ignored_video_opts(a: &crate::config::AvetConfig) -> Vec<&'static str> {
     if a.scale.is_some() { v.push("scale"); }
     if a.bit_depth.is_some() { v.push("bit_depth"); }
     v
+}
+
+/// Players and FFVship guess the colors of an untagged picture from its height, BT.709 above 650 lines.
+fn untagged_hd_colors(hdr_args: &[String], not_yuv: bool, source_height: u32, output_height: u32) -> Vec<String> {
+    let tagged = |flag: &str| hdr_args.iter().any(|a| a == flag);
+    if not_yuv || source_height <= 650 || output_height > 650 || tagged("--matrix-coefficients") {
+        return Vec::new();
+    }
+    ["--color-primaries", "--transfer-characteristics", "--matrix-coefficients"]
+        .into_iter()
+        .filter(|flag| !tagged(flag))
+        .flat_map(|flag| [flag.to_string(), "1".to_string()])
+        .collect()
 }
 
 /// `(scale_target, crop, scene_vf)`. Crop is in source space and runs before the scale.
@@ -1358,7 +1429,7 @@ fn profile_fingerprint(
     // Without `..`, so a new field has to be placed; the skipped ones are in `merged_args` or follow from the source.
     let EncodeOptions {
         hdr_args: _, keyint: _, chroma_loc: _,
-        scale, crop, deinterlace, fps_num, fps_den, target_bit_depth, dynamic_hdr, hdr10plus_frames,
+        scale, crop, deinterlace, mirror, fps_num, fps_den, target_bit_depth, dynamic_hdr, hdr10plus_frames,
     } = opts;
     let mut parts = vec![
         format!("{encoder:?}"),
@@ -1373,6 +1444,9 @@ fn profile_fingerprint(
     ];
     if let Some(order) = deinterlace {
         parts.push(format!("deinterlace={order:?}"));
+    }
+    if let Some(mirror) = mirror {
+        parts.push(format!("mirror={mirror:?}"));
     }
     if dynamic_hdr.any() {
         parts.push(format!("{dynamic_hdr:?}"));
@@ -1472,6 +1546,9 @@ fn wait_for_stable(path: &Path, stem: &str) -> Result<bool> {
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(INTERVAL_SECS));
+        if ATTEMPTS.stopping() {
+            return Ok(false);
+        }
         let next = file_state(path);
         // Moved away mid-wait it reads as (0, None) twice, which compares as stable.
         if next.0 == 0 {
@@ -1612,8 +1689,6 @@ struct SourceVideo {
     /// mkvmerge reads a Matroska source's own tracks and chapters without that rebase.
     matroska_start_ms: i64,
     sar: Option<(u32, u32)>,
-    /// Degrees counter-clockwise, as ffprobe reports the display matrix.
-    rotation: i64,
     /// Matroska PixelCrop or MP4 `clap` as left, top, right, bottom.
     container_crop: [u32; 4],
 }
@@ -1622,22 +1697,30 @@ impl SourceVideo {
     /// The picture a player shows, in FFMS2's frame: ffmpeg applies a container crop, FFMS2 does not.
     fn visible(&self, width: u32, height: u32) -> Crop {
         let [left, top, right, bottom] = self.container_crop;
+        if self.container_crop == [0; 4] {
+            return Crop { w: width, h: height, x: 0, y: 0 };
+        }
         let w = width.checked_sub(left.saturating_add(right)).filter(|&w| w > 0);
         let h = height.checked_sub(top.saturating_add(bottom)).filter(|&h| h > 0);
+        // What a container hides is no picture, an odd edge included.
+        let (x, y) = ((left + 1) & !1, (top + 1) & !1);
         match (w, h) {
-            (Some(w), Some(h)) => Crop { w, h, x: left, y: top },
+            (Some(w), Some(h)) if left + w > x + 1 && top + h > y + 1 => {
+                Crop { w: (left + w - x) & !1, h: (top + h - y) & !1, x, y }
+            }
             _ => Crop { w: width, h: height, x: 0, y: 0 },
         }
     }
 
-    fn display_args(&self, width: u32, height: u32) -> Vec<String> {
+    /// `roll` in degrees counter-clockwise, as Matroska's ProjectionPoseRoll.
+    fn display_args(&self, width: u32, height: u32, roll: i64) -> Vec<String> {
         let mut args = Vec::new();
         if let Some((n, d)) = self.sar.filter(|&(n, d)| n > 0 && d > 0 && n != d) {
             let display_width = (u64::from(width) * u64::from(n) + u64::from(d) / 2) / u64::from(d);
             args.extend(["--display-dimensions".into(), format!("0:{display_width}x{height}")]);
         }
-        if self.rotation != 0 {
-            args.extend(["--projection-pose-roll".into(), format!("0:{}", self.rotation)]);
+        if roll != 0 {
+            args.extend(["--projection-pose-roll".into(), format!("0:{roll}")]);
         }
         args
     }
@@ -1657,7 +1740,6 @@ struct VideoProbeStream {
 }
 #[derive(serde::Deserialize)]
 struct VideoProbeSideData {
-    rotation: Option<f64>,
     crop_top: Option<u32>,
     crop_bottom: Option<u32>,
     crop_left: Option<u32>,
@@ -1670,7 +1752,7 @@ fn probe_source_video(source: &Path) -> Result<SourceVideo> {
     let probe: VideoProbe = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "v:0",
           "-show_entries", "stream=avg_frame_rate,r_frame_rate,start_time,sample_aspect_ratio",
-          "-show_entries", "stream_side_data=rotation,crop_top,crop_bottom,crop_left,crop_right",
+          "-show_entries", "stream_side_data=crop_top,crop_bottom,crop_left,crop_right",
           "-show_entries", "format=format_name,start_time",
           "-of", "json"],
         source,
@@ -1695,11 +1777,6 @@ impl SourceVideo {
         let sar = stream.sample_aspect_ratio.as_deref()
             .and_then(|r| r.split_once(':'))
             .and_then(|(n, d)| Some((n.parse().ok()?, d.parse().ok()?)));
-        let rotation = stream.side_data_list.iter()
-            .find_map(|s| s.rotation)
-            .map(|r| (r.round() as i64).rem_euclid(360))
-            .map(|r| if r > 180 { r - 360 } else { r })
-            .unwrap_or(0);
         let container_crop = stream.side_data_list.iter()
             .find(|s| s.crop_top.is_some())
             .map_or([0; 4], |s| [s.crop_left, s.crop_top, s.crop_right, s.crop_bottom].map(|e| e.unwrap_or(0)));
@@ -1710,7 +1787,6 @@ impl SourceVideo {
             offset_ms: (video_start - container_start).max(0),
             matroska_start_ms: if probe.format.format_name.contains("matroska") { container_start } else { 0 },
             sar,
-            rotation,
             container_crop,
         })
     }
@@ -1775,6 +1851,10 @@ mod tests {
         let mut o = opts();
         o.fps_den = 2;
         assert_ne!(base, profile_fingerprint(enc, &args, &o, &sc, None));
+
+        let mut o = opts();
+        o.mirror = Some(crate::ffms2::Mirror::Horizontal);
+        assert_ne!(base, profile_fingerprint(enc, &args, &o, &sc, None));
     }
 
     #[test]
@@ -1815,9 +1895,34 @@ mod failure_class_tests {
         let toml = dir.path().join("encode.toml");
         std::fs::write(&toml, "encoder = \"svt-av1\"\n[avet]\nscale = 0\n").unwrap();
 
-        let err = Config::from_file(&toml).context(Transient).unwrap_err();
+        let ctx = JobContext { input_dir: dir.path().to_path_buf(), output_dir: dir.path().join("output"), poll: std::time::Duration::from_secs(60) };
+        let job = Job { encode_toml: toml, source_file: dir.path().join("film.mkv"), rel_dir: PathBuf::new(), delivered: false };
+        let err = run(&job, &ctx).unwrap_err();
         assert!(format!("{err:#}").contains("avet.scale"), "got: {err:#}");
         assert!(is_transient(&err), "got: {err:#}");
+    }
+
+    #[test]
+    fn a_timeout_and_a_full_disk_are_transient_but_an_encoder_failure_is_not() {
+        let timeout = anyhow::Error::new(Transient).context("ffprobe did not finish within 120s");
+        assert!(is_transient(&timeout.context("HDR detection")));
+
+        let disk_full = anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::StorageFull,
+        ))
+        .context("write chunk");
+        assert!(is_transient(&disk_full));
+
+        let real = anyhow::anyhow!("encoder exited with status 1");
+        assert!(!is_transient(&real.context("encode chunk 3")));
+    }
+
+    #[test]
+    fn the_retry_log_leaves_the_transient_marker_out() {
+        let config = anyhow::anyhow!("unknown field `corp`").context("parse encode.toml").context(Transient);
+        assert_eq!(reason(&config), "parse encode.toml: unknown field `corp`");
+        let copy = anyhow::Error::new(Transient).context("file is empty or missing");
+        assert_eq!(reason(&copy), "file is empty or missing");
     }
 
     #[test]
@@ -1952,8 +2057,6 @@ mod failure_class_tests {
 mod output_param_tests {
     use super::*;
 
-    const POLL: std::time::Duration = std::time::Duration::from_secs(60);
-
     fn packets(json: &str) -> Vec<Pkt> {
         serde_json::from_str::<Packets>(json).unwrap().packets
     }
@@ -2035,21 +2138,15 @@ mod output_param_tests {
     #[test]
     fn aspect_and_rotation_become_mkvmerge_options() {
         let anamorphic = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "64:45"}]}"#);
-        assert_eq!(anamorphic.display_args(720, 576), ["--display-dimensions", "0:1024x576"]);
-        assert_eq!(anamorphic.display_args(360, 288), ["--display-dimensions", "0:512x288"]);
+        assert_eq!(anamorphic.display_args(720, 576, 0), ["--display-dimensions", "0:1024x576"]);
+        assert_eq!(anamorphic.display_args(360, 288, 0), ["--display-dimensions", "0:512x288"]);
 
         let square = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "1:1"}]}"#);
-        assert!(square.display_args(1920, 1080).is_empty());
+        assert!(square.display_args(1920, 1080, 0).is_empty());
         let unknown = source_video(r#"{"streams": [{"avg_frame_rate": "25/1", "sample_aspect_ratio": "0:1"}]}"#);
-        assert!(unknown.display_args(1920, 1080).is_empty());
+        assert!(unknown.display_args(1920, 1080, 0).is_empty());
 
-        let rotated = |r: &str| source_video(&format!(
-            r#"{{"streams": [{{"avg_frame_rate": "30/1", "side_data_list": [{{"rotation": {r}}}]}}]}}"#
-        )).rotation;
-        assert_eq!([rotated("90"), rotated("-90"), rotated("270"), rotated("180"), rotated("-180"), rotated("0")],
-                   [90, -90, -90, 180, 180, 0]);
-        assert_eq!(source_video(r#"{"streams": [{"avg_frame_rate": "30/1", "side_data_list": [{"rotation": 90}]}]}"#)
-            .display_args(640, 360), ["--projection-pose-roll", "0:90"]);
+        assert_eq!(square.display_args(640, 360, -90), ["--projection-pose-roll", "0:-90"]);
     }
 
     #[test]
@@ -2059,8 +2156,34 @@ mod output_param_tests {
         assert_eq!(cropped.visible(640, 296), Crop { w: 638, h: 276, x: 0, y: 8 });
         assert_eq!(cropped.visible(10, 10), Crop { w: 10, h: 10, x: 0, y: 0 });
 
+        let odd = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "side_data_list": [
+            {"side_data_type": "Frame Cropping", "crop_top": 7, "crop_bottom": 76, "crop_left": 3, "crop_right": 0}]}]}"#);
+        assert_eq!(odd.visible(640, 360), Crop { w: 636, h: 276, x: 4, y: 8 });
+
         let plain = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "side_data_list": [{"rotation": 90}]}]}"#);
         assert_eq!(plain.visible(640, 360), Crop { w: 640, h: 360, x: 0, y: 0 });
+        assert_eq!(plain.visible(321, 181), Crop { w: 321, h: 181, x: 0, y: 0 });
+
+        let sliver = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "side_data_list": [
+            {"side_data_type": "Frame Cropping", "crop_top": 0, "crop_bottom": 0, "crop_left": 3, "crop_right": 6}]}]}"#);
+        assert_eq!(sliver.visible(10, 10), Crop { w: 10, h: 10, x: 0, y: 0 });
+    }
+
+    #[test]
+    fn an_untagged_hd_source_brought_below_651_lines_is_tagged_as_bt709() {
+        let all = ["--color-primaries", "1", "--transfer-characteristics", "1", "--matrix-coefficients", "1"];
+        assert_eq!(untagged_hd_colors(&[], false, 720, 536), all);
+        assert_eq!(untagged_hd_colors(&[], false, 1080, 480), all);
+        assert!(untagged_hd_colors(&[], false, 1080, 800).is_empty());
+        assert!(untagged_hd_colors(&[], false, 576, 432).is_empty());
+        assert_eq!(untagged_hd_colors(&[], false, 651, 650), all);
+        assert!(untagged_hd_colors(&[], false, 650, 480).is_empty());
+        assert!(untagged_hd_colors(&[], false, 1080, 651).is_empty());
+        assert!(untagged_hd_colors(&[], true, 1080, 480).is_empty());
+        let matrix = ["--matrix-coefficients".to_string(), "5".to_string()];
+        assert!(untagged_hd_colors(&matrix, false, 1080, 480).is_empty());
+        let primaries = ["--color-primaries".to_string(), "9".to_string()];
+        assert_eq!(untagged_hd_colors(&primaries, false, 1080, 480), all[2..]);
     }
 
     #[test]
@@ -2150,6 +2273,33 @@ mod output_param_tests {
     }
 
     #[test]
+    fn only_timestamps_that_drift_from_the_frame_rate_are_kept() {
+        // 23.976 fps in a millisecond timebase: rounding, not a variable rate.
+        let cfr: Vec<f64> = (0..10_000).map(|i| (i as f64 * 1001.0 / 24.0).round() + 80.0).collect();
+        assert_eq!(vfr_timestamps(&cfr, 24000, 1001, "t"), None);
+
+        let vfr: Vec<f64> = (0..30).map(|i| i as f64 * 1000.0 / 30.0)
+            .chain((0..60).map(|i| 1000.0 + i as f64 * 1000.0 / 60.0))
+            .map(|t| t + 500.0)
+            .collect();
+        let kept = vfr_timestamps(&vfr, 45, 1, "t").expect("variable rate not detected");
+        assert_eq!(kept[0], 0.0);
+        assert!((kept[30] - 1000.0).abs() < 1e-9);
+
+        let mut backwards = vfr.clone();
+        backwards.swap(40, 41);
+        assert_eq!(vfr_timestamps(&backwards, 45, 1, "t"), None);
+        assert_eq!(vfr_timestamps(&[], 24, 1, "t"), None);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    const POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
+    #[test]
     fn archiving_never_overwrites_an_earlier_source() {
         let dir = tempfile::TempDir::new().unwrap();
         let first = dir.path().join("Episode 01.mkv");
@@ -2164,6 +2314,21 @@ mod output_param_tests {
         assert_eq!(free_path(&first).unwrap(), dir.path().join("Episode 01.3.mkv"));
 
         assert_eq!(std::fs::read(&first).unwrap(), b"season 1");
+    }
+
+    #[test]
+    fn archiving_a_source_with_the_longest_name_finds_a_free_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = dir.path().join(format!("{}.mkv", "ä".repeat(125)));
+        std::fs::write(&first, b"first").unwrap();
+
+        let second = free_path(&first).unwrap();
+        assert!(second.file_name().unwrap().len() <= 255);
+        assert!(second.to_string_lossy().ends_with(".2.mkv"));
+        std::fs::write(&second, b"second").unwrap();
+
+        let part = crate::scanner::fit_name(&first.file_name().unwrap().to_string_lossy(), ".part");
+        assert!(part.len() <= 255 && part.ends_with(".part"));
     }
 
     #[test]
@@ -2224,28 +2389,7 @@ mod output_param_tests {
     }
 
     #[test]
-    fn only_timestamps_that_drift_from_the_frame_rate_are_kept() {
-        // 23.976 fps in a millisecond timebase: rounding, not a variable rate.
-        let cfr: Vec<f64> = (0..10_000).map(|i| (i as f64 * 1001.0 / 24.0).round() + 80.0).collect();
-        assert_eq!(vfr_timestamps(&cfr, 24000, 1001, "t"), None);
-
-        let vfr: Vec<f64> = (0..30).map(|i| i as f64 * 1000.0 / 30.0)
-            .chain((0..60).map(|i| 1000.0 + i as f64 * 1000.0 / 60.0))
-            .map(|t| t + 500.0)
-            .collect();
-        let kept = vfr_timestamps(&vfr, 45, 1, "t").expect("variable rate not detected");
-        assert_eq!(kept[0], 0.0);
-        assert!((kept[30] - 1000.0).abs() < 1e-9);
-
-        let mut backwards = vfr.clone();
-        backwards.swap(40, 41);
-        assert_eq!(vfr_timestamps(&backwards, 45, 1, "t"), None);
-        assert_eq!(vfr_timestamps(&[], 24, 1, "t"), None);
-    }
-
-    #[test]
     fn a_source_that_disappears_mid_wait_is_transient() {
-        // The file is fine; a marker would lock it out for good once it came back.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("film.mkv");
         std::fs::write(&path, b"data").unwrap();
@@ -2276,7 +2420,6 @@ mod output_param_tests {
         };
         let marker = TempDir::for_video(&job.output_dir(&ctx.output_dir), "film").failed_path;
 
-        // A stop mid-job is no verdict on the file.
         let err = anyhow::anyhow!("encoder exited with status 1");
         handle_failure(&job, &ctx, "film", &err, true, None);
         assert!(!marker.exists(), "a shutdown wrote a failure marker");
@@ -2287,6 +2430,27 @@ mod output_param_tests {
         handle_failure(&job, &ctx, "film", &err, false, None);
         assert!(marker.exists(), "a real failure wrote no marker");
         assert!(std::fs::read_to_string(&marker).unwrap().contains("status 1"));
+    }
+
+    #[test]
+    fn a_failure_whose_marker_cannot_be_written_waits_like_a_transient_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let show = dir.path().join("input").join("p").join("Show");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("film.mkv"), b"data").unwrap();
+        std::fs::create_dir_all(dir.path().join("output")).unwrap();
+        std::fs::write(dir.path().join("output").join("Show"), b"a file where the folder belongs").unwrap();
+
+        let ctx = JobContext { input_dir: dir.path().join("input"), output_dir: dir.path().join("output"), poll: POLL };
+        let job = Job {
+            encode_toml: dir.path().join("input").join("p").join("encode.toml"),
+            source_file: show.join("film.mkv"),
+            rel_dir: PathBuf::from("Show"),
+            delivered: false,
+        };
+        handle_failure(&job, &ctx, "film", &anyhow::anyhow!("no video track found"), false, None);
+        assert!(!RETRIES.due(&job), "the job runs again on the very next scan");
+        assert!(RETRIES.due_at(&job, Instant::now() + POLL));
     }
 
     #[test]
@@ -2337,20 +2501,5 @@ mod output_param_tests {
         handle_failure(&job, &ctx, "film", &anyhow::anyhow!("the index does not match the source file"), false, None);
         assert!(!temp.failed_path.exists(), "the replacement was locked out");
         assert_eq!(temp.recorded_id(), claimed);
-    }
-
-    #[test]
-    fn a_timeout_and_a_full_disk_are_transient_but_an_encoder_failure_is_not() {
-        let timeout = anyhow::Error::new(Transient).context("ffprobe did not finish within 120s");
-        assert!(is_transient(&timeout.context("HDR detection")));
-
-        let disk_full = anyhow::Error::new(std::io::Error::from(
-            std::io::ErrorKind::StorageFull,
-        ))
-        .context("write chunk");
-        assert!(is_transient(&disk_full));
-
-        let real = anyhow::anyhow!("encoder exited with status 1");
-        assert!(!is_transient(&real.context("encode chunk 3")));
     }
 }

@@ -1,5 +1,4 @@
 #!/bin/sh
-# avet integration test suite - single entry point.
 
 set -u
 

@@ -165,7 +165,7 @@ language_whitelist = ["fra"]
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist no match: no output"
 assert_audio_track_count "$O/test.mkv" 0
-assert_log_contains      "audio omitted"
+assert_log_contains      "matched none of the audio tracks (eng) - the output has no audio"
 
 # untagged audio track: no language tag, always kept by whitelist
 I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p" "$O"
@@ -430,6 +430,16 @@ assert_log_contains   "changes its channel layout midway"
 assert_audio_channels "$O/test.mkv" 0 6
 ffmpeg -v error -ss 4 -i "$O/test.mkv" -map 0:a:0 -c copy "$WORKDIR/25/film.mka"
 assert_channel_frequencies "$WORKDIR/25/film.mka" 0 "300 500 700 90 1100 1300"
+
+# a track ffmpeg tagged with a two-letter language is filtered by the ISO 639-2 code mkvmerge reads
+I="$WORKDIR/27/in"; O="$WORKDIR/27/out"; mkdir -p "$I/p" "$O"
+ffmpeg -y -hide_banner -loglevel error -i "$FIXTURES_DIR/sdr_multiaudio.mkv" -map 0 -c copy \
+    -metadata:s:a:0 language=en -metadata:s:a:1 language=de -metadata:s:a:2 language=fr "$I/p/test.mkv" \
+    || fail "could not build the two-letter fixture"
+printf '[avet]\nvideo = "copy"\n[audio]\nlanguage_whitelist = ["deu"]\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "two-letter language: no output"
+assert_audio_track_count "$O/test.mkv" 1
+assert_audio_codec       "$O/test.mkv" 0 ac3
 
 # a TS descriptor whose first code mkvmerge does not know leaves the track untagged
 I="$WORKDIR/26/in"; O="$WORKDIR/26/out"; mkdir -p "$I/p" "$O"

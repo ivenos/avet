@@ -69,6 +69,29 @@ for mode in encode copy; do
     done
 done
 
+# a broadcast track that starts after the part ffmpeg probes is kept
+for mode in encode copy; do
+    run "late_$mode" audio_late.ts "[avet]\nvideo = \"$mode\"\n"
+    assert_log_not_contains "has no sample rate or channel count"
+    assert_audio_track_count "$O/test.mkv" 2
+    assert_packets_identical "$O/test.mkv" a:0 "$SRC" a:0
+    # Without a larger probe, ffmpeg cannot copy the late track out of the source.
+    assert_packets_identical "$O/test.mkv" a:1 "$FIXTURES_DIR/audio_late.ac3" a:0
+    for i in 0 1; do
+        assert_stream_times_match "$O/test.mkv" "a:$i" "$SRC" "a:$i"
+    done
+done
+for mode in encode copy; do
+    run "late_first_$mode" audio_late_first.ts "[avet]\nvideo = \"$mode\"\n"
+    assert_audio_track_count "$O/test.mkv" 2
+    for i in 0 1; do
+        assert_stream_times_match "$O/test.mkv" "a:$i" "$SRC" "a:$i"
+    done
+done
+run late_opus audio_late.ts "$OPUS"
+assert_audio_codec "$O/test.mkv" 1 opus
+assert_audio_language "$O/test.mkv" 1 eng
+
 # MP4: AAC and MP3 lose their priming, which Matroska cannot mark, and stay in sync
 run mp4 audio_codecs.mp4
 i=0

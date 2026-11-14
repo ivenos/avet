@@ -49,8 +49,7 @@ jobs:
             || { echo "::error::RUST_VERSION is '$image' in the Dockerfile and '$RUST_VERSION' in this workflow"; ok=0; }
           [ "$ok" = 1 ]
 
-      # The version the image builds with, not `stable`: a newly stabilized API would
-      # pass here and fail 25 minutes later inside the image build.
+      # The version the image builds with, not `stable`, which accepts newer APIs.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
@@ -127,7 +126,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      # The same value as in the build job, so that job reuses this one's layers.
+      # The build job's layer cache keys on this value.
       - name: Resolve version
         env:
           TAG: ${{ inputs.tag }}
@@ -138,8 +137,7 @@ jobs:
           esac
           echo "AVET_VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      # Not test/run.sh's own build: without the layer cache, SVT-AV1, FFMS2 and Vship
-      # eat the timeout before the first test runs.
+      # Not test/run.sh's own build, which has no layer cache.
       - name: Build test image
         uses: docker/build-push-action@v7
         with:
@@ -370,18 +368,18 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
             type=semver,pattern={{major}},value=${{ inputs.tag }}
 
+      - name: Write the Docker Hub description
+        if: inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+        run: sh .github/scripts/dockerhub-description.sh "$GITHUB_REPOSITORY" "$TAG" > "$RUNNER_TEMP/dockerhub.md"
+
       - name: Create and push multi-arch manifest to GHCR
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map(select(startswith("ghcr.io"))) | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.GITHUB_IMAGE }}@sha256:%s ' *)
-
-      - name: Prepare Docker Hub README
-        if: inputs.tag != ''
-        run: |
-          printf '**Note:** This description is automatically generated from the [GitHub repository README](https://github.com/ivenos/avet).\n\n---\n\n' \
-            | cat - README.md > /tmp/dockerhub-readme.md
 
       - name: Create and push multi-arch manifest to Docker Hub
         working-directory: /tmp/digests
@@ -397,4 +395,4 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ env.DOCKERHUB_IMAGE }}
-          readme-filepath: /tmp/dockerhub-readme.md
+          readme-filepath: ${{ runner.temp }}/dockerhub.md

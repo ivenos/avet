@@ -281,26 +281,30 @@ struct FfprobeDispOutput {
 }
 
 /// `stream_disposition`, not `stream=disposition`: ffprobe prints an empty object for that one.
-fn probe_dispositions(path: &Path, stream_spec: &str) -> Vec<FfprobeDispStream> {
+fn probe_dispositions(path: &Path, stream_spec: &str) -> Result<Vec<FfprobeDispStream>> {
     match crate::ext::ffprobe_json::<FfprobeDispOutput>(
         &["-v", "error", "-select_streams", stream_spec,
           "-show_entries", "stream_disposition", "-of", "json"],
         path,
     ) {
-        Ok(p) => p.streams,
+        Ok(p) => Ok(p.streams),
+        Err(e) if crate::job::is_transient(&e) => Err(e.context("probe the track flags")),
         Err(e) => {
             tracing::warn!("ffprobe disposition probe failed for {}: {e:#}", path.display());
-            vec![]
+            Ok(vec![])
         }
     }
 }
 
-fn probe_audio_tracks(source_file: &Path) -> Result<Vec<AudioTrack>> {
+/// By default ffmpeg reads 5 MB and 5 s of a file, 7 s of an MPEG-TS, to find each stream's parameters.
+const LATE_TRACKS: &[&str] = &["-analyzeduration", "60M", "-probesize", "200M"];
+
+fn probe_audio_tracks(source_file: &Path, probe: &[&str]) -> Result<Vec<AudioTrack>> {
     let parsed: FfprobeOutput = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", "a",
+        &[probe, &["-v", "error", "-select_streams", "a",
           "-show_entries",
           "stream=id,codec_name,profile,channels,channel_layout,sample_rate,bits_per_raw_sample,sample_fmt,initial_padding:stream_tags=language,title",
-          "-of", "json"],
+          "-of", "json"]].concat(),
         source_file,
     )?;
 
@@ -353,7 +357,7 @@ fn lenient<T>(probe: Result<T>, audio_index: usize) -> Result<Option<T>> {
 }
 
 /// The widest layout of a track that changes it midway; ffmpeg opens the encoder on the first frame.
-fn switched_layout(source_file: &Path, audio_index: usize, span: Option<(f64, f64)>) -> Result<Option<(String, u32)>> {
+fn switched_layout(source_file: &Path, audio_index: usize, span: Option<(f64, f64)>, probe: &[&str]) -> Result<Option<(String, u32)>> {
     #[derive(Deserialize)]
     struct Probe { #[serde(default)] frames: Vec<Frame> }
     #[derive(Deserialize)]
@@ -366,8 +370,8 @@ fn switched_layout(source_file: &Path, audio_index: usize, span: Option<(f64, f6
         intervals.extend((1..SAMPLES).map(|k| format!("{:.3}%+#2", start + f64::from(k) * step)));
     }
     let probe: Probe = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", &format!("a:{audio_index}"), "-read_intervals", &intervals.join(","),
-          "-show_entries", "frame=channels,channel_layout", "-of", "json"],
+        &[probe, &["-v", "error", "-select_streams", &format!("a:{audio_index}"), "-read_intervals", &intervals.join(","),
+          "-show_entries", "frame=channels,channel_layout", "-of", "json"]].concat(),
         source_file,
     )
     .with_context(|| format!("probe the channel layouts of audio track {audio_index}"))?;
@@ -396,11 +400,13 @@ fn mkvmerge_repacks(
 }
 
 /// Into a seekable sink: into a pipe the muxer cannot finish ADTS AAC's header and refuses it.
-fn copies_into_matroska(source_file: &Path, audio_index: usize) -> Result<bool> {
+fn copies_into_matroska(source_file: &Path, audio_index: usize, probe: &[&str]) -> Result<bool> {
     use std::os::unix::process::ExitStatusExt;
 
     let mut cmd = Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(probe)
+        .arg("-i")
         .arg(source_file)
         .args(["-map", &format!("0:a:{audio_index}"), "-c", "copy", "-frames:a", "1", "-f", "matroska", "/dev/null"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg copy check")?;
@@ -421,7 +427,7 @@ fn pcm_codec(track: &AudioTrack) -> &'static str {
 }
 
 /// Encoder priming or audio before an MP4 edit; a codec delay reaches Matroska by itself.
-fn preroll_packets(source_file: &Path, track: &AudioTrack) -> Result<usize> {
+fn preroll_packets(source_file: &Path, track: &AudioTrack, probe: &[&str]) -> Result<usize> {
     #[derive(Deserialize)]
     struct Probe { #[serde(default)] packets: Vec<Packet> }
     #[derive(Deserialize)]
@@ -434,9 +440,9 @@ fn preroll_packets(source_file: &Path, track: &AudioTrack) -> Result<usize> {
     struct SideData { skip_samples: Option<u64> }
 
     let probe: Probe = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", &format!("a:{}", track.audio_index),
+        &[probe, &["-v", "error", "-select_streams", &format!("a:{}", track.audio_index),
           "-read_intervals", "%+30",
-          "-show_entries", "packet=duration_time:packet_side_data=skip_samples", "-of", "json"],
+          "-show_entries", "packet=duration_time:packet_side_data=skip_samples", "-of", "json"]].concat(),
         source_file,
     )?;
     let Some(skip) = probe.packets.first().and_then(|p| p.side_data_list.iter().find_map(|s| s.skip_samples)) else {
@@ -594,6 +600,7 @@ struct PlannedTrack {
 
 pub struct AudioPlan {
     tracks: Vec<PlannedTrack>,
+    probe: &'static [&'static str],
 }
 
 /// A rule keyed by a name ffprobe never reports, such as `ac-3`, leaves its tracks on the default.
@@ -605,15 +612,23 @@ fn warn_about_unknown_codec_rules(config: &AudioConfig, decodable: Option<&HashS
 }
 
 pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
-    let tracks = probe_audio_tracks(source_file).context("probe audio tracks")?;
+    let mut tracks = probe_audio_tracks(source_file, &[]).context("probe audio tracks")?;
     if tracks.is_empty() {
-        return Ok(AudioPlan { tracks: vec![] });
+        return Ok(AudioPlan { tracks: vec![], probe: &[] });
     }
 
-    // An MPEG-TS can announce a stream it never carries.
+    // An MPEG-TS can announce a stream it never carries, or start one late.
+    let described = |t: &&AudioTrack| t.sample_rate > 0 && t.channels.unwrap_or(0) > 0;
+    let mut probe: &'static [&'static str] = &[];
+    if !tracks.iter().all(|t| described(&t)) {
+        let deeper = probe_audio_tracks(source_file, LATE_TRACKS).context("probe audio tracks that start late")?;
+        if deeper.len() == tracks.len() && deeper.iter().filter(described).count() > tracks.iter().filter(described).count() {
+            (tracks, probe) = (deeper, LATE_TRACKS);
+        }
+    }
     let (tracks, empty): (Vec<AudioTrack>, Vec<AudioTrack>) = tracks
         .into_iter()
-        .partition(|t| t.sample_rate > 0 && t.channels.unwrap_or(0) > 0);
+        .partition(|t| described(&t));
     for t in empty {
         tracing::warn!(
             "audio track {} ({}) has no sample rate or channel count - skipped",
@@ -622,19 +637,25 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
     }
 
     let carried = tracks.len();
-    let kept: Vec<AudioTrack> = tracks
-        .into_iter()
-        .filter(|t| crate::config::language_selected(&config.language_whitelist, t.language.as_deref()))
-        .collect();
+    let languages: Vec<&str> = tracks.iter().map(|t| t.language.as_deref().unwrap_or("und")).collect();
+    let languages = languages.join(", ");
+    let mut read = None;
+    let mut kept = Vec::with_capacity(carried);
+    for t in tracks {
+        let legacy = || Ok(Languages::cached(&mut read, source_file)?.legacy_audio(t.audio_index));
+        if language_selected(&config.language_whitelist, t.language.as_deref(), legacy)? {
+            kept.push(t);
+        }
+    }
 
     if kept.is_empty() {
         if carried > 0 {
             tracing::warn!(
-                "no audio tracks match language whitelist {:?} - audio omitted",
-                config.language_whitelist
+                "[{}] the language whitelist {:?} matched none of the audio tracks ({languages}) - the output has no audio",
+                source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("video"), config.language_whitelist
             );
         }
-        return Ok(AudioPlan { tracks: vec![] });
+        return Ok(AudioPlan { tracks: vec![], probe: &[] });
     }
 
     let codecs = audio_codecs();
@@ -649,11 +670,11 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
         let action = if r.mode == AudioMode::Copy || !decodable {
             if let Some(id) = mkvmerge_repacks(source_file, &track, &mut identified)? {
                 Action::FromSource { id }
-            } else if copies_into_matroska(source_file, track.audio_index)? {
+            } else if copies_into_matroska(source_file, track.audio_index, probe)? {
                 if r.mode == AudioMode::Encode {
                     tracing::warn!("audio track {} ({}): ffmpeg cannot decode it - copied instead", track.audio_index, track.codec_name);
                 }
-                let preroll = preroll_packets(source_file, &track)
+                let preroll = preroll_packets(source_file, &track, probe)
                     .with_context(|| format!("probe the priming of audio track {}", track.audio_index))?;
                 Action::Copy { preroll }
             } else if decodable {
@@ -675,7 +696,7 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
             if span.is_none() {
                 span = Some(lenient(source_span(source_file), track.audio_index)?.flatten());
             }
-            let switched = lenient(switched_layout(source_file, track.audio_index, span.flatten()), track.audio_index)?.flatten();
+            let switched = lenient(switched_layout(source_file, track.audio_index, span.flatten(), probe), track.audio_index)?.flatten();
             if let Some((layout, channels)) = &switched {
                 tracing::info!("audio track {}: changes its channel layout midway - encoding all of it as {layout}", track.audio_index);
                 track.channel_layout = Some(layout.clone());
@@ -727,7 +748,7 @@ pub fn plan(source_file: &Path, config: &AudioConfig) -> Result<AudioPlan> {
         });
     }
 
-    Ok(AudioPlan { tracks: planned })
+    Ok(AudioPlan { tracks: planned, probe })
 }
 
 impl AudioPlan {
@@ -750,8 +771,7 @@ impl AudioPlan {
         }
         self.tracks
             .iter()
-            .enumerate()
-            .map(|(i, t)| {
+            .map(|t| {
                 let lang = t.language.as_deref().unwrap_or("und");
                 let layout = t.channels.map_or("?", layout_name);
                 let kind = if t.lossless { "lossless" } else { "lossy" };
@@ -771,7 +791,7 @@ impl AudioPlan {
                         s
                     }
                 };
-                format!("track {i}: {lang} {} {layout} ({kind}) -> {action}", t.codec_name)
+                format!("track {}: {lang} {} {layout} ({kind}) -> {action}", t.audio_index, t.codec_name)
             })
             .collect()
     }
@@ -792,6 +812,7 @@ pub fn extract(
 
     let mut cmd = Command::new(external_bin("ffmpeg"));
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(plan.probe)
         .arg("-i")
         .arg(source_file);
 
@@ -878,7 +899,7 @@ pub fn check_encoders(source_file: &Path, plan: &AudioPlan) -> Result<()> {
         return Ok(());
     }
     let mut cmd = Command::new(external_bin("ffmpeg"));
-    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-t", "1", "-i"]).arg(source_file);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-t", "1"]).args(plan.probe).arg("-i").arg(source_file);
     for t in &tracks {
         cmd.args(["-map", &format!("0:a:{}", t.audio_index)]);
     }
@@ -888,7 +909,7 @@ pub fn check_encoders(source_file: &Path, plan: &AudioPlan) -> Result<()> {
     cmd.args(["-f", "null", "-"]);
     let out = crate::ext::output_with_timeout(&mut cmd, 300, "ffmpeg audio encoder check")?;
     if !out.status.success() {
-        return Err(crate::ext::tool_error("ffmpeg track extraction", out.status, &String::from_utf8_lossy(&out.stderr))
+        return Err(crate::ext::tool_error("ffmpeg audio encoder check", out.status, &String::from_utf8_lossy(&out.stderr))
             .context("try the audio encoders on the first second"));
     }
     Ok(())
@@ -901,6 +922,8 @@ pub struct Languages {
     video: Option<String>,
     audio: Vec<Option<String>>,
     subtitles: Vec<Option<String>>,
+    legacy_audio: Vec<Option<String>>,
+    legacy_subtitles: Vec<Option<String>>,
 }
 
 impl Languages {
@@ -951,16 +974,36 @@ impl Languages {
                     ietf: t.properties.language_ietf.as_deref(),
                 })
                 .collect();
-            matched_tags(&ours, &theirs)
+            (matched_tags(&ours, &theirs), legacy_codes(&ours, &theirs))
         };
+        let (audio, legacy_audio) = tags("audio", "audio");
+        let (subtitles, legacy_subtitles) = tags("subtitle", "subtitles");
         Ok(Self {
             video: identify.tracks.iter()
                 .find(|t| t.kind == "video")
                 .and_then(|t| t.properties.language_ietf.clone().or_else(|| t.properties.language.clone()))
                 .filter(|l| !l.is_empty() && l != "und"),
-            audio: tags("audio", "audio"),
-            subtitles: tags("subtitle", "subtitles"),
+            audio,
+            subtitles,
+            legacy_audio,
+            legacy_subtitles,
         })
+    }
+
+    pub fn cached<'a>(read: &'a mut Option<Self>, source: &Path) -> Result<&'a Self> {
+        let languages = match read.take() {
+            Some(languages) => languages,
+            None => Self::probe(source)?,
+        };
+        Ok(read.insert(languages))
+    }
+
+    pub fn legacy_audio(&self, audio_index: usize) -> Option<String> {
+        self.legacy_audio.get(audio_index).cloned().flatten()
+    }
+
+    pub fn legacy_subtitle(&self, subtitle_index: usize) -> Option<String> {
+        self.legacy_subtitles.get(subtitle_index).cloned().flatten()
     }
 
     pub fn video(&self) -> Option<&str> {
@@ -982,17 +1025,23 @@ struct Twin<'a> {
     ietf: Option<&'a str>,
 }
 
-/// Only what mkvmerge read for the same track, which `--language` cannot refuse.
-fn matched_tags(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &[Twin]) -> Vec<Option<String>> {
+fn twins<'t, 'a>(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &'t [Twin<'a>]) -> Vec<Option<&'t Twin<'a>>> {
     let same_tracks = ffprobe.len() == mkvmerge.len();
     ffprobe.iter().enumerate()
-        .map(|(i, (id, ours))| {
+        .map(|(i, (id, _))| match id.and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok()) {
+            Some(number) => mkvmerge.iter().find(|t| t.number == Some(number)),
+            None => mkvmerge.get(i).filter(|_| same_tracks),
+        })
+        .collect()
+}
+
+/// Only what mkvmerge read for the same track, which `--language` cannot refuse.
+fn matched_tags(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &[Twin]) -> Vec<Option<String>> {
+    ffprobe.iter().zip(twins(ffprobe, mkvmerge))
+        .map(|((_, ours), twin)| {
             let ours = (*ours)?;
             let first = ours.split(',').next()?.trim();
-            let twin = match id.and_then(|id| u64::from_str_radix(id.trim_start_matches("0x"), 16).ok()) {
-                Some(number) => mkvmerge.iter().find(|t| t.number == Some(number)),
-                None => mkvmerge.get(i).filter(|_| same_tracks),
-            }?;
+            let twin = twin?;
             let legacy = twin.legacy?;
             if first != ours {
                 return Some(twin.ietf.unwrap_or(legacy).to_owned());
@@ -1002,10 +1051,27 @@ fn matched_tags(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &[Twin]) -> 
         .collect()
 }
 
+fn legacy_codes(ffprobe: &[(Option<&str>, Option<&str>)], mkvmerge: &[Twin]) -> Vec<Option<String>> {
+    twins(ffprobe, mkvmerge).into_iter().map(|t| t.and_then(|t| t.legacy).map(str::to_owned)).collect()
+}
+
+/// ffmpeg keeps Matroska's two-letter `en` as written, which mkvmerge reads as `eng`.
+pub fn language_selected(
+    whitelist: &[String],
+    tag: Option<&str>,
+    legacy: impl FnOnce() -> Result<Option<String>>,
+) -> Result<bool> {
+    if crate::config::language_selected(whitelist, tag) {
+        return Ok(true);
+    }
+    Ok(legacy()?.is_some_and(|code| whitelist.iter().any(|w| crate::config::language_matches(w, &code))))
+}
+
 pub fn has_chapters(path: &Path) -> Result<bool> {
     #[derive(Deserialize)]
     struct Chapters { #[serde(default)] chapters: Vec<serde_json::Value> }
-    let probe: Chapters = crate::ext::ffprobe_json(&["-v", "error", "-show_chapters", "-of", "json"], path)?;
+    let probe: Chapters = crate::ext::ffprobe_json(&["-v", "error", "-show_chapters", "-of", "json"], path)
+        .with_context(|| format!("probe the chapters of {}", path.display()))?;
     Ok(!probe.chapters.is_empty())
 }
 
@@ -1026,7 +1092,7 @@ pub fn mux_final(
 
     // video.ivf has none; in copy mode the source has its own and track 0 may be audio.
     let encoded = video_path.extension().is_some_and(|e| e == "ivf");
-    let source_video = if encoded { probe_dispositions(source_file, "v:0") } else { Vec::new() };
+    let source_video = if encoded { probe_dispositions(source_file, "v:0")? } else { Vec::new() };
 
     let mut cmd = crate::ext::mkvmerge();
     cmd.arg("-o").arg(output_path);
@@ -1048,9 +1114,9 @@ pub fn mux_final(
 
     if let Some(v) = source_video.first() {
         cmd.args(v.disposition.to_mkvmerge_flags(0));
-        if let Some(lang) = video_language {
-            cmd.args(["--language".to_string(), format!("0:{lang}")]);
-        }
+    }
+    if let Some(lang) = video_language {
+        cmd.args(["--language".to_string(), format!("0:{lang}")]);
     }
     // In copy mode the video comes from the source, whose attachments follow once more below.
     cmd.args(["--no-audio", "--no-subtitles", "--no-chapters", "--no-attachments",
@@ -1081,7 +1147,7 @@ pub fn mux_final(
     cmd.args(sources.source_args());
     // mkvmerge flags a track default where the container has no such flag, as in MPEG-TS.
     for (tracks, spec) in [(&sources.source_audio, "a"), (&sources.source_subtitles, "s")] {
-        let dispositions = if tracks.is_empty() { Vec::new() } else { probe_dispositions(source_file, spec) };
+        let dispositions = if tracks.is_empty() { Vec::new() } else { probe_dispositions(source_file, spec)? };
         for (index, id) in tracks {
             if let Some(stream) = dispositions.get(*index) {
                 cmd.args(stream.disposition.to_mkvmerge_flags(*id as usize));
@@ -1118,6 +1184,7 @@ pub struct Sources {
     pub source_audio: Vec<(usize, u64)>,
     pub extracted_subtitles: Vec<usize>,
     pub source_subtitles: Vec<(usize, u64)>,
+    probe: &'static [&'static str],
 }
 
 impl Sources {
@@ -1127,6 +1194,7 @@ impl Sources {
             source_audio: plan.source_tracks(),
             extracted_subtitles: subtitles.extract.iter().map(|(i, _)| *i).collect(),
             source_subtitles: subtitles.from_source.clone(),
+            probe: plan.probe,
         }
     }
 
@@ -1169,18 +1237,18 @@ fn extraction_shift_ms(source: &Path, tracks_path: &Path, sources: &Sources) -> 
         (None, Some(i)) => format!("s:{i}"),
         (None, None) => return Ok(0),
     };
-    let probe = |path: &Path, spec: &str| -> Result<Probe> {
+    let probe = |path: &Path, spec: &str, probe: &[&str]| -> Result<Probe> {
         crate::ext::ffprobe_json(
-            &["-v", "error", "-select_streams", spec, "-show_entries", "stream=start_time:format=format_name,start_time", "-of", "json"],
+            &[probe, &["-v", "error", "-select_streams", spec, "-show_entries", "stream=start_time:format=format_name,start_time", "-of", "json"]].concat(),
             path,
         )
         .context("probe the start of the extracted tracks")
     };
-    let source_probe = probe(source, &spec)?;
+    let source_probe = probe(source, &spec, sources.probe)?;
     if source_probe.format.format_name != "mpegts" {
         return Ok(0);
     }
-    let extracted = probe(tracks_path, "0")?;
+    let extracted = probe(tracks_path, "0", sources.probe)?;
     let secs = |s: Option<&String>| s.and_then(|v| v.parse::<f64>().ok());
     let (Some(first), Some(container), Some(kept)) = (
         secs(source_probe.streams.first().and_then(|s| s.start_time.as_ref())),
@@ -1206,7 +1274,8 @@ fn wrapped_ts_shift_ms(source: &Path, sources: &Sources, scratch: &Path) -> Resu
     let probe: Probe = crate::ext::ffprobe_json(
         &["-v", "error", "-show_entries", "format=format_name,start_time,duration", "-of", "json"],
         source,
-    )?;
+    )
+    .context("probe the start and duration of the source")?;
     let secs = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok());
     let (Some(start), Some(duration)) = (secs(probe.format.start_time.as_deref()), secs(probe.format.duration.as_deref())) else {
         return Ok(0);
@@ -1229,7 +1298,8 @@ fn wrapped_ts_shift_ms(source: &Path, sources: &Sources, scratch: &Path) -> Resu
     let packets: Result<Packets> = crate::ext::ffprobe_json(
         &["-v", "error", "-read_intervals", "%+#8", "-show_entries", "packet=pts_time", "-of", "json"],
         &taken,
-    );
+    )
+    .context("probe the first packets mkvmerge takes from the source");
     let _ = std::fs::remove_file(&taken);
     let first = packets?.packets.iter().filter_map(|p| secs(p.pts_time.as_deref())).reduce(f64::min);
     Ok(absolute_time_shift_ms(first, start, duration))
@@ -1266,11 +1336,11 @@ mod tests {
     fn tracks_mkvmerge_takes_from_the_source_keep_their_place() {
         let sources = Sources {
             extracted_audio: vec![0, 2], source_audio: vec![(1, 5)],
-            extracted_subtitles: vec![0, 2], source_subtitles: vec![(1, 7)],
+            extracted_subtitles: vec![0, 2], source_subtitles: vec![(1, 7)], probe: &[],
         };
         assert_eq!(track_order(&[0], &sources, 2), [(0, 0), (1, 0), (2, 5), (1, 1), (1, 2), (2, 7), (1, 3)]);
 
-        let only_source = Sources { extracted_audio: vec![], source_audio: vec![(0, 1)], extracted_subtitles: vec![], source_subtitles: vec![] };
+        let only_source = Sources { extracted_audio: vec![], source_audio: vec![(0, 1)], extracted_subtitles: vec![], source_subtitles: vec![], probe: &[] };
         assert_eq!(track_order(&[3, 4], &only_source, 1), [(0, 3), (0, 4), (1, 1)]);
     }
 
@@ -1311,6 +1381,45 @@ mod tests {
         assert_eq!(matched_tags(&ours, &unknown_first), tags(&["", "fre"]));
         let ours = [(Some("0x100"), Some("eng")), (Some("0x101"), Some("zzz,eng")), (Some("0x109"), Some("zzz,eng"))];
         assert_eq!(matched_tags(&ours, &unknown_first), tags(&["", "", ""]));
+    }
+
+    #[test]
+    fn a_track_ffprobe_reads_as_en_is_selected_by_what_mkvmerge_read() {
+        let eng = vec!["eng".to_string()];
+        let read = |code: Option<&str>| { let code = code.map(str::to_owned); move || Ok(code) };
+        assert!(language_selected(&eng, Some("en"), read(Some("eng"))).unwrap());
+        assert!(!language_selected(&eng, Some("en"), read(None)).unwrap());
+        assert!(!language_selected(&eng, Some("de"), read(Some("ger"))).unwrap());
+        assert!(language_selected(&["deu".to_string()], Some("de"), read(Some("ger"))).unwrap());
+        assert!(language_selected(&eng, Some("eng"), || -> Result<Option<String>> { panic!("mkvmerge run for a tag ffprobe matched") }).unwrap());
+        assert!(language_selected(&eng, None, || -> Result<Option<String>> { panic!("mkvmerge run for an untagged track") }).unwrap());
+    }
+
+    #[test]
+    fn the_legacy_code_mkvmerge_read_belongs_to_the_same_track() {
+        let twin = |number, legacy| Twin { number, legacy, ietf: None };
+        let codes = |t: &[&str]| t.iter().map(|t| (!t.is_empty()).then(|| t.to_string())).collect::<Vec<_>>();
+
+        let mkv = [twin(None, Some("eng")), twin(None, Some("ger"))];
+        assert_eq!(legacy_codes(&[(None, Some("en")), (None, Some("de"))], &mkv), codes(&["eng", "ger"]));
+        assert_eq!(legacy_codes(&[(None, Some("en"))], &mkv), codes(&[""]));
+
+        let ts = [twin(Some(0x101), Some("ger")), twin(Some(0x102), None)];
+        assert_eq!(legacy_codes(&[(Some("0x102"), Some("en")), (Some("0x101"), Some("de")), (Some("0x103"), Some("fr"))], &ts), codes(&["", "ger", ""]));
+    }
+
+    #[test]
+    fn every_disposition_becomes_its_mkvmerge_flag() {
+        let flags = |d: FfprobeDisposition| d.to_mkvmerge_flags(3);
+        assert_eq!(flags(FfprobeDisposition::default()), ["--default-track-flag", "3:no"]);
+        assert_eq!(
+            flags(FfprobeDisposition { default: 1, forced: 1, hearing_impaired: 1, visual_impaired: 1, original: 1, comment: 1 }),
+            [
+                "--default-track-flag", "3:yes", "--forced-display-flag", "3:yes", "--hearing-impaired-flag", "3:yes",
+                "--visual-impaired-flag", "3:yes", "--original-flag", "3:yes", "--commentary-flag", "3:yes",
+            ],
+        );
+        assert_eq!(flags(FfprobeDisposition { visual_impaired: 1, ..Default::default() }), ["--default-track-flag", "3:no", "--visual-impaired-flag", "3:yes"]);
     }
 
     fn sample_set() -> HashSet<String> {

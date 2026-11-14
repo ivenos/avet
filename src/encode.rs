@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
 use crate::config::{Config, Encoder};
-use crate::ffms2::{Crop, FrameHdrMetadata, OpenOpts, PixelFormat, PixelSubsampling, VideoSource};
+use crate::ffms2::{Crop, FrameHdrMetadata, Mirror, OpenOpts, PixelFormat, PixelSubsampling, VideoSource};
 use crate::ext::external_bin;
 use crate::hdr::{DynamicHdr, Geometry};
 use crate::resume::SceneEntry;
@@ -25,6 +25,7 @@ pub struct EncodeOptions {
     /// Crop in source space, applied in the Y4M pipe before scaling.
     pub crop: Option<Crop>,
     pub deinterlace: Option<crate::interlace::FieldOrder>,
+    pub mirror: Option<Mirror>,
     pub chroma_loc: Option<&'static str>,
     /// FPS from ffprobe; FFMS2 reports 0/0 for some exotic containers (e.g. DV) which breaks IVF timestamps.
     pub fps_num: u32,
@@ -58,7 +59,9 @@ pub fn encode_chunk(
     ensure_complete(output_path, scene)?;
 
     if opts.dynamic_hdr.any() {
-        let geometry = Geometry { width: vs.info.width, height: vs.info.height, crop: opts.crop, scale: opts.scale };
+        let geometry = Geometry {
+            width: vs.info.width, height: vs.info.height, crop: opts.crop, scale: opts.scale, mirror: opts.mirror,
+        };
         if let Some(table) = &opts.hdr10plus_frames {
             let from = scene.start_frame as usize;
             for (i, frame) in hdr_metadata.iter_mut().enumerate() {
@@ -104,16 +107,20 @@ fn open_source(source_file: &Path, index_file: &Path, opts: &EncodeOptions) -> R
 }
 
 fn filter_chain(opts: &EncodeOptions, format: &PixelFormat) -> Vec<String> {
-    let subsample = format.subsampling != PixelSubsampling::Yuv420;
+    let full_chroma = opts.mirror.zip(opts.chroma_loc).filter(|(m, loc)| m.moves_chroma(loc, format.subsampling)).map(|(_, loc)| loc);
+    let subsample = full_chroma.is_some() || format.subsampling != PixelSubsampling::Yuv420;
     // Left to its default, swscale shifts left and center sited chroma alike.
     let siting = opts.chroma_loc.map_or_else(String::new, |loc| format!(":in_chroma_loc={loc}:out_chroma_loc={loc}"));
     let resample = match opts.scale {
         Some((w, h)) => Some(format!("scale={w}:{h}:flags=lanczos{siting}")),
         None => subsample.then(|| format!("scale=iw:ih{siting}")),
     };
+    let to_444 = full_chroma.map(|loc| format!("scale=iw:ih:in_chroma_loc={loc},format={}", if format.bit_depth > 8 { "yuv444p10le" } else { "yuv444p" }));
     let to_420 = subsample.then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
     [
         opts.deinterlace.map(|d| d.filter().to_string()),
+        to_444,
+        opts.mirror.map(|m| m.filter().to_string()),
         resample,
         to_420,
     ]
@@ -213,7 +220,10 @@ pub fn encode_reference(
         .stdin(Stdio::from(ff_out))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = match crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'")) {
+    let spawned = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"));
+    // Command holds its own handle on ffmpeg's stdout until dropped.
+    drop(cmd);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             crate::ext::reap(&mut ff);
@@ -380,7 +390,10 @@ fn encode_filtered(
         .stdin(Stdio::from(ff_out))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = match crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'")) {
+    let spawned = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"));
+    // Command holds its own handle on ffmpeg's stdout until dropped.
+    drop(cmd);
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             crate::ext::reap(&mut ff);
@@ -724,6 +737,35 @@ mod tests {
         std::fs::write(&path, &ivf).unwrap();
         let err = ensure_complete(&path, &scene).unwrap_err();
         assert!(err.downcast_ref::<crate::job::Transient>().is_none(), "got: {err:#}");
+    }
+
+    #[test]
+    fn a_mirror_turns_the_deinterlaced_fields_and_not_the_combed_frame() {
+        let format = PixelFormat { pix_fmt: 0, bit_depth: 8, subsampling: PixelSubsampling::Yuv422 };
+        let opts = EncodeOptions {
+            deinterlace: Some(crate::interlace::FieldOrder::Tff), mirror: Some(Mirror::Vertical), scale: Some((320, 180)),
+            ..Default::default()
+        };
+        let chain = filter_chain(&opts, &format);
+        assert_eq!(&chain[..2], ["bwdif=mode=send_frame:parity=tff:deint=all", "vflip"]);
+        assert!(chain[2].starts_with("scale=320:180"), "{chain:?}");
+        assert_eq!(filter_chain(&EncodeOptions { mirror: Some(Mirror::Horizontal), ..Default::default() },
+            &PixelFormat { subsampling: PixelSubsampling::Yuv420, ..format }), ["hflip"]);
+    }
+
+    #[test]
+    fn a_flip_that_moves_sited_chroma_runs_at_full_chroma_resolution() {
+        let yuv420 = PixelFormat { pix_fmt: 0, bit_depth: 10, subsampling: PixelSubsampling::Yuv420 };
+        let flip = |mirror, loc| filter_chain(&EncodeOptions { mirror: Some(mirror), chroma_loc: Some(loc), ..Default::default() }, &yuv420);
+        assert_eq!(flip(Mirror::Horizontal, "left"), [
+            "scale=iw:ih:in_chroma_loc=left,format=yuv444p10le", "hflip",
+            "scale=iw:ih:in_chroma_loc=left:out_chroma_loc=left", "format=yuv420p10le",
+        ]);
+        assert_eq!(flip(Mirror::Vertical, "topleft")[..2], ["scale=iw:ih:in_chroma_loc=topleft,format=yuv444p10le", "vflip"]);
+        assert_eq!(flip(Mirror::Vertical, "left"), ["vflip"]);
+        assert_eq!(flip(Mirror::Horizontal, "center"), ["hflip"]);
+        assert!(!Mirror::Vertical.moves_chroma("topleft", PixelSubsampling::Yuv422));
+        assert!(Mirror::Horizontal.moves_chroma("left", PixelSubsampling::Yuv422));
     }
 
     #[test]

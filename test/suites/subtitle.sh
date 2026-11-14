@@ -67,6 +67,16 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "iso alias: no output"
 assert_subtitle_track_count "$O/test.mkv" 1
 assert_subtitle_language    "$O/test.mkv" 0 ger
 
+# a subtitle ffmpeg tagged with a two-letter language is filtered by the ISO 639-2 code mkvmerge reads
+I="$WORKDIR/8/in"; O="$WORKDIR/8/out"; mkdir -p "$I/p" "$O"
+ffmpeg -y -hide_banner -loglevel error -i "$FIXTURES_DIR/sdr_subtitles.mkv" \
+    -map 0 -c copy -metadata:s:s:0 language=en -metadata:s:s:1 language=de "$I/p/test.mkv" \
+    || fail "could not build the two-letter fixture"
+printf '[avet]\nvideo = "copy"\n[subtitles]\nlanguage_whitelist = ["deu"]\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "two-letter language: no output"
+assert_subtitle_track_count "$O/test.mkv" 1
+assert_subtitle_language    "$O/test.mkv" 0 ger
+
 # source without subtitles + copy: 0 tracks, no error
 I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
@@ -94,6 +104,7 @@ language_whitelist = ["fra"]
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "sub whitelist no match: no output"
 assert_subtitle_track_count "$O/test.mkv" 0
+assert_log_contains         "[test] the language whitelist [\"fra\"] matched none of the subtitle tracks (eng, "
 
 # default (no [subtitles] section): all subtitle tracks preserved
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I/p" "$O"
@@ -149,5 +160,7 @@ assert_subtitle_events_match "$O/test.mkv" s:0 "$SRC" s:1
 
 run_subs ttml_ger subs_ttml.mp4 '[subtitles]\nlanguage_whitelist = ["deu"]\n'
 assert_subtitle_track_count "$O/test.mkv" 0
+assert_log_contains "cannot be stored in Matroska"
+assert_log_not_contains "matched none"
 
 test_done

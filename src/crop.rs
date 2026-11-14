@@ -37,7 +37,7 @@ pub fn detect(
         let handles: Vec<_> = windows
             .into_iter()
             .chain([None])
-            .map(|seek| s.spawn(move || run_cropdetect(source_file, seek)))
+            .map(|seek| s.spawn(move || run_cropdetect(source_file, seek, visible)))
             .collect();
         handles.into_iter().map(|h| h.join()).collect()
     });
@@ -93,7 +93,7 @@ pub fn detect(
 
     let result = detected.map(|c| Crop { x: c.x + visible.x, y: c.y + visible.y, ..c }.to_filter());
     if cacheable {
-        cache_result(cache_path, result.as_deref().unwrap_or(""));
+        cache_result(cache_path, result.as_deref().unwrap_or(""), stem);
     }
 
     match &result {
@@ -128,11 +128,11 @@ fn is_bars(c: &Crop, src_w: u32, src_h: u32) -> bool {
         && centered(c.y, src_h.saturating_sub(c.y + c.h), src_h)
 }
 
-/// The last box, which cropdetect accumulates: ten seconds from `seek_secs`, or every keyframe.
-fn run_cropdetect(source_file: &Path, seek_secs: Option<u64>) -> Result<Option<Crop>> {
+/// The last box inside `visible`, which cropdetect accumulates: ten seconds from `seek_secs`, or every keyframe.
+fn run_cropdetect(source_file: &Path, seek_secs: Option<u64>, visible: Crop) -> Result<Option<Crop>> {
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
-    // FFMS2 decodes in storage orientation; autorotate would box the displayed image.
-    cmd.arg("-noautorotate");
+    // FFMS2 decodes in storage orientation and without a container's crop.
+    cmd.args(["-noautorotate", "-apply_cropping", "codec"]);
     let timeout = match seek_secs {
         Some(seek) => {
             cmd.args(["-ss", &seek.to_string(), "-t", "10"]);
@@ -148,7 +148,7 @@ fn run_cropdetect(source_file: &Path, seek_secs: Option<u64>) -> Result<Option<C
         .args(["-map", "0:v:0"])
         // Below 1.0 ffmpeg scales the limit by the bit depth; round=16 would report
         // 640x352 for a clean 640x360 source.
-        .args(["-vf", "cropdetect=0.094:2:0", "-f", "null", "-"]);
+        .args(["-vf", &format!("{},cropdetect=0.094:2:0", visible.to_filter()), "-f", "null", "-"]);
     let what = seek_secs.map_or_else(|| "ffmpeg cropdetect on the keyframes".to_string(), |s| format!("ffmpeg cropdetect at {s}s"));
     let output = crate::ext::output_with_timeout(&mut cmd, timeout, &what)?;
 
@@ -165,9 +165,9 @@ fn run_cropdetect(source_file: &Path, seek_secs: Option<u64>) -> Result<Option<C
         .next_back())
 }
 
-fn cache_result(path: &Path, content: &str) {
+fn cache_result(path: &Path, content: &str, stem: &str) {
     if let Err(e) = crate::resume::write_atomic(path, content.as_bytes()) {
-        tracing::warn!("could not write crop cache {}: {e:#}", path.display());
+        tracing::warn!("[{stem}] could not write crop cache {}: {e:#}", path.display());
     }
 }
 
@@ -183,6 +183,7 @@ mod tests {
         assert_eq!(classify(crop(1440, 1080, 240, 0), 1920, 1080), (crop(1440, 1080, 240, 0), true));
 
         assert_eq!(classify(crop(640, 360, 100, 100), 1920, 1080), (None, false));
+        assert_eq!(classify(crop(640, 360, 640, 360), 1920, 1080), (None, false));
         assert_eq!(classify(crop(1920, 1072, 0, 4), 1920, 1080), (None, true));
         assert_eq!(classify(None, 1920, 1080), (None, true));
     }

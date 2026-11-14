@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::audio::Languages;
 use crate::config::{SubtitleConfig, SubtitleMode};
 
 const MATROSKA_SUBTITLES: &[&str] = &[
@@ -45,15 +46,18 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
     };
     let mut plan = SubtitlePlan::default();
     let mut unsupported = Vec::new();
-    let mut total = 0usize;
+    let mut languages = Vec::new();
+    let mut read = None;
     for (index, stream) in probe.streams.into_iter().enumerate() {
-        total += 1;
+        languages.push(stream.tags.language.clone().unwrap_or_else(|| "und".into()));
         let codec = stream.codec_name.unwrap_or_else(|| "unknown".into());
         match route(&codec) {
-            Route::ExtractWithFfmpeg(convert) if selected(stream.tags.language.as_deref()) => {
-                plan.extract.push((index, convert));
+            Route::ExtractWithFfmpeg(convert) => {
+                let legacy = || Ok(Languages::cached(&mut read, source)?.legacy_subtitle(index));
+                if crate::audio::language_selected(&config.language_whitelist, stream.tags.language.as_deref(), legacy)? {
+                    plan.extract.push((index, convert));
+                }
             }
-            Route::ExtractWithFfmpeg(_) => {}
             Route::FromSourceWithMkvmerge => unsupported.push((index, stream.id, codec)),
         }
     }
@@ -73,10 +77,12 @@ pub fn plan(source: &Path, config: &SubtitleConfig) -> Result<SubtitlePlan> {
         }
     }
 
-    if !config.language_whitelist.is_empty() && total > 0 && plan.extract.is_empty() && plan.from_source.is_empty() {
+    if !config.language_whitelist.is_empty() && !languages.is_empty() && plan.extract.is_empty() && plan.from_source.is_empty()
+        && !languages.iter().any(|l| selected(Some(l)))
+    {
         tracing::warn!(
-            "subtitles: the language whitelist {:?} matched none of the {total} subtitle track(s) - the output has none",
-            config.language_whitelist
+            "[{}] the language whitelist {:?} matched none of the subtitle tracks ({}) - the output has none",
+            source.file_stem().and_then(|s| s.to_str()).unwrap_or("video"), config.language_whitelist, languages.join(", ")
         );
     }
     Ok(plan)

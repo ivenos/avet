@@ -5,6 +5,19 @@ use std::path::{Path, PathBuf};
 
 use crate::resume::TempDir;
 
+pub const NAME_MAX: usize = 255;
+
+const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
+
+/// `name` cut back at its end so that it still fits NAME_MAX with `suffix` added.
+pub fn fit_name(name: &str, suffix: &str) -> String {
+    let mut end = name.len().min(NAME_MAX.saturating_sub(suffix.len()));
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &name[..end])
+}
+
 #[derive(Debug)]
 pub struct Job {
     pub encode_toml: PathBuf,
@@ -38,6 +51,9 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
     profile_dirs.sort();
 
     for profile_dir in profile_dirs {
+        if profile_dir.is_file() && is_video(&profile_dir) {
+            report(format!("skipping {}: a video goes into a folder with an encode.toml", profile_dir.display()));
+        }
         if !profile_dir.is_dir() || profile_dir.file_name() == Some(OsStr::new("processed")) {
             continue;
         }
@@ -48,12 +64,15 @@ pub fn scan(input_dir: &Path, output_dir: &Path) -> Result<Vec<Job>> {
 
         let encode_toml = profile_dir.join("encode.toml");
         if !encode_toml.exists() {
+            if holds_video(&profile_dir) {
+                report(format!("skipping {}: it holds videos but no encode.toml", profile_dir.display()));
+            }
             continue;
         }
 
         for (source_file, rel_dir) in find_video_files(&profile_dir) {
             let mut job = Job { encode_toml: encode_toml.clone(), source_file, rel_dir, delivered: false };
-            if output_exists(&job.output_dir(output_dir), &job.source_file) {
+            if output_exists(&job.output_dir(output_dir), job.stem()) {
                 job.delivered = TempDir::for_video(&job.output_dir(output_dir), job.stem()).awaits_archiving(&job.source_file);
                 if !job.delivered {
                     report(format!("[{}] skip: output exists for {}", job.stem(), job.source_file.display()));
@@ -132,9 +151,19 @@ fn find_video_files(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     files
 }
 
+fn is_video(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| EXTENSIONS.contains(&e.to_lowercase().as_str()))
+}
+
+fn holds_video(dir: &Path) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|entry| {
+        let path = entry.path();
+        let hidden = entry.file_name().to_str().is_none_or(|n| n.starts_with('.'));
+        !hidden && if entry.file_type().is_ok_and(|t| t.is_dir()) { holds_video(&path) } else { is_video(&path) }
+    })
+}
+
 fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) {
-    const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
-    const NAME_MAX: usize = 255;
 
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -166,10 +195,7 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
         if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.')) {
             continue;
         }
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase());
-        if let Some(ext) = ext
-            && EXTENSIONS.contains(&ext.as_str())
-        {
+        if is_video(&path) {
             // Skip non-UTF8 stems: they'd collide on the fallback name and break temp-dir layout.
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 report(format!("skipping file with non-UTF8 name: {}", path.display()));
@@ -189,8 +215,7 @@ fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf
 }
 
 /// avet never produces an empty output, so one is a leftover, not "already done".
-fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
-    let stem = source_file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+fn output_exists(output_dir: &Path, stem: &str) -> bool {
     let path = output_dir.join(format!("{stem}.mkv"));
     match std::fs::metadata(&path) {
         Ok(m) if m.len() > 0 => true,
@@ -204,8 +229,7 @@ fn output_exists(output_dir: &Path, source_file: &Path) -> bool {
 
 /// The marker path when this exact source is locked out under this encode.toml; a stem twin does not block.
 fn failed_marker(output_dir: &Path, job: &Job) -> Option<PathBuf> {
-    let stem = job.source_file.file_stem().and_then(|s| s.to_str())?;
-    let temp = TempDir::for_video(output_dir, stem);
+    let temp = TempDir::for_video(output_dir, job.stem());
     if !temp.failed_path.exists() || temp.failed_under_another_profile(&job.encode_toml) {
         return None;
     }
@@ -359,6 +383,20 @@ mod tests {
             fs::write(profile.join("film.mkv"), b"fake").unwrap();
         }
         assert_eq!(scan(&input, &output).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_folder_holds_videos_only_through_visible_video_files() {
+        let (_tmp, input, _output) = make_dirs();
+        let show = input.join("Show");
+        fs::create_dir_all(show.join("Season 1")).unwrap();
+        fs::write(show.join("Season 1").join("notes.txt"), b"").unwrap();
+        assert!(!holds_video(&show));
+        fs::create_dir_all(show.join(".trash")).unwrap();
+        fs::write(show.join(".trash").join("old.mkv"), b"x").unwrap();
+        assert!(!holds_video(&show));
+        fs::write(show.join("Season 1").join("Episode 01.MKV"), b"x").unwrap();
+        assert!(holds_video(&show));
     }
 
     #[test]

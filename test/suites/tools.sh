@@ -20,6 +20,22 @@ for encoder in SvtAv1EncApp SvtAv1EncApp-hdr; do
 done
 [ -s "$W/SvtAv1EncApp.ivf" ] || { fail "tools: could not build the encode"; test_done; }
 
+# ffmpeg: a reader gone is "Broken pipe", and the summaries of idet and cropdetect
+tool sh -c 'exec 3>&1; ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -i testsrc2=size=320x240:rate=24 \
+    -frames:v 100 -f yuv4mpegpipe pipe:1 2>&3 | head -c 100 >/dev/null' | grep -q 'Broken pipe' || \
+    fail "ffmpeg: no 'Broken pipe' once its reader is gone"
+tool ffmpeg -nostdin -hide_banner -i "$W/src.mkv" -map 0:v:0 -vf idet -f null - 2>&1 | \
+    grep -qE 'Multi frame detection: TFF: *[0-9]+ BFF: *[0-9]+ Progressive: *[0-9]+' || \
+    fail "ffmpeg idet: no 'Multi frame detection: TFF: <n> BFF: <n> Progressive: <n>' line"
+tool ffmpeg -nostdin -hide_banner -i "$W/src.mkv" -map 0:v:0 -vf cropdetect=0.094:2:0 -f null - 2>&1 | \
+    grep -qE ' crop=320:240:0:0$' || fail "ffmpeg cropdetect: no 'crop=W:H:X:Y' at the end of a line"
+
+# ffmpeg and mkvmerge on a full disk
+tool ffmpeg -nostdin -hide_banner -loglevel error -y -i "$W/src.mkv" -map 0:v:0 -c copy -f matroska /dev/full 2>&1 | \
+    grep -q 'No space left' || fail "ffmpeg: no 'No space left' on a full disk"
+tool mkvmerge --ui-language en_US -o /dev/full "$W/src.mkv" 2>&1 | grep -q 'No space left' || \
+    fail "mkvmerge: no 'No space left' on a full disk"
+
 # FFVship: the device list and its own verdict on a device
 gpus=$(tool FFVship --list-gpu 2>&1)
 printf '%s\n' "$gpus" | grep -qE '^GPU [0-9]+: .+' || fail "FFVship --list-gpu: no 'GPU <n>: <name>' line in: $gpus"

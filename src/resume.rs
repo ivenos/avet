@@ -26,16 +26,17 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(data)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("flush {} to disk", tmp.display()))?;
+    let written = std::fs::File::create(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))
+        .and_then(|mut f| {
+            f.write_all(data).with_context(|| format!("write {}", tmp.display()))?;
+            f.sync_all().with_context(|| format!("flush {} to disk", tmp.display()))
+        })
+        .and_then(|()| std::fs::rename(&tmp, path).with_context(|| format!("rename {} to {}", tmp.display(), path.display())));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))
+    written
 }
 
 pub(crate) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -155,6 +156,11 @@ impl CrfCache {
         }
     }
 
+    /// Solved and scored by its probes, but the finished chunk not yet measured.
+    pub fn unmeasured(&self, chunk_key: &str) -> bool {
+        matches!(self.state.lock().unwrap().get(chunk_key), Some(Solved::Scored { measured: None, .. }))
+    }
+
     pub fn insert(&self, chunk_key: &str, crf: f64, jod: f64) -> Result<()> {
         let solved = if jod.is_finite() { Solved::Scored { crf, jod, measured: None } } else { Solved::Crf(crf) };
         let mut state = self.state.lock().unwrap();
@@ -184,18 +190,11 @@ pub fn stable_hash(text: &str) -> u64 {
 
 /// `.avet_<stem>`, shortened with a hash of the stem where that passes the 255-byte name limit.
 fn temp_dir_name(stem: &str) -> String {
-    const NAME_MAX: usize = 255;
-
     let name = format!(".avet_{stem}");
-    if name.len() <= NAME_MAX {
+    if name.len() <= crate::scanner::NAME_MAX {
         return name;
     }
-    let suffix = format!("-{:016x}", stable_hash(stem));
-    let mut end = NAME_MAX - suffix.len();
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &name[..end])
+    crate::scanner::fit_name(&name, &format!("-{:016x}", stable_hash(stem)))
 }
 
 pub struct TempDir {
@@ -365,8 +364,22 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_is_done_only_with_the_frames_and_the_size_it_was_finished_with() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let chunk = dir.path().join("00001.ivf");
+        std::fs::write(&chunk, b"encoded").unwrap();
+        let done = DoneFile::load_or_create(&dir.path().join("done.json")).unwrap();
+        assert!(!done.is_done("00001", &chunk, 24));
+
+        done.mark_done("00001", 24, 7).unwrap();
+        assert!(done.is_done("00001", &chunk, 24));
+        assert!(!done.is_done("00001", &chunk, 25));
+        std::fs::write(&chunk, b"cut").unwrap();
+        assert!(!done.is_done("00001", &chunk, 24));
+    }
+
+    #[test]
     fn a_shorter_rewrite_leaves_no_tail_and_no_temp_file() {
-        // In place, the second write would leave the tail of the first behind.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("scenes.json");
 
@@ -500,9 +513,12 @@ mod tests {
         assert_eq!((reloaded.get("00002"), reloaded.jod("00002")), (Some(31.0), None));
         assert_eq!(reloaded.get("00003"), None);
 
+        assert!(reloaded.unmeasured("00001"));
+        assert!(!reloaded.unmeasured("00002") && !reloaded.unmeasured("00003"));
         reloaded.set_measured("00001", 9.47).unwrap();
         reloaded.set_measured("00002", 9.5).unwrap();
         let again = CrfCache::load_or_create(&path).unwrap();
+        assert!(!again.unmeasured("00001"));
         assert_eq!((again.get("00001"), again.jod("00001"), again.probed("00001")), (Some(28.25), Some(9.47), Some(9.512)));
         assert_eq!((again.get("00002"), again.jod("00002")), (Some(31.0), None));
     }

@@ -242,6 +242,10 @@ pub enum SolveOutcome {
     CapBinding,
     /// Floor unreachable in the CRF range; best-quality probe used.
     FloorUnreachable,
+    /// Every probe over the size cap; the smallest one used.
+    OverCap { floor_held: bool },
+    /// `max_probes` ran out with the search still open; the best probe so far used.
+    ProbesSpent,
 }
 
 pub struct SolveResult {
@@ -258,14 +262,14 @@ impl SolveResult {
     }
 }
 
-/// A chunk's encoder input as a file: FFVship resizes an encode to its source, so a scaled one is held against this.
+/// A chunk's encoder input as a file: FFVship resizes an encode to its source, so a scaled or mirrored one is held against this.
 pub struct Reference(PathBuf);
 
 impl Reference {
     pub const PREFIX: &'static str = "reference_";
 
     pub fn write(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Option<Self>> {
-        if ctx.opts.scale.is_none() {
+        if ctx.opts.scale.is_none() && ctx.opts.mirror.is_none() {
             return Ok(None);
         }
         let reference = Reference(ctx.temp_dir.join(format!("{}{}.mkv", Self::PREFIX, scene.padded_index())));
@@ -316,13 +320,18 @@ fn solve(
 
     let mut pts: Vec<Probe> = Vec::new();
     let mut crf = round_to_step(seed, lo, hi);
+    let mut spent = false;
     loop {
         let probe = probe_at(crf)?;
         pts.push(probe);
         let n = pts.len() as u32;
         let settled = n >= tq.min_probes
             && floor.holds(&probe) && probe.jod <= floor.jod + tq.tolerance && probe.size_pct <= cap;
-        if settled || n >= tq.max_probes {
+        if settled {
+            break;
+        }
+        if n >= tq.max_probes {
+            spent = next_probe(&pts, &floor, cap, lo, hi, true).is_some();
             break;
         }
         match next_probe(&pts, &floor, cap, lo, hi, n + 1 == tq.max_probes) {
@@ -330,7 +339,11 @@ fn solve(
             None => break,
         }
     }
-    Ok(decide(&pts, &floor, cap, lo))
+    let mut res = decide(&pts, &floor, cap, lo);
+    if spent && !matches!(res.outcome, SolveOutcome::Met) {
+        res.outcome = SolveOutcome::ProbesSpent;
+    }
+    Ok(res)
 }
 
 fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
@@ -381,30 +394,61 @@ fn probe_opts(ctx: &ProbeContext) -> EncodeOptions {
     let mut opts = EncodeOptions {
         dynamic_hdr: Default::default(), hdr10plus_frames: None, deinterlace: None, ..ctx.opts.clone()
     };
-    // FFVship guesses an untagged matrix from the height, the source's uncropped one included.
-    if !opts.hdr_args.iter().any(|a| a == "--matrix-coefficients") {
-        let guess = if ctx.source_height > 650 { "1" } else { "5" };
-        opts.hdr_args.extend(["--matrix-coefficients".to_string(), guess.to_string()]);
-    }
-    // It takes untagged RGB for sRGB with BT.709 primaries, and guesses both from the matrix on the encode.
-    for (flag, srgb) in [("--transfer-characteristics", "13"), ("--color-primaries", "1")] {
-        if ctx.source_rgb && !opts.hdr_args.iter().any(|a| a == flag) {
-            opts.hdr_args.extend([flag.to_string(), srgb.to_string()]);
-        }
+    for (flag, value) in source_reading_tags(&ctx.opts.hdr_args, ctx.source_height, ctx.source_rgb) {
+        opts.hdr_args.extend([flag.to_string(), value.to_string()]);
     }
     opts
 }
 
+/// The tags an encode read against the source needs on top of the source's own.
+fn source_reading_tags(hdr_args: &[String], source_height: u32, source_rgb: bool) -> Vec<(&'static str, &'static str)> {
+    let signaled = |flag: &str| hdr_args.iter().any(|a| a == flag);
+    let mut tags = Vec::new();
+    // FFVship guesses an untagged matrix from the height, the source's uncropped one included.
+    if !signaled("--matrix-coefficients") {
+        tags.push(("--matrix-coefficients", if source_height > 650 { "1" } else { "5" }));
+    }
+    // It takes untagged RGB for sRGB with BT.709 primaries, and guesses both from the matrix on the encode.
+    for (flag, srgb) in [("--transfer-characteristics", "13"), ("--color-primaries", "1")] {
+        if source_rgb && !signaled(flag) {
+            tags.push((flag, srgb));
+        }
+    }
+    tags
+}
+
+/// The same tags as ffmpeg's av1_metadata filter sets them in a finished encode.
+fn av1_metadata_filter(tags: &[(&str, &str)]) -> Option<String> {
+    let options: Vec<String> = tags
+        .iter()
+        .map(|(flag, value)| format!("{}={value}", flag.trim_start_matches("--").replace('-', "_")))
+        .collect();
+    (!options.is_empty()).then(|| format!("av1_metadata={}", options.join(":")))
+}
+
+/// FFVship would hold a deinterlaced encode against the source's combed frames, and only a reference has none.
+pub fn measurable(opts: &EncodeOptions) -> bool {
+    opts.deinterlace.is_none() || opts.scale.is_some() || opts.mirror.is_some()
+}
+
 /// The finished chunk as it will play, which the probes at another preset only estimate.
 pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path, reference: Option<&Reference>) -> Option<f64> {
-    // FFVship would hold the deinterlaced encode against the source's combed frames.
     if ctx.opts.deinterlace.is_some() && reference.is_none() {
         return None;
     }
-    match score(ctx, scene, chunk, &format!("{}_final", scene.padded_index()), reference) {
+    let tag = format!("{}_final", scene.padded_index());
+    let tagged = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
+    let _cleanup = Cleanup(vec![tagged.clone()]);
+    let measured = match reference {
+        Some(_) => score(ctx, scene, chunk, &tag, reference),
+        None => tag_as_probed(ctx, chunk, &tagged).and_then(|copied| {
+            score(ctx, scene, if copied { &tagged } else { chunk }, &tag, None)
+        }),
+    };
+    match measured {
         Ok(Score { jod, mismatch: None }) => Some(jod),
         Ok(Score { mismatch: Some(readings), .. }) => {
-            tracing::debug!("[{}] chunk {}: not measured, FFVship reads {readings}", ctx.stem, scene.padded_index());
+            tracing::warn!("[{}] chunk {}: not measured, FFVship reads {readings}", ctx.stem, scene.padded_index());
             None
         }
         Err(e) => {
@@ -412,6 +456,21 @@ pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path, refer
             None
         }
     }
+}
+
+/// A copy of `chunk` with its probes' tags in `copy`, false where they add none. The encode itself keeps its own.
+fn tag_as_probed(ctx: &ProbeContext, chunk: &Path, copy: &Path) -> Result<bool> {
+    let Some(filter) = av1_metadata_filter(&source_reading_tags(&ctx.opts.hdr_args, ctx.source_height, ctx.source_rgb)) else {
+        return Ok(false);
+    };
+    let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"]).arg(chunk)
+        .args(["-map", "0:v:0", "-c", "copy", "-bsf:v", &filter, "-f", "ivf"]).arg(copy);
+    let out = crate::ext::output_with_timeout(&mut cmd, 600, "ffmpeg av1_metadata")?;
+    if !out.status.success() {
+        return Err(crate::ext::tool_error("ffmpeg av1_metadata", out.status, &String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(true)
 }
 
 struct Score {
@@ -598,7 +657,7 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
     // Every probe over the cap: the smallest chunk is the closest thing to honoring it.
     pts.iter()
         .min_by(|a, b| a.size_pct.total_cmp(&b.size_pct))
-        .map(|&p| res(p, SolveOutcome::CapBinding))
+        .map(|&p| res(p, SolveOutcome::OverCap { floor_held: floor.holds(&p) }))
         .unwrap_or(SolveResult {
             crf: lo, jod: f64::NAN, cambi: None, size_pct: f64::NAN,
             outcome: SolveOutcome::FloorUnreachable,
@@ -1098,6 +1157,32 @@ mod tests {
     }
 
     #[test]
+    fn an_untagged_matrix_is_tagged_as_ffvship_guesses_it_from_the_source_height() {
+        let matrix = |height| source_reading_tags(&[], height, false);
+        assert_eq!(matrix(1080), [("--matrix-coefficients", "1")]);
+        assert_eq!(matrix(651), [("--matrix-coefficients", "1")]);
+        assert_eq!(matrix(650), [("--matrix-coefficients", "5")]);
+        assert_eq!(matrix(576), [("--matrix-coefficients", "5")]);
+
+        let tagged = ["--matrix-coefficients".to_string(), "9".to_string()];
+        assert!(source_reading_tags(&tagged, 2160, false).is_empty());
+        assert_eq!(
+            source_reading_tags(&tagged, 2160, true),
+            [("--transfer-characteristics", "13"), ("--color-primaries", "1")]
+        );
+    }
+
+    #[test]
+    fn the_finished_chunk_is_measured_with_the_tags_its_probes_carried() {
+        assert_eq!(av1_metadata_filter(&source_reading_tags(&[], 720, false)).as_deref(), Some("av1_metadata=matrix_coefficients=1"));
+        assert_eq!(
+            av1_metadata_filter(&source_reading_tags(&[], 480, true)).as_deref(),
+            Some("av1_metadata=matrix_coefficients=5:transfer_characteristics=13:color_primaries=1")
+        );
+        assert_eq!(av1_metadata_filter(&[]), None);
+    }
+
+    #[test]
     fn round_to_step_quarters_and_clamps() {
         assert_eq!(round_to_step(28.1, 14.0, 45.0), 28.0);
         assert_eq!(round_to_step(28.2, 14.0, 45.0), 28.25);
@@ -1113,6 +1198,16 @@ mod tests {
         assert_eq!(chunk_size_pct(200, &cum, 3, 3), 50.0);
         assert_eq!(chunk_size_pct(300, &cum, 0, 99), 0.0);
         assert_eq!(chunk_size_pct(300, &[], 0, 2), 0.0);
+    }
+
+    #[test]
+    fn a_deinterlaced_chunk_is_measurable_only_against_a_reference() {
+        let mut opts = EncodeOptions::default();
+        assert!(measurable(&opts));
+        opts.deinterlace = Some(crate::interlace::FieldOrder::Tff);
+        assert!(!measurable(&opts));
+        opts.scale = Some((320, 180));
+        assert!(measurable(&opts));
     }
 
     #[test]
@@ -1165,13 +1260,16 @@ mod tests {
     }
 
     #[test]
-    fn decide_reports_cap_binding_when_no_probe_fits() {
-        // Pre-compressed source: every probe over the cap, and none of it was "Met".
+    fn a_chunk_with_every_probe_over_the_cap_is_reported_as_over_it_not_as_missing_the_floor() {
+        // Pre-compressed source: the floor holds everywhere, the cap nowhere.
         let pts = vec![p(35.0, 9.6, 300.0), p(41.0, 9.5, 259.0)];
         let r = decide(&pts, &jod(9.5), 90.0, 14.0);
         assert_eq!(r.crf, 41.0);
         assert_eq!(r.size_pct, 259.0);
-        assert!(matches!(r.outcome, SolveOutcome::CapBinding));
+        assert!(matches!(r.outcome, SolveOutcome::OverCap { floor_held: true }));
+
+        let pts = vec![p(35.0, 9.4, 300.0), p(41.0, 9.3, 259.0)];
+        assert!(matches!(decide(&pts, &jod(9.5), 90.0, 14.0).outcome, SolveOutcome::OverCap { floor_held: false }));
     }
 
     #[test]
@@ -1387,6 +1485,19 @@ mod tests {
         check_probes(&cfg, &calls);
         assert!(matches!(res.outcome, SolveOutcome::FloorUnreachable));
         assert_eq!(res.crf, calls.iter().copied().fold(f64::MAX, f64::min));
+    }
+
+    #[test]
+    fn a_search_that_max_probes_cuts_short_says_so() {
+        let curve = |crf: f64| p(crf, 9.75 - 0.0115 * crf, 185.0 * (-0.0475 * (crf - 1.0)).exp());
+        let cfg = TargetQualityConfig { max_probes: 2, min_crf: 1, max_crf: 65, max_encoded_percent: 90.0, ..tq(9.5) };
+        let (res, calls) = run_solve(&cfg, 65.0, curve);
+        check_probes(&cfg, &calls);
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(res.outcome, SolveOutcome::ProbesSpent), "probed {calls:?}");
+
+        let (res, _) = run_solve(&TargetQualityConfig { max_probes: 7, ..cfg }, 65.0, curve);
+        assert!(matches!(res.outcome, SolveOutcome::Met));
     }
 
     #[test]
