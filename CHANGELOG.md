@@ -44,7 +44,7 @@ All notable changes to this project are documented in this file, in the format o
 ### Dependencies
 
 - signal-hook 0.4.4 -> 0.4.5 (#45)
-- SVT-AV1-HDR 18327c0 -> 4499785
+- SVT-AV1-HDR 18327c0 -> 6d661b6
 - toml 1.1.6+spec-1.1.0 -> 1.2.0
 - rust 1.99.0 -> 1.100.0
 - av-scenechange 0.24.1 -> 0.25.0
