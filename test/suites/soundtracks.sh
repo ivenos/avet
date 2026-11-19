@@ -21,9 +21,9 @@ assert_tracks_match "$O/test.mkv" "$SRC" a
 i=0
 for codec in ac3 eac3 dts truehd mp2 mp3 aac alac flac wavpack tta vorbis opus pcm_f32le; do
     assert_audio_codec "$O/test.mkv" "$i" "$codec"
-    # mkvmerge drops a TrueHD stream's last frame of 40 samples.
-    missing=0; [ "$codec" = truehd ] && missing=40
-    assert_audio_samples_identical "$O/test.mkv" "$SRC" "$i" "$i" "$missing"
+    # mkvmerge drops the padding FFmpeg marks for discarding on the last AC-3, E-AC-3 or DTS frame.
+    extra=0; case $codec in ac3|eac3) extra=1536 ;; dts) extra=512 ;; esac
+    assert_audio_samples_identical "$O/test.mkv" "$SRC" "$i" "$i" "$extra"
     assert_av_sync "$O/test.mkv" "$SRC" "$i"
     i=$((i + 1))
 done
@@ -50,8 +50,7 @@ set -- "0 0 pcm_s24le" "1 1 truehd" "2 3 dts" "3 4 ac3" "4 5 pcm_s24le" "5 6 aac
 for track; do
     set -- $track
     assert_audio_codec "$O/test.mkv" "$1" "$3"
-    missing=0; [ "$3" = truehd ] && missing=40
-    assert_audio_samples_identical "$O/test.mkv" "$SRC" "$1" "$2" "$missing"
+    assert_audio_samples_identical "$O/test.mkv" "$SRC" "$1" "$2"
     assert_av_sync "$O/test.mkv" "$SRC" "$1" "$2"
 done
 
