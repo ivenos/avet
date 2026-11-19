@@ -73,6 +73,7 @@ All notable changes to this project are documented in this file, in the format o
 - rust 1.99.0 -> 1.100.0
 - av-scenechange 0.24.1 -> 0.25.0
 - AOMediaCodec/SVT-AV1 v4.2.0 -> v4.3.0
+- MKVToolNix 99.0 -> 103.0
 
 ## [2.0.0] - 2026-10-07
 
