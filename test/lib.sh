@@ -676,18 +676,18 @@ assert_decodes_cleanly() {
 }
 
 # Decoded samples of audio track INDEX against the source's SRC_INDEX, bit for bit, the
-# output at most MISSING samples short at the end.
+# output at most EXTRA samples longer at the end.
 assert_audio_samples_identical() {
-    local out="$1" src="$2" index="${3:-0}" src_index="${4:-${3:-0}}" missing="${5:-0}" a b channels
+    local out="$1" src="$2" index="${3:-0}" src_index="${4:-${3:-0}}" extra="${5:-0}" a b channels sa sb
     a=$(mktemp -p "$_SCRATCH"); b=$(mktemp -p "$_SCRATCH")
     ffmpeg -hide_banner -v error -i "$out" -map "0:a:$index" -c:a pcm_s32le -f s32le - > "$a"
     ffmpeg -hide_banner -v error -i "$src" -map "0:a:$src_index" -c:a pcm_s32le -f s32le - > "$b"
     channels=$(ffprobe -v error -select_streams "a:$src_index" -show_entries stream=channels -of csv=p=0 "$src" | head -n 1)
-    if [ ! -s "$b" ]; then
+    sa=$(stat -c %s "$a"); sb=$(stat -c %s "$b")
+    if [ "$sb" -eq 0 ]; then
         fail "samples: the source $src has no audio $src_index"
-    elif ! cmp -s -n "$(stat -c %s "$a")" "$a" "$b" || \
-        [ $(( ($(stat -c %s "$b") - $(stat -c %s "$a")) / 4 / channels )) -gt "$missing" ]; then
-        fail "samples: $out audio $index is not bit-exact against source audio $src_index ($(stat -c %s "$a") against $(stat -c %s "$b") bytes)"
+    elif [ "$sa" -lt "$sb" ] || ! cmp -s -n "$sb" "$a" "$b" || [ $(( (sa - sb) / 4 / channels )) -gt "$extra" ]; then
+        fail "samples: $out audio $index is not bit-exact against source audio $src_index ($sa against $sb bytes)"
     fi
 }
 
