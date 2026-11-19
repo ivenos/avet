@@ -49,29 +49,10 @@ assert_file_not_exists "$O/test.mkv"
 assert_log_contains    "no jobs"
 
 # POLL_INTERVAL env var is logged at startup
-I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I/p" "$O"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
-cat > "$I/p/encode.toml" << 'EOF'
-encoder = "svt-av1"
-[encoder_params]
-preset = 12
-crf    = 50
-EOF
-RUN_LOGS=""
-CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
-    --user "$(id -u):$(id -g)" \
-    -v "${I}:/input:z" \
-    -v "${O}:/output:z" \
-    -e POLL_INTERVAL=42 \
-    -e RUST_LOG=info \
-    "${TEST_IMAGE:-avet:test}")
-ELAPSED=0
-while [ "$ELAPSED" -lt 120 ]; do
-    [ -f "$O/test.mkv" ] && break
-    sleep 1; ELAPSED=$((ELAPSED + 1))
-done
-RUN_LOGS=$(docker logs "$CID" 2>&1) || true
-docker rm -f "$CID" >/dev/null 2>&1 || true
+I="$WORKDIR/4/in"; O="$WORKDIR/4/out"; mkdir -p "$I" "$O"
+start_avet "$I" "$O" 42
+wait_for_log "poll_s=42" 30
+kill_avet
 assert_log_contains "poll_s=42"
 
 # .mp4 and .webm extensions both recognized by scanner
@@ -92,21 +73,9 @@ assert_file_exists   "$I/processed/b.webm"
 
 # invalid POLL_INTERVAL: warning logged, default used
 I="$WORKDIR/6/in"; O="$WORKDIR/6/out"; mkdir -p "$I" "$O"
-CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
-    --user "$(id -u):$(id -g)" \
-    -v "${I}:/input:z" \
-    -v "${O}:/output:z" \
-    -e POLL_INTERVAL=notanumber \
-    -e RUST_LOG=warn \
-    "${TEST_IMAGE:-avet:test}")
-ELAPSED=0
-while [ "$ELAPSED" -lt 30 ]; do
-    RUN_LOGS=$(docker logs "$CID" 2>&1) || true
-    printf '%s\n' "$RUN_LOGS" | grep -qF "invalid value" && break
-    sleep 1
-    ELAPSED=$((ELAPSED + 1))
-done
-docker rm -f "$CID" >/dev/null 2>&1 || true
+TEST_RUST_LOG=warn start_avet "$I" "$O" notanumber
+wait_for_log "invalid value" 30
+kill_avet
 assert_log_contains "invalid value"
 
 # two files sharing a stem: neither runs
@@ -156,5 +125,29 @@ EOF
 run_avet "$I" "$O" "$O/$NL/$NL.mkv" 120 || fail "line break in name: no output"
 assert_video_codec       "$O/$NL/$NL.mkv" av1
 assert_audio_track_count "$O/$NL/$NL.mkv" 1
+
+# an encode.toml in a folder inside a profile is ignored with a warning
+I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p/Show A" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/Show A/test.mkv"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+printf 'encoder = "svt-av1"\n' > "$I/p/Show A/encode.toml"
+run_avet "$I" "$O" "$O/Show A/test.mkv" 120 || fail "nested encode.toml: no output"
+assert_log_contains "Show A/encode.toml: only the encode.toml of the profile folder applies"
+assert_video_codec  "$O/Show A/test.mkv" h264
+
+# LOG_NAME_LENGTH cuts the name in front of a job's log lines, the start line shows the full path
+I="$WORKDIR/11/in"; O="$WORKDIR/11/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/Dune.Part.Two.2024.2160p.UHD.BluRay.mkv"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+start_avet "$I" "$O" 2 -e LOG_NAME_LENGTH=10 "$TEST_IMAGE"
+wait_for_file "$O/Dune.Part.Two.2024.2160p.UHD.BluRay.mkv" 120 || fail "LOG_NAME_LENGTH: no output"
+kill_avet
+assert_log_contains     "[Dune.Part.…] starting /input/p/Dune.Part.Two.2024.2160p.UHD.BluRay.mkv"
+assert_log_not_contains "[Dune.Part.Two"
+
+I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I" "$O"
+start_avet "$I" "$O" 2 -e LOG_NAME_LENGTH=0 "$TEST_IMAGE"
+wait_for_log 'LOG_NAME_LENGTH has invalid value "0" - logging full names' 30 || fail "LOG_NAME_LENGTH=0: no warning"
+kill_avet
 
 test_done

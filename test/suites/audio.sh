@@ -82,6 +82,9 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
 assert_audio_track_count "$O/test.mkv" 1
 assert_audio_codec       "$O/test.mkv" 0 ac3
+assert_log_contains      "[test] audio track 0 (eng) left out by the language whitelist"
+assert_log_contains      "[test] audio track 2 (jpn) left out by the language whitelist"
+assert_log_not_contains  "audio track 1 (deu) left out"
 assert_channel_frequencies "$O/test.mkv" 0 880
 
 # whitelist + codec_rule combined
@@ -165,7 +168,7 @@ language_whitelist = ["fra"]
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist no match: no output"
 assert_audio_track_count "$O/test.mkv" 0
-assert_log_contains      "matched none of the audio tracks (eng) - the output has no audio"
+assert_log_contains      "[test] the language whitelist [\"fra\"] matched none of the audio tracks (eng) - the output has no audio"
 
 # untagged audio track: no language tag, always kept by whitelist
 I="$WORKDIR/10/in"; O="$WORKDIR/10/out"; mkdir -p "$I/p" "$O"

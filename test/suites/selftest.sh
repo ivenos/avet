@@ -114,7 +114,8 @@ printf '[{"index":0,"start_frame":0,"end_frame":239}]' > "$W/one_chunk.json"
 printf '[{"index":0,"start_frame":0,"end_frame":99},{"index":1,"start_frame":100,"end_frame":239}]' > "$W/two_chunks.json"
 $FF -i "$SRC" -map 0:a:0 -af "atrim=end_sample=479960" -c:a flac "$W/short40.mkv"
 $FF -i "$SRC" -map 0:a:0 -af "atrim=end_sample=479900" -c:a flac "$W/short100.mkv"
-need "$W/short40.mkv" "$W/short100.mkv"
+$FF -i "$SRC" -map 0:a:0 -af "apad=pad_len=4800" -c:a flac "$W/long4800.mkv"
+need "$W/short40.mkv" "$W/short100.mkv" "$W/long4800.mkv"
 expect_pass "the same pictures"      assert_frames_identical "$SRC" "$SRC"
 expect_fail "two swapped pictures"   assert_frames_identical "$W/swapped.mkv" "$SRC"
 expect_pass "subtitles shown on time" assert_subtitle_events_match "$SRC" s:0 "$SRC" s:0
@@ -126,6 +127,7 @@ expect_fail "a list with no chunk"   assert_keyframes_at_chunks "$SRC" "$W/no_ch
 expect_pass "40 samples short, allowed"  assert_audio_samples_identical "$W/short40.mkv" "$SRC" 0 0 40
 expect_fail "40 samples short"       assert_audio_samples_identical "$W/short40.mkv" "$SRC" 0
 expect_fail "100 samples short"      assert_audio_samples_identical "$W/short100.mkv" "$SRC" 0 0 40
+expect_fail "4800 samples too many"  assert_audio_samples_identical "$W/long4800.mkv" "$SRC" 0
 
 # scene lists: a gap, an overlap, a late start, a short chunk
 printf '[{"index":0,"start_frame":0,"end_frame":99},{"index":1,"start_frame":120,"end_frame":239}]' > "$W/gap.json"

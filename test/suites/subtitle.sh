@@ -45,6 +45,7 @@ language_whitelist = ["deu"]
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "whitelist: no output"
 assert_subtitle_track_count "$O/test.mkv" 1
+assert_log_contains         "[test] subtitle track 0 (eng) left out by the language whitelist"
 # Counting alone would pass with the English track kept. mkvmerge writes the
 # bibliographic form, so "deu" comes back out as "ger".
 assert_subtitle_language    "$O/test.mkv" 0 ger

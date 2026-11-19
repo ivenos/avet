@@ -115,8 +115,9 @@ fn filter_chain(opts: &EncodeOptions, format: &PixelFormat) -> Vec<String> {
         Some((w, h)) => Some(format!("scale={w}:{h}:flags=lanczos{siting}")),
         None => subsample.then(|| format!("scale=iw:ih{siting}")),
     };
-    let to_444 = full_chroma.map(|loc| format!("scale=iw:ih:in_chroma_loc={loc},format={}", if format.bit_depth > 8 { "yuv444p10le" } else { "yuv444p" }));
-    let to_420 = subsample.then(|| format!("format={}", if format.bit_depth > 8 { "yuv420p10le" } else { "yuv420p" }));
+    let pix_fmt = |sub| crate::ffms2::pixfmt_name(sub, if format.bit_depth > 8 { 10 } else { 8 }).expect("8 and 10 bits are named");
+    let to_444 = full_chroma.map(|loc| format!("scale=iw:ih:in_chroma_loc={loc},format={}", pix_fmt(PixelSubsampling::Yuv444)));
+    let to_420 = subsample.then(|| format!("format={}", pix_fmt(PixelSubsampling::Yuv420)));
     [
         opts.deinterlace.map(|d| d.filter().to_string()),
         to_444,
@@ -171,7 +172,7 @@ pub fn write_reference(
 
 /// As a `setparams` filter: named as an output option, a tag makes ffmpeg convert the pixels to it.
 fn reference_tags(encoder_args: &[String]) -> String {
-    let value = |flag: &str| encoder_args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str());
+    let value = |flag: &str| arg_value(encoder_args, flag);
     let mut tags = vec![
         format!("range={}", if value("--color-range") == Some("1") { "pc" } else { "tv" }),
         // AV1 has no center siting, so FFVship takes the encode for left sited there too.
@@ -211,26 +212,8 @@ pub fn encode_reference(
     let (encoder_bin, encoder_name, encoder_args) = encoder_invocation(config, output_path, opts, overrides)?;
 
     let mut ff = spawn_reference_decoder(reference, opts, Stdio::piped())?;
-    let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let ff_err_t = crate::ext::drain_text(ff.stderr.take());
-
-    let mut cmd = std::process::Command::new(&encoder_bin);
-    cmd.args(&encoder_args)
-        .args(["--input", "-"])
-        .stdin(Stdio::from(ff_out))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let spawned = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"));
-    // Command holds its own handle on ffmpeg's stdout until dropped.
-    drop(cmd);
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            crate::ext::reap(&mut ff);
-            return Err(e);
-        }
-    };
-    let enc_err_t = crate::ext::drain_text(child.stderr.take());
+    let (mut child, enc_err_t) = spawn_encoder_fed_by(&mut ff, &encoder_bin, encoder_name, &encoder_args)?;
 
     let ff_status  = ff.wait().context("wait for ffmpeg reference decoder")?;
     let enc_status = child.wait().context("wait for encoder")?;
@@ -380,27 +363,8 @@ fn encode_filtered(
     hdr_metadata: Option<&mut Vec<FrameHdrMetadata>>,
 ) -> Result<()> {
     let mut ff = spawn_filter(vf, vs.info.fps_num, vs.info.fps_den)?;
-
-    let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
     let ff_err_t = crate::ext::drain_text(ff.stderr.take());
-
-    let mut cmd = std::process::Command::new(encoder_bin);
-    cmd.args(encoder_args)
-        .args(["--input", "-"])
-        .stdin(Stdio::from(ff_out))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let spawned = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"));
-    // Command holds its own handle on ffmpeg's stdout until dropped.
-    drop(cmd);
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            crate::ext::reap(&mut ff);
-            return Err(e);
-        }
-    };
-    let enc_err_t = crate::ext::drain_text(child.stderr.take());
+    let (mut child, enc_err_t) = spawn_encoder_fed_by(&mut ff, encoder_bin, encoder_name, encoder_args)?;
 
     let mut ff_in = BufWriter::with_capacity(256 * 1024, ff.stdin.take().expect("ffmpeg stdin unavailable"));
     let write_res = vs.write_y4m_range(&mut ff_in, scene.start_frame, scene.end_frame, crop, hdr_metadata);
@@ -427,6 +391,27 @@ fn encode_filtered(
     Ok(())
 }
 
+fn spawn_encoder_fed_by(
+    ff: &mut std::process::Child,
+    encoder_bin: &OsStr,
+    encoder_name: &str,
+    encoder_args: &[String],
+) -> Result<(std::process::Child, std::thread::JoinHandle<String>)> {
+    let ff_out = ff.stdout.take().expect("ffmpeg stdout unavailable");
+    let mut cmd = std::process::Command::new(encoder_bin);
+    cmd.args(encoder_args)
+        .args(["--input", "-"])
+        .stdin(Stdio::from(ff_out))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let spawned = crate::ext::spawn(&mut cmd, &format!("encoder '{encoder_name}'"));
+    // Command holds its own handle on ffmpeg's stdout until dropped.
+    drop(cmd);
+    let mut child = spawned.inspect_err(|_| crate::ext::reap(ff))?;
+    let err_t = crate::ext::drain_text(child.stderr.take());
+    Ok((child, err_t))
+}
+
 /// The encoder's death breaks the filter's pipe; a filter that died without one starved the encoder.
 fn encoder_to_blame(ff_ok: bool, ff_stderr: &str, enc_ok: bool, enc_stderr: &str) -> bool {
     let enc_started = enc_stderr.contains("Encoding");
@@ -443,8 +428,7 @@ fn spawn_filter(vf: &str, fps_num: u32, fps_den: u32) -> Result<std::process::Ch
         .args(["-vf", vf, "-fps_mode", "passthrough", "-strict", "-1", "-f", "yuv4mpegpipe", "pipe:1"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-;
+        .stderr(Stdio::piped());
     crate::ext::spawn(&mut cmd, "ffmpeg filter")
 }
 
@@ -468,6 +452,10 @@ fn encoder_binary(enc: Encoder) -> &'static str {
         Encoder::SvtAv1    => "SvtAv1EncApp",
         Encoder::SvtAv1Hdr => "SvtAv1EncApp-hdr",
     }
+}
+
+pub fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].as_str())
 }
 
 fn set_arg(args: &mut Vec<String>, flag: &str, value: String) {
@@ -631,8 +619,13 @@ mod tests {
             reference_tags(&pq),
             "setparams=range=tv:chroma_location=topleft:color_primaries=9:color_trc=16:colorspace=9"
         );
+    }
 
-        // What the encode leaves unsigned stays unsigned, so FFVship guesses the same for both.
+    #[test]
+    fn what_the_encode_leaves_untagged_the_reference_does_too_so_ffvship_guesses_both_alike() {
+        let args = |pairs: &[(&str, &str)]| -> Vec<String> {
+            pairs.iter().flat_map(|(k, v)| [k.to_string(), v.to_string()]).collect()
+        };
         assert_eq!(reference_tags(&args(&[("--crf", "30")])), "setparams=range=tv:chroma_location=left");
         assert_eq!(
             reference_tags(&args(&[("--color-range", "1"), ("--chroma-sample-position", "1")])),
@@ -692,12 +685,11 @@ mod tests {
     }
 
     #[test]
-    fn an_encoder_that_rejects_its_arguments_is_a_verdict_and_a_killed_one_is_not() {
+    fn an_encoder_that_rejects_its_arguments_waits_for_an_edit_of_encode_toml_and_a_killed_one_is_retried() {
         use std::os::unix::process::ExitStatusExt;
         let exit = |code: i32| ExitStatus::from_raw(code << 8);
         let transient = |e: &anyhow::Error| e.downcast_ref::<crate::job::Transient>().is_some();
 
-        // Lifted by the edit of encode.toml that fixes it, not by trying again.
         let typo = tool_failure("encoder", exit(1), "Unprocessed tokens: --prest \nError in configuration, could not begin encoding! ...", 0);
         assert!(!transient(&typo) && format!("{typo:#}").contains("--prest"), "got: {typo:#}");
         let too_wide = tool_failure("encoder", exit(1), "Svt[error]: Source Width must be less than or equal to 16384", 0);

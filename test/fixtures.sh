@@ -541,6 +541,17 @@ $FF -f lavfi -i "$(pattern 320x180 25 yuv420p)" -f lavfi -i "aevalsrc=exprs=$BEE
 $FF -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=5" -c:a ac3 -f ac3 audio_late.ac3
 $FF -i late_main.ts -itsoffset 10 -i audio_late.ac3 -map 0 -map 1 -c copy -metadata:s:a:1 language=eng -f mpegts audio_late.ts
 $FF -i late_main.ts -itsoffset 10 -i audio_late.ac3 -map 0:v -map 1 -map 0:a -c copy -metadata:s:a:0 language=eng -f mpegts audio_late_first.ts
+# ffprobe gives a LATM stream no type until it reads a packet of it.
+$FF -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=5" -c:a aac -mpegts_flags latm -f mpegts audio_late_latm.only.ts
+$FF -i late_main.ts -itsoffset 10 -i audio_late_latm.only.ts -map 0:v -map 1 -map 0:a -c copy \
+    -metadata:s:a:0 language=eng -disposition:a:1 visual_impaired -f mpegts audio_late_latm.ts
+# A recording started before the show: the second track begins 4 minutes in.
+$FF -f lavfi -i "testsrc2=size=160x90:rate=25" -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:d=320" \
+    -frames:v 8000 -map 0:v -map 1:a -c:v mpeg2video -q:v 8 -c:a ac3 -b:a 96k -metadata:s:a:0 language=ger -f mpegts late4_main.ts
+$FF -i late4_main.ts -itsoffset 240 -i audio_late.ac3 -map 0 -map 1 -c copy -metadata:s:a:1 language=eng -f mpegts audio_late4.ts
+# mkvmerge looks for tracks in the first 10 MB; the second LATM starts after the 5 minutes avet probes.
+$FF -i late4_main.ts -itsoffset 240 -i audio_late_latm.only.ts -itsoffset 310 -i audio_late_latm.only.ts \
+    -map 0:v -map 1 -map 2 -map 0:a -c copy -copyts -metadata:s:a:0 language=eng -metadata:s:a:1 language=fre -f mpegts audio_late_latm4.ts
 $FF -i pattern.mkv -map 0:v -c:v copy -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 -map 0:a:0 \
     -c:a:0 aac -c:a:1 aac -ar:a:1 44100 -c:a:2 alac -c:a:3 libmp3lame -c:a:4 ac3 audio_codecs.mp4
 
@@ -633,11 +644,101 @@ $FF -i one_picture.mkv -f lavfi -i "aevalsrc=exprs=$BEEP|$BEEP:c=stereo:s=48000:
     -map 0:v -map 1:a -c:v copy -c:a flac one_frame.mkv
 $FF -i pattern.mkv -map 0:a:0 -c:a copy audio_only.mkv
 
-rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts switch*.ac3 late_main.ts
+rm -f eng.srt ger.srt eng.sup ger.sup late.sup layout*.mov one_picture.mkv gop.ts switch*.ac3 late_main.ts late4_main.ts
 GEN
 
 GEN_RC=$?
 if [ "$GEN_RC" -ne 0 ]; then
     printf "ERROR: real-world fixture generation failed (rc=%d)\n" "$GEN_RC"
+    exit 1
+fi
+
+# Dolby Vision whose RPUs stop after frame 47, and HDR10 with HDR10+ recorded from mid-GOP.
+docker run --rm -i --init \
+    --user "$(id -u):$(id -g)" \
+    -v "${FIXTURES_DIR}:/out:z" \
+    --entrypoint sh \
+    "$TEST_IMAGE" << 'GEN'
+set -e
+cd /out
+FF="ffmpeg -nostdin -y -hide_banner -loglevel error"
+HDR10="hdr10=1:max-cll=1000,400:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)"
+for part in 0:48 48:72; do
+    $FF -f lavfi -i "testsrc2=size=640x280:rate=24" \
+        -vf "trim=start_frame=${part%:*}:end_frame=${part#*:},setpts=PTS-STARTPTS,pad=640:360:0:40:black,format=yuv420p10le,setparams=range=tv:color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc" \
+        -c:v libx265 -preset ultrafast -x265-params "log-level=error:bframes=4:keyint=24:scenecut=0:$HDR10" \
+        "rpu_stops_${part%:*}.hevc"
+done
+$FF -f lavfi -i "testsrc2=size=320x180:rate=50" -frames:v 200 -pix_fmt yuv420p10le \
+    -c:v libx265 -preset ultrafast \
+    -x265-params "log-level=error:keyint=100:min-keyint=100:scenecut=0:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:$HDR10" \
+    gop_base.hevc
+GEN
+
+GEN_RC=$?
+if [ "$GEN_RC" -ne 0 ]; then
+    printf "ERROR: late HDR fixture generation failed (rc=%d)\n" "$GEN_RC"
+    exit 1
+fi
+
+docker run --rm -i --init \
+    -e OWNER="$(id -u):$(id -g)" \
+    -v "${FIXTURES_DIR}:/out:z" \
+    "$TOOLS_IMAGE" sh << 'GEN'
+set -e
+cd /out
+
+echo "  dv81_rpu_stops.mkv"
+echo '{ "length": 48 }' > rpu_stops.json
+dovi_tool generate -j rpu_stops.json -p 8.1 -o rpu_stops.bin >/dev/null
+dovi_tool inject-rpu -i rpu_stops_0.hevc --rpu-in rpu_stops.bin -o rpu_stops_rpu.hevc >/dev/null
+cat rpu_stops_rpu.hevc rpu_stops_48.hevc > rpu_stops.hevc
+mkvmerge -q -o dv81_rpu_stops.mkv --default-duration 0:24fps rpu_stops.hevc
+
+echo "  hdr10plus_gop.mkv"
+{
+    printf '{"JSONInfo":{"HDR10plusProfile":"B","Version":"1.0"},"SceneInfo":['
+    i=0
+    while [ "$i" -lt 200 ]; do
+        [ "$i" -gt 0 ] && printf ','
+        printf '{"BezierCurveData":{"Anchors":[143,298,447,592,731,864,891,917,938],"KneePointX":164,"KneePointY":240},'
+        printf '"LuminanceParameters":{"AverageRGB":%d,"LuminanceDistributions":{"DistributionIndex":[1,5,10,25,50,75,90,95,99],' "$((100 + i))"
+        printf '"DistributionValues":[0,6080,92,1,4,107,726,1784,5843]},"MaxScl":[7768,6589,6912]},'
+        printf '"NumberOfWindows":1,"TargetedSystemDisplayMaximumLuminance":400,"SceneFrameIndex":%d,"SceneId":0,"SequenceFrameIndex":%d}' "$i" "$i"
+        i=$((i + 1))
+    done
+    printf '],"SceneInfoSummary":{"SceneFirstFrameIndex":[0],"SceneFrameNumbers":[200]},"ToolInfo":{"Tool":"hdr10plus_tool","Version":"1.7.2"}}'
+} > gop.json
+hdr10plus_tool inject -i gop_base.hevc -j gop.json -o gop_plus.hevc >/dev/null
+mkvmerge -q -o hdr10plus_gop.mkv --default-duration 0:50fps gop_plus.hevc
+
+rm -f rpu_stops.json rpu_stops.bin rpu_stops_0.hevc rpu_stops_48.hevc rpu_stops_rpu.hevc rpu_stops.hevc \
+    gop.json gop_base.hevc gop_plus.hevc
+chown "$OWNER" dv81_rpu_stops.mkv hdr10plus_gop.mkv
+GEN
+
+GEN_RC=$?
+if [ "$GEN_RC" -ne 0 ]; then
+    printf "ERROR: late Dolby Vision and HDR10+ fixture generation failed (rc=%d)\n" "$GEN_RC"
+    exit 1
+fi
+
+# Cut at a TS packet a fifth into the first 2 s GOP, as a recording starts.
+docker run --rm -i --init \
+    --user "$(id -u):$(id -g)" \
+    -v "${FIXTURES_DIR}:/out:z" \
+    --entrypoint sh \
+    "$TEST_IMAGE" << 'GEN'
+set -e
+cd /out
+echo "  hdr10plus_recording.ts"
+ffmpeg -nostdin -y -hide_banner -loglevel error -i hdr10plus_gop.mkv -c copy -f mpegts gop.ts
+tail -c +$(( $(wc -c < gop.ts) / 2 / 5 / 188 * 188 + 1 )) gop.ts > hdr10plus_recording.ts
+rm -f gop.ts
+GEN
+
+GEN_RC=$?
+if [ "$GEN_RC" -ne 0 ]; then
+    printf "ERROR: recording fixture generation failed (rc=%d)\n" "$GEN_RC"
     exit 1
 fi

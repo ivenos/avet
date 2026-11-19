@@ -43,7 +43,8 @@ assert_channel_frequencies "$O/test.mkv" 0 13000
 
 # Blu-ray and broadcast: LPCM and SMPTE 302M as PCM, a stream announced but never sent
 run m2ts audio_codecs.m2ts
-assert_log_contains "audio track 2 (ac3) has no sample rate or channel count - skipped"
+assert_log_contains "[test] audio track 2 (ac3) has no sample rate or channel count - skipped"
+assert_log_contains "[test] audio track 3: eng dts "
 assert_audio_track_count "$O/test.mkv" 6
 set -- "0 0 pcm_s24le" "1 1 truehd" "2 3 dts" "3 4 ac3" "4 5 pcm_s24le" "5 6 aac_latm"
 for track; do
@@ -88,6 +89,39 @@ for mode in encode copy; do
         assert_stream_times_match "$O/test.mkv" "a:$i" "$SRC" "a:$i"
     done
 done
+# a track that starts four minutes into a recording is kept
+run late4 audio_late4.ts '[avet]\nvideo = "copy"\n'
+assert_audio_track_count "$O/test.mkv" 2
+assert_packets_identical "$O/test.mkv" a:1 "$FIXTURES_DIR/audio_late.ac3" a:0
+assert_stream_times_match "$O/test.mkv" a:1 "$SRC" a:1
+# LATM AAC that starts late, ahead of the AC-3 in PID order
+for mode in encode copy; do
+    run "late_latm_$mode" audio_late_latm.ts "[avet]\nvideo = \"$mode\"\n"
+    assert_log_contains "[test] audio track 0: eng aac_latm stereo (lossy) -> copy as AAC"
+    assert_audio_track_count "$O/test.mkv" 2
+    set -- "0 aac eng" "1 ac3 ger"
+    for track; do
+        set -- $track
+        assert_audio_codec "$O/test.mkv" "$1" "$2"
+        assert_audio_language "$O/test.mkv" "$1" "$3"
+    done
+    assert_stream_value "$O/test.mkv" a stream_disposition=default,visual_impaired "0 0 0 1"
+    assert_audio_samples_identical "$O/test.mkv" "$FIXTURES_DIR/audio_late_latm.only.ts" 0 0
+    assert_packets_identical "$O/test.mkv" a:1 "$SRC" a:0
+    # Untyped, the LATM stream lists its PES packets rather than its frames.
+    start=$(stream_times "$O/test.mkv" a:0 | head -n 1); src_start=$(stream_times "$SRC" 1 | head -n 1)
+    awk -v a="$start" -v b="$src_start" 'BEGIN { exit !(a != "" && (a - b) ^ 2 <= 4) }' || \
+        fail "late_latm_$mode: the AAC starts $start ms after the first frame, the source's LATM $src_start ms"
+    assert_stream_times_match "$O/test.mkv" a:1 "$SRC" a:0
+done
+# LATM AAC that starts 4 minutes in, and one that starts after 5 minutes
+run late_latm4 audio_late_latm4.ts '[avet]\nvideo = "copy"\n'
+assert_log_contains "[test] audio track 0: eng aac_latm stereo (lossy) -> copy as AAC"
+assert_log_contains "no type found in the first 5 minutes - skipped"
+assert_audio_track_count "$O/test.mkv" 2
+assert_audio_codec "$O/test.mkv" 0 aac
+assert_audio_codec "$O/test.mkv" 1 ac3
+assert_audio_samples_identical "$O/test.mkv" "$FIXTURES_DIR/audio_late_latm.only.ts" 0 0
 run late_opus audio_late.ts "$OPUS"
 assert_audio_codec "$O/test.mkv" 1 opus
 assert_audio_language "$O/test.mkv" 1 eng

@@ -37,7 +37,6 @@ Environment:
   TOOLS_IMAGE      Fixture tools image tag (default: avet:fixture-tools)
 EOF
             exit 0 ;;
-        # A mistyped flag as the filter would match no suite and pass.
         -*)         printf "ERROR: unknown option %s\n" "$1" >&2; exit 2 ;;
         *)          [ -z "$FILTER" ] || { printf "ERROR: only one filter, got '%s' and '%s'\n" "$FILTER" "$1" >&2; exit 2; }
                     FILTER="$1" ;;
@@ -53,6 +52,11 @@ GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
+
+if [ -n "$FILTER" ] && ! ls "$CASES_DIR" | sed -n 's/\.sh$//p' | grep -qF "$FILTER"; then
+    printf "${RED}ERROR:${NC} filter '%s' matches no suite\n" "$FILTER"
+    exit 2
+fi
 
 if [ "$NO_BUILD" -eq 0 ]; then
     printf "=== Building %s and %s ===\n" "$TEST_IMAGE" "$TOOLS_IMAGE"
@@ -128,9 +132,7 @@ printf "\n"
 
 # A run that executed nothing is not a passing run.
 if [ "$((PASS + FAIL))" -eq 0 ]; then
-    printf "${RED}ERROR:${NC} no test case ran"
-    [ -n "$FILTER" ] && printf " (filter '%s' matched nothing)" "$FILTER"
-    printf "\n"
+    printf "${RED}ERROR:${NC} no test case ran\n"
     exit 2
 fi
 

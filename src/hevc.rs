@@ -128,7 +128,6 @@ fn hdr10plus_by_access_unit(mut r: impl Read) -> Result<Vec<Option<Vec<u8>>>> {
             }
             return Ok(units.hdr10plus);
         }
-        // Keep the unfinished NAL, and two bytes a start code may continue from.
         let keep_from = nal_start.unwrap_or(buf.len()).min(buf.len().saturating_sub(2));
         buf.drain(..keep_from);
         nal_start = nal_start.map(|s| s - keep_from);

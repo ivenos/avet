@@ -76,10 +76,7 @@ pub fn display_model_for(width: u32, height: u32, frame: (u32, u32), hdr_args: &
 }
 
 fn signaled_transfer(hdr_args: &[String]) -> Option<&str> {
-    hdr_args
-        .windows(2)
-        .find(|w| w[0] == "--transfer-characteristics")
-        .map(|w| w[1].as_str())
+    crate::encode::arg_value(hdr_args, "--transfer-characteristics")
 }
 
 /// A Vulkan device reported by FFVship.
@@ -99,7 +96,7 @@ impl GpuSelection {
 
 /// A software Vulkan device is rejected: CVVDP on the CPU is too slow to be practical.
 pub fn ensure_available() -> Result<GpuSelection> {
-    const HINT: &str = "Pass /dev/dri for an Intel or AMD GPU; NVIDIA's driver loads only in the AppImage.";
+    const HINT: &str = "Pass /dev/dri for an Intel or AMD GPU, or gpus: all for NVIDIA.";
 
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
     cmd.arg("--list-gpu");
@@ -269,7 +266,7 @@ impl Reference {
     pub const PREFIX: &'static str = "reference_";
 
     pub fn write(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Option<Self>> {
-        if ctx.opts.scale.is_none() && ctx.opts.mirror.is_none() {
+        if !uses_reference(ctx.opts) {
             return Ok(None);
         }
         let reference = Reference(ctx.temp_dir.join(format!("{}{}.mkv", Self::PREFIX, scene.padded_index())));
@@ -428,12 +425,16 @@ fn av1_metadata_filter(tags: &[(&str, &str)]) -> Option<String> {
 
 /// FFVship would hold a deinterlaced encode against the source's combed frames, and only a reference has none.
 pub fn measurable(opts: &EncodeOptions) -> bool {
-    opts.deinterlace.is_none() || opts.scale.is_some() || opts.mirror.is_some()
+    opts.deinterlace.is_none() || uses_reference(opts)
+}
+
+fn uses_reference(opts: &EncodeOptions) -> bool {
+    opts.scale.is_some() || opts.mirror.is_some()
 }
 
 /// The finished chunk as it will play, which the probes at another preset only estimate.
 pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path, reference: Option<&Reference>) -> Option<f64> {
-    if ctx.opts.deinterlace.is_some() && reference.is_none() {
+    if !measurable(ctx.opts) {
         return None;
     }
     let tag = format!("{}_final", scene.padded_index());
@@ -638,11 +639,11 @@ fn decide(pts: &[Probe], floor: &Floor, cap: f64, lo: f64) -> SolveResult {
         return res(p, SolveOutcome::Met);
     }
 
-    // Nothing holds both, so the cap wins: lowest CRF that fits is the best quality left.
+    // Nothing holds both, so the cap wins. CVVDP is not monotonic in CRF.
     // The search does not go below a probe over the cap, so only min_crf proves the floor out of reach.
     if let Some(p) = pts.iter()
         .filter(|p| p.size_pct <= cap)
-        .min_by(|a, b| a.crf.total_cmp(&b.crf))
+        .max_by(|a, b| a.jod.total_cmp(&b.jod))
         .copied()
     {
         let out_of_reach = !pts.iter().any(|p| floor.holds(p)) && pts.iter().any(|p| p.crf <= lo + 1e-9);
@@ -1208,6 +1209,19 @@ mod tests {
         assert!(!measurable(&opts));
         opts.scale = Some((320, 180));
         assert!(measurable(&opts));
+        opts.scale = None;
+        opts.mirror = Some(crate::ffms2::Mirror::Vertical);
+        assert!(measurable(&opts));
+    }
+
+    #[test]
+    fn only_a_scaled_or_mirrored_chunk_is_held_against_a_reference() {
+        let deinterlaced = EncodeOptions { deinterlace: Some(crate::interlace::FieldOrder::Tff), ..Default::default() };
+        assert!(!uses_reference(&EncodeOptions::default()));
+        assert!(!uses_reference(&deinterlaced));
+        assert!(uses_reference(&EncodeOptions { scale: Some((320, 180)), ..Default::default() }));
+        assert!(uses_reference(&EncodeOptions { mirror: Some(crate::ffms2::Mirror::Horizontal), ..Default::default() }));
+        assert!(uses_reference(&EncodeOptions { scale: Some((320, 180)), ..deinterlaced }));
     }
 
     #[test]
@@ -1248,6 +1262,14 @@ mod tests {
         assert_eq!(seed_crf(&config, 14.0, 45.0), 45.0);
         config.encoder_params.clear();
         assert_eq!(seed_crf(&config, 18.0, 44.0), 31.0);
+    }
+
+    #[test]
+    fn without_a_probe_holding_both_the_best_scored_one_under_the_cap_is_used() {
+        let pts = vec![p(17.0, 9.6, 130.0), p(26.75, 9.428, 74.0), p(35.5, 9.487, 29.0)];
+        let r = decide(&pts, &jod(9.5), 90.0, 1.0);
+        assert_eq!(r.crf, 35.5);
+        assert!(matches!(r.outcome, SolveOutcome::CapBinding));
     }
 
     #[test]

@@ -11,6 +11,7 @@ struct Section {
 
 struct Row {
     default: String,
+    values: String,
     description: String,
 }
 
@@ -30,6 +31,7 @@ fn readme() -> BTreeMap<String, Section> {
             current = line
                 .strip_prefix("### `")
                 .and_then(|l| l.strip_suffix('`'))
+                .filter(|name| !name.contains('`'))
                 .map(|name| name.trim_matches(['[', ']']).to_string());
             if let Some(name) = &current {
                 sections.entry(name.clone()).or_default();
@@ -41,10 +43,15 @@ fn readme() -> BTreeMap<String, Section> {
         };
         if line.starts_with("| `") {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-            assert_eq!(cells.len(), 5, "README row with other than three cells: {line}");
+            assert_eq!(cells.len(), 6, "README row with other than four cells: {line}");
+            assert!(!cells[3].is_empty() && !cells[4].is_empty() && !cells[4].ends_with('.'), "README row with an empty cell or a final period: {line}");
             section.rows.insert(
                 cells[1].trim_matches('`').to_string(),
-                Row { default: cells[2].trim_matches('`').to_string(), description: cells[3].to_string() },
+                Row {
+                    default: cells[2].trim_matches('`').to_string(),
+                    values: cells[3].to_string(),
+                    description: format!("{}. Values: {}", cells[4], cells[3]),
+                },
             );
         } else if section.intro.is_none() && section.rows.is_empty() && !line.is_empty() && !line.starts_with('|') {
             section.intro = Some(line.to_string());
@@ -63,8 +70,8 @@ fn generate() -> Value {
     let readme = readme();
     for (name, prop) in schema["properties"].as_object_mut().unwrap() {
         let section = readme.get(name).unwrap_or_else(|| panic!("README has no section for `{name}`"));
-        if let Some(intro) = &section.intro {
-            prop["description"] = json!(intro);
+        if let Some(text) = section.intro.as_ref().or(section.rows.get(name).map(|row| &row.description)) {
+            prop["description"] = json!(text);
         }
         describe(prop, name, section);
     }
@@ -158,7 +165,7 @@ fn every_readme_row_names_a_key() {
         let table = schema["properties"].get(&name).unwrap_or_else(|| panic!("README section `{name}` is no key"));
         let mut known = Vec::new();
         keys(table, &mut known);
-        for key in section.rows.keys() {
+        for key in section.rows.keys().filter(|key| **key != name) {
             assert!(known.contains(key), "README row `{name}.{key}` is no key");
         }
     }
@@ -170,7 +177,8 @@ fn readme_defaults_match_the_code() {
     let mut checked = 0;
     for (name, section) in readme() {
         for (key, row) in &section.rows {
-            let Some(prop) = schema["properties"][&name]["properties"].get(key) else {
+            let prop = if *key == name { schema["properties"].get(key) } else { schema["properties"][&name]["properties"].get(key) };
+            let Some(prop) = prop else {
                 continue;
             };
             let documented = (row.default != "-").then(|| {
@@ -187,6 +195,28 @@ fn readme_defaults_match_the_code() {
         }
     }
     assert!(checked > 20, "only {checked} defaults compared");
+}
+
+#[test]
+fn readme_values_name_the_schema_bounds() {
+    let schema = generate();
+    let text = |v: &Value| v.as_f64().filter(|f| f.fract() == 0.0).map_or_else(|| v.to_string(), |f| (f as i64).to_string());
+    let mut checked = 0;
+    for (name, section) in readme() {
+        for (key, row) in &section.rows {
+            let prop = if *key == name { &schema["properties"][key] } else { &schema["properties"][&name]["properties"][key] };
+            let linked = section.rows.keys().any(|other| other != key && row.values.contains(&format!("`{other}`")));
+            let mut named: Vec<&Value> = prop.get("enum").and_then(Value::as_array).into_iter().flatten().collect();
+            if !linked {
+                named.extend(["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"].iter().filter_map(|b| prop.get(*b)));
+            }
+            for value in named {
+                assert!(row.values.contains(&format!("`{}`", text(value))), "README values of `{name}.{key}` leave out {value}: {}", row.values);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 20, "only {checked} values compared");
 }
 
 const BASE: &str = "encoder = \"svt-av1\"\n[audio]\ncodec = \"libopus\"\nbitrate = \"192k\"\n";
@@ -211,7 +241,10 @@ fn validate_accepts(path: &[&str], value: &Value) -> bool {
 }
 
 fn boundary_cases(prop: &Value) -> (Vec<Value>, Vec<Value>) {
-    let integer = prop["type"] == "integer";
+    let integer = match &prop["type"] {
+        Value::Array(types) => types.contains(&json!("integer")),
+        t => t == "integer",
+    };
     let step = if integer { 1.0 } else { 0.01 };
     let num = |x: f64| if integer { json!(x as i64) } else { json!(x) };
     let bound = |key: &str| prop.get(key).and_then(Value::as_f64);
@@ -285,7 +318,6 @@ fn schema_bounds_match_validate() {
     assert!(checked > 40, "only {checked} values checked");
 }
 
-/// The draft-07 keywords the generated schema uses, as an editor applies them.
 fn fits(schema: &Value, value: &Value) -> bool {
     let Some(schema) = schema.as_object() else {
         return schema != &Value::Bool(false);
@@ -356,7 +388,7 @@ fn the_schema_takes_the_values_validate_takes() {
         cases.push((vec!["encoder_params", "crf"], v));
     }
     for key in crate::config::COLOR_KEYS {
-        for v in [json!(9), json!(0), json!("16"), json!("+9"), json!(-1), json!(9.5), json!(true), json!("bt2020"), json!(""), json!([1])] {
+        for v in [json!(9), json!(0), json!("16"), json!("+9"), json!(-1), json!(9.5), json!(9.0), json!(true), json!("bt2020"), json!(""), json!([1])] {
             cases.push((vec!["encoder_params", key], v));
         }
     }

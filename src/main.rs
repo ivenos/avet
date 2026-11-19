@@ -26,7 +26,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tracing::field::{Field, Visit};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::field::{RecordFields, VisitOutput};
+use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::{DefaultVisitor, Writer};
 
 const VERSION: &str = match option_env!("AVET_VERSION") {
     Some(v) if !v.is_empty() => v,
@@ -37,20 +41,9 @@ const USAGE: &str = "usage: avet [--version | --help]\nIt watches INPUT_DIR (./i
 
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    match args.first().and_then(|a| a.to_str()) {
-        None => {}
-        Some("--version" | "-V") if args.len() == 1 => {
-            println!("avet {VERSION}");
-            return Ok(());
-        }
-        Some("--help" | "-h") if args.len() == 1 => {
-            println!("{USAGE}");
-            return Ok(());
-        }
-        _ => {
-            let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
-            anyhow::bail!("avet takes no argument other than --version or --help, got: {}\n{USAGE}", args.join(" "));
-        }
+    if let Some(reply) = reply(&args)? {
+        println!("{reply}");
+        return Ok(());
     }
     init_logging();
     let default_hook = std::panic::take_hook();
@@ -129,6 +122,18 @@ fn main() -> Result<()> {
     }
 }
 
+fn reply(args: &[std::ffi::OsString]) -> Result<Option<String>> {
+    match args {
+        [] => Ok(None),
+        [a] if a == "--version" || a == "-V" => Ok(Some(format!("avet {VERSION}"))),
+        [a] if a == "--help" || a == "-h" => Ok(Some(USAGE.into())),
+        _ => {
+            let args: Vec<_> = args.iter().map(|a| a.to_string_lossy()).collect();
+            anyhow::bail!("avet takes no argument other than --version or --help, got: {}\n{USAGE}", args.join(" "));
+        }
+    }
+}
+
 /// Ends the scan loop between jobs. Killed instead, the orphaned encoders keep writing
 /// chunk files the restarted instance starts writing too.
 fn shutdown_signal() -> Arc<AtomicBool> {
@@ -201,11 +206,65 @@ fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
 
+    let name_length = std::env::var("LOG_NAME_LENGTH").ok();
+    let max = name_length.as_deref().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0);
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_ansi(std::io::stdout().is_terminal())
+        .fmt_fields(ShortNames(max))
         .init();
+    if let Some(v) = name_length.filter(|_| max.is_none()) {
+        tracing::warn!("LOG_NAME_LENGTH has invalid value {v:?} - logging full names");
+    }
+}
+
+struct ShortNames(Option<usize>);
+
+impl<'w> FormatFields<'w> for ShortNames {
+    fn format_fields<R: RecordFields>(&self, writer: Writer<'w>, fields: R) -> std::fmt::Result {
+        let mut visitor = ShortNameVisitor { inner: DefaultVisitor::new(writer, true), max: self.0 };
+        fields.record(&mut visitor);
+        visitor.inner.finish()
+    }
+}
+
+struct ShortNameVisitor<'w> {
+    inner: DefaultVisitor<'w>,
+    max: Option<usize>,
+}
+
+impl Visit for ShortNameVisitor<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.inner.record_str(field, value)
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.inner.record_error(field, value)
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        match self.max.filter(|_| field.name() == "message").and_then(|max| short_name(&format!("{value:?}"), max)) {
+            Some(short) => self.inner.record_debug(field, &format_args!("{short}")),
+            None => self.inner.record_debug(field, value),
+        }
+    }
+}
+
+fn short_name(message: &str, max: usize) -> Option<String> {
+    let rest = message.strip_prefix('[')?;
+    let first_line = rest.split('\n').next().unwrap_or(rest);
+    let mut depth = 1;
+    let (end, _) = first_line.char_indices().find(|&(_, c)| {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    })?;
+    let name = &rest[..end];
+    (name.chars().count() > max).then(|| format!("[{}…]{}", name.chars().take(max).collect::<String>(), &rest[end + 1..]))
 }
 
 fn env_path(var: &str, default: &str) -> PathBuf {
@@ -230,14 +289,13 @@ fn ensure_dirs(input_dir: &std::path::Path, output_dir: &std::path::Path) -> Res
     create(input_dir)?;
     if resolved(output_dir)?.starts_with(resolved(input_dir)?) {
         anyhow::bail!(
-            "OUTPUT_DIR {} is inside INPUT_DIR {}, which would queue every output again",
+            "OUTPUT_DIR {} is inside INPUT_DIR {}",
             output_dir.display(), input_dir.display()
         );
     }
     create(output_dir)
 }
 
-/// Where `path` leads once created: its existing part resolved, the folders still to make taken as written.
 fn resolved(path: &std::path::Path) -> Result<PathBuf> {
     let existing = path.ancestors().find(|a| a.as_os_str().is_empty() || a.exists()).unwrap_or(path);
     let start = if existing.as_os_str().is_empty() { std::path::Path::new(".") } else { existing };
@@ -285,6 +343,30 @@ mod tests {
         assert!(ensure_dirs(&input, &dir.path().join("link/out")).is_err());
         assert!(ensure_dirs(&input, &input.join("new/../../out")).is_ok());
         assert!(dir.path().join("out").is_dir());
+    }
+
+    #[test]
+    fn log_name_length_cuts_only_the_name_in_front_of_a_job_line() {
+        assert_eq!(short_name("[Dune.Part.Two.2024.2160p.UHD.BluRay] encoding: 4 chunks", 10).as_deref(), Some("[Dune.Part.…] encoding: 4 chunks"));
+        assert_eq!(short_name("[Amélie.2001.1080p] done", 6).as_deref(), Some("[Amélie…] done"));
+        assert_eq!(short_name("[[SubsPlease] Show - 01 [A1B2]] done", 12).as_deref(), Some("[[SubsPlease]…] done"));
+        assert_eq!(short_name("[Short] done", 10), None);
+        assert_eq!(short_name("avet started", 3), None);
+        assert_eq!(short_name("[never closed", 3), None);
+        assert_eq!(short_name("[Show [1080p] job failed\nparse encode.toml\n  |  ]", 4), None);
+    }
+
+    #[test]
+    fn an_argument_that_is_not_utf8_is_refused_like_any_unknown_one() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        assert!(reply(&[bad.clone()]).is_err());
+        assert!(reply(&[bad, "--bogus".into()]).is_err());
+        assert!(reply(&["--bogus".into()]).is_err());
+        assert!(reply(&["--version".into(), "--version".into()]).is_err());
+        assert_eq!(reply(&["-V".into()]).unwrap(), Some(format!("avet {VERSION}")));
+        assert_eq!(reply(&["--help".into()]).unwrap().as_deref(), Some(USAGE));
+        assert_eq!(reply(&[]).unwrap(), None);
     }
 
     #[test]

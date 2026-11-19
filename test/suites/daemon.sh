@@ -137,7 +137,7 @@ cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
 TEST_CPUS=0.5 start_avet "$I" "$O" 1
 kills=0; waited=0
 while [ ! -f "$O/.avet_test/.failed" ] && [ "$waited" -lt 240 ]; do
-    docker exec "$AVET_CID" pkill -KILL SvtAv1EncApp 2>/dev/null && kills=$((kills + 1))
+    docker exec "$AVET_CID" pkill -KILL -f SvtAv1EncApp 2>/dev/null && kills=$((kills + 1))
     sleep 1
     waited=$((waited + 1))
 done
@@ -187,10 +187,37 @@ kill_avet
 [ "$elapsed" -ge 12 ] || fail "backoff: five attempts within ${elapsed}s at a 1 s poll"
 assert_log_not_contains "clears on its own"
 
+# an encoder that cannot be started is retried like any failure that clears on its own, never locked out
+setup unstartable
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'not a program\n' > "$WORKDIR/SvtAv1EncApp"
+chmod 644 "$WORKDIR/SvtAv1EncApp"
+start_avet "$I" "$O" 1 -v "$WORKDIR/SvtAv1EncApp:/usr/local/bin/SvtAv1EncApp:ro,z" "$TEST_IMAGE"
+wait_for_log "retrying in 16s" 120 || fail "unstartable: no fifth attempt within 120 s"
+kill_avet
+assert_log_contains     "start encoder"
+assert_log_not_contains "stopped 3 times in a row"
+assert_file_not_exists  "$O/.avet_test/.failed"
+
+# a full output disk is waited out
+setup full 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 5\n'
+start_avet "$I" "$O" 5 --tmpfs /full:size=8m,mode=1777 -e OUTPUT_DIR=/full "$TEST_IMAGE"
+wait_for_log "no jobs" 30 || fail "full: avet never reported an idle scan"
+docker exec "$AVET_CID" sh -c 'dd if=/dev/zero of=/full/filler bs=1024 count=$(( $(df -k /full | awk "NR == 2 { print \$4 }") - 64 )) 2>/dev/null'
+cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+wait_for_log "is the disk full?" 120 || fail "full: no chunk ran out of space"
+docker exec "$AVET_CID" rm /full/filler
+wait_for_log "[test] done" 120 || fail "full: the job did not finish once there was space"
+docker exec "$AVET_CID" cat /full/test.mkv > "$O/test.mkv"
+kill_avet
+assert_log_not_contains "could not write failure marker"
+assert_log_not_contains "source kept"
+assert_video_frames     "$O/test.mkv" 240
+assert_file_exists      "$I/processed/test.mkv"
+
 # started with nohup, a hangup leaves avet running
 setup nohup
-AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" --user "$(id -u):$(id -g)" \
-    -v "$I:/input:z" -v "$O:/output:z" -e POLL_INTERVAL=2 -e RUST_LOG=debug --entrypoint nohup "$TEST_IMAGE" avet)
+start_avet "$I" "$O" 2 --entrypoint nohup "$TEST_IMAGE" avet
 wait_for_log "no jobs" 30 || fail "nohup: avet never reported an idle scan"
 docker kill --signal=HUP "$AVET_CID" >/dev/null 2>&1
 sleep 5
@@ -199,8 +226,8 @@ stop_avet 20
 [ "$AVET_RC" = 0 ] || fail "nohup: avet did not stop on SIGTERM (rc $AVET_RC)"
 
 # avet refuses at the start what would run it on the wrong folders
-start_once() { # DOCKER_ARGS...: until avet exits on its own, at most 10 s
-    AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" --user "$(id -u):$(id -g)" "$@")
+start_once() { # DOCKER_ARG... IMAGE [ARG...]: until avet exits on its own, at most 10 s
+    start_avet "$I" "$O" 2 "$@"
     waited=0
     while [ "$(docker inspect -f '{{.State.Running}}' "$AVET_CID" 2>/dev/null)" = true ] && [ "$waited" -lt 10 ]; do
         sleep 1
@@ -209,16 +236,16 @@ start_once() { # DOCKER_ARGS...: until avet exits on its own, at most 10 s
     stop_avet 20
 }
 setup nested
-start_once -v "$I:/input:z" -e OUTPUT_DIR=/input/p/out "$TEST_IMAGE"
+start_once -e OUTPUT_DIR=/input/p/out "$TEST_IMAGE"
 [ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "nested: avet started anyway (rc $AVET_RC)"
 assert_log_contains "is inside INPUT_DIR"
 [ -e "$I/p/out" ] && fail "nested: the refused output folder was created"
-start_once --entrypoint avet "$TEST_IMAGE" --help-me
+start_once "$TEST_IMAGE" --help-me
 [ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "argument: avet started anyway (rc $AVET_RC)"
 assert_log_contains "takes no argument other than --version or --help, got: --help-me"
-start_once --entrypoint avet "$TEST_IMAGE" --version --version
+start_once "$TEST_IMAGE" --version --version
 [ "$AVET_RC" != 0 ] && [ "$AVET_RC" != 124 ] || fail "two arguments: avet took them (rc $AVET_RC)"
-start_once --entrypoint avet "$TEST_IMAGE" --help
+start_once "$TEST_IMAGE" --help
 [ "$AVET_RC" = 0 ] || fail "--help: exited with $AVET_RC"
 assert_log_contains "usage: avet [--version | --help]"
 

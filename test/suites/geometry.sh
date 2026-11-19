@@ -28,6 +28,16 @@ encode pixcrop_odd_crop pattern_pixcrop_odd.mkv 'crop = true'
 assert_log_contains "auto-crop: detected crop=480:274:72:8"
 assert_stream_value "$O/test.mkv" v:0 stream=width,height "480 274"
 
+# an interlaced picture a container crops from row 2 starts two rows further in, never on a hidden row
+I="$WORKDIR/interlaced_pixcrop/in"; O="$WORKDIR/interlaced_pixcrop/out"; mkdir -p "$I/p" "$O"
+mkvmerge -q -o "$WORKDIR/interlaced_pixcrop.mkv" --cropping 0:0,2,0,2 "$FIXTURES_DIR/pattern_interlaced.mkv"
+cp "$WORKDIR/interlaced_pixcrop.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 8\ncrf = 40\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 180 || fail "interlaced_pixcrop: no output"
+assert_log_contains "interlaced, top field first"
+assert_stream_value "$O/test.mkv" v:0 stream=width,height "320 174"
+assert_frames_match "$O/test.mkv" "$WORKDIR/interlaced_pixcrop.mkv" "crop=320:174:0:2,bwdif=mode=send_frame:parity=tff:deint=all"
+
 # crop, then scale what is left
 encode crop_scale pattern_bars.mkv 'crop = true\nscale = 138'
 # Downscaled chroma planes cost a few dB, still twice what a shifted frame reaches.

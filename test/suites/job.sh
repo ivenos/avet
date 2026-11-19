@@ -250,21 +250,22 @@ assert_file_not_exists "$I/p/test.mkv"
 assert_dir_not_exists  "$O/.avet_test"
 
 I="$WORKDIR/18/in"; O="$WORKDIR/18/out"; mkdir -p "$I/p" "$I/processed" "$O" "$WORKDIR/18/processed"
-cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+long=$(printf '%0250d' 0 | tr 0 x)
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/$long.mkv"
 printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
 TEST_PROCESSED="$WORKDIR/18/processed"
 chmod 555 "$I/p"
-run_avet "$I" "$O" "$O/test.mkv" 120 || fail "archive mount: no output"
+run_avet "$I" "$O" "$O/$long.mkv" 120 || fail "archive mount: no output"
 chmod 755 "$I/p"
 assert_log_contains    "remove the original after copying it"
-assert_file_exists     "$I/p/test.mkv"
-assert_file_not_exists "$TEST_PROCESSED/test.mkv"
+assert_file_exists     "$I/p/$long.mkv"
+assert_file_not_exists "$TEST_PROCESSED/$long.mkv"
 TEST_RUST_LOG=debug start_avet "$I" "$O"
 wait_for_log "no jobs" 30 || fail "archive mount: the source was not archived"
 kill_avet
-assert_same_bytes      "$TEST_PROCESSED/test.mkv" "$FIXTURES_DIR/sdr_simple.mkv"
-assert_file_not_exists "$I/p/test.mkv"
-assert_dir_not_exists  "$O/.avet_test"
+assert_same_bytes      "$TEST_PROCESSED/$long.mkv" "$FIXTURES_DIR/sdr_simple.mkv"
+assert_file_not_exists "$I/p/$long.mkv"
+[ -z "$(find "$O" -maxdepth 1 -name '.avet_*')" ] || fail "archive mount: the temp dir was left behind"
 unset TEST_PROCESSED
 
 # an option the encoder refuses fails the job behind the scale filter as well
@@ -274,5 +275,22 @@ printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\nfilm-grain = 99\n[av
 run_avet_timed "$I" "$O" 60 "job failed"
 assert_file_exists     "$O/.avet_test/.failed"
 assert_file_not_exists "$O/test.mkv"
+
+# a source whose name is taken in processed/ is archived under a number, and the log says so
+I="$WORKDIR/20/in"; O="$WORKDIR/20/out"; mkdir -p "$I/p" "$I/processed" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'earlier\n' > "$I/processed/test.mkv"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "archive name taken: no output"
+assert_same_bytes   "$I/processed/test.2.mkv" "$FIXTURES_DIR/sdr_simple.mkv"
+assert_log_contains "[test] archived as /input/processed/test.2.mkv, the name was taken"
+
+# a source named outside ASCII
+I="$WORKDIR/21/in"; O="$WORKDIR/21/out"; mkdir -p "$I/p" "$O"
+name="Die Brücke 進撃"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/$name.mkv"
+printf '[avet]\nvideo = "copy"\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/$name.mkv" 120 || fail "non-ASCII name: no output"
+assert_file_exists "$I/processed/$name.mkv"
 
 test_done

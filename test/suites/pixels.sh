@@ -76,6 +76,12 @@ encode interlaced_bgr0 pattern_interlaced_bgr0.mkv
 assert_log_contains "interlaced, top field first"
 assert_frames_match "$O/test.mkv" "$SRC" "format=yuv444p,bwdif=mode=send_frame:parity=tff:deint=all" 30
 
+# an interlace check that cannot be saved still deinterlaces
+mkdir -p "$WORKDIR/interlace_cache_dir/out/.avet_test/interlace.cache"
+encode interlace_cache_dir pattern_interlaced.mkv
+assert_log_contains "could not write interlace cache"
+assert_frames_match "$O/test.mkv" "$SRC" "bwdif=mode=send_frame:parity=tff:deint=all"
+
 # bit_depth converts without touching the picture
 encode up8to10 pattern.mkv 'bit_depth = 10'
 assert_video_pix_fmt "$O/test.mkv" yuv420p10le

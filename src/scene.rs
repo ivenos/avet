@@ -13,6 +13,7 @@ pub fn detect(
     cfg: &SceneDetectionConfig,
     vf_filter: Option<&str>,
     fps: f64,
+    stem: &str,
 ) -> Result<Vec<SceneEntry>> {
     let actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
 
@@ -55,6 +56,7 @@ pub fn detect(
         Ok(d) => d,
         Err(e) => return abort(ffmpeg, stderr_handle, e),
     };
+    tracing::info!("[{stem}] scene detection on {}x{}", y4m_dec.get_width(), y4m_dec.get_height());
     let decoder_impl = av_decoders::DecoderImpl::Y4m(y4m_dec);
     let mut decoder = match av_decoders::Decoder::from_decoder_impl(decoder_impl)
         .context("create decoder")
@@ -97,7 +99,7 @@ pub fn detect(
         return Err(crate::ext::tool_error("ffmpeg during scene detection", status, &ffmpeg_stderr));
     }
     if !ffmpeg_stderr.is_empty() {
-        tracing::warn!("ffmpeg scene detection: {}", crate::ext::tail(&ffmpeg_stderr, 20));
+        tracing::warn!("[{stem}] ffmpeg scene detection: {}", crate::ext::tail(&ffmpeg_stderr, 20));
     }
 
     let scenes = build_scene_entries(&results.scene_changes, results.frame_count.max(1));
@@ -129,7 +131,6 @@ fn apply_extra_split(scenes: Vec<SceneEntry>, max_frames: usize) -> Vec<SceneEnt
         } else {
             let n_parts = len.div_ceil(max_frames);
             let part_size = len / n_parts;
-            // The remainder goes one frame per part, or the last part would exceed max_frames.
             let long_parts = len % n_parts;
             let mut start = scene.start_frame;
             for i in 0..n_parts {

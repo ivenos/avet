@@ -36,6 +36,12 @@ tool ffmpeg -nostdin -hide_banner -loglevel error -y -i "$W/src.mkv" -map 0:v:0 
 tool mkvmerge --ui-language en_US -o /dev/full "$W/src.mkv" 2>&1 | grep -q 'No space left' || \
     fail "mkvmerge: no 'No space left' on a full disk"
 
+# ffprobe: a TS stream it has read no packet of has no type until avet probes deeper
+types() { ffprobe -v error "$@" -show_entries stream=index,codec_type -of csv=p=0 "$FIXTURES_DIR/audio_late_latm.ts" | grep , | sort -u | cut -d, -f2 | sort | tr '\n' ' '; }
+[ "$(types)" = "audio unknown video " ] || fail "ffprobe: the late LATM stream has the types '$(types)', expected 'audio unknown video '"
+[ "$(types -analyzeduration 300M -probesize 1G -fflags +nobuffer)" = "audio audio video " ] || \
+    fail "ffprobe: the deeper probe gives the types '$(types -analyzeduration 300M -probesize 1G -fflags +nobuffer)', expected 'audio audio video '"
+
 # FFVship: the device list and its own verdict on a device
 gpus=$(tool FFVship --list-gpu 2>&1)
 printf '%s\n' "$gpus" | grep -qE '^GPU [0-9]+: .+' || fail "FFVship --list-gpu: no 'GPU <n>: <name>' line in: $gpus"
@@ -86,6 +92,7 @@ got=$(docker exec -e VK_DRIVER_FILES=/nonexistent.json -e VK_ICD_FILENAMES=/none
 for type in OutOfVRAM OutOfRAM InternalError DeviceCountError NoDeviceDetected BadDeviceArgument BadDeviceCode; do
     tool grep -qaF "$type: " /usr/local/lib/libvship.so || fail "libvship: no error type $type"
 done
+tool grep -qaF "Pinned buffer allocation failed" /usr/local/bin/FFVship || fail "FFVship: no message about a failed pinned buffer"
 
 # vmaf: the three CAMBI scores per frame, the encode's own under a name that takes the options
 $FF -i "$W/SvtAv1EncApp.ivf" -pix_fmt yuv420p -f yuv4mpegpipe "$W/enc.y4m"

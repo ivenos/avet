@@ -156,7 +156,6 @@ impl CrfCache {
         }
     }
 
-    /// Solved and scored by its probes, but the finished chunk not yet measured.
     pub fn unmeasured(&self, chunk_key: &str) -> bool {
         matches!(self.state.lock().unwrap().get(chunk_key), Some(Solved::Scored { measured: None, .. }))
     }

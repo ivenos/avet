@@ -14,14 +14,23 @@ pub fn detect(
 ) -> Result<Option<String>> {
     // Read as "no black bars", an unreadable cache would change the fingerprint and discard the chunks.
     match std::fs::read_to_string(cache_path) {
+        Ok(cached) if cached.trim().is_empty() => {
+            tracing::info!("[{stem}] auto-crop: no black bars (cached)");
+            return Ok(None);
+        }
         Ok(cached) => {
-            let cached = cached.trim().to_string();
-            if cached.is_empty() {
-                tracing::info!("[{stem}] auto-crop: no black bars (cached)");
-            } else {
-                tracing::info!("[{stem}] auto-crop: {cached} (cached)");
+            let inside_visible = |c: Crop| {
+                let inner = Crop { x: c.x.checked_sub(visible.x)?, y: c.y.checked_sub(visible.y)?, ..c };
+                (inner.normalized(visible.w, visible.h) == Some(inner)).then_some(c)
+            };
+            if let Some(c) = Crop::from_str(cached.trim()).and_then(inside_visible) {
+                tracing::info!("[{stem}] auto-crop: {} (cached)", c.to_filter());
+                return Ok(Some(c.to_filter()));
             }
-            return Ok(if cached.is_empty() { None } else { Some(cached) });
+            tracing::warn!(
+                "[{stem}] auto-crop: {} holds no crop of this source ({:?}) - measuring again",
+                cache_path.display(), cached.trim()
+            );
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("[{stem}] auto-crop: cannot read {} ({e}) - measuring again", cache_path.display()),
@@ -67,7 +76,6 @@ pub fn detect(
         if failed > 0 {
             bail!("auto-crop: all {failed} cropdetect samples failed");
         }
-        // Nothing was measured, so there is nothing worth caching either.
         tracing::warn!("[{stem}] auto-crop: no sample produced a crop box - leaving the video as it is");
         return Ok(None);
     }
@@ -206,17 +214,34 @@ mod tests {
     }
 
     #[test]
-    fn a_box_that_is_not_centered_is_a_lit_scene_and_not_a_bar() {
-        let crop = |w, h, x, y| Some(Crop { w, h, x, y });
+    fn only_a_box_inside_the_visible_picture_is_taken_from_the_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cache = dir.path().join("crop.cache");
+        let visible = Crop { w: 640, h: 276, x: 0, y: 8 };
+        let cached = |text: &str| {
+            std::fs::write(&cache, text).unwrap();
+            detect(Path::new("/nonexistent/film.mkv"), 60.0, &cache, "film", visible)
+        };
 
-        // Both are large enough to clear the area check on their own.
+        assert_eq!(cached("crop=480:276:72:8\n").unwrap().as_deref(), Some("crop=480:276:72:8"));
+        assert_eq!(cached("crop=640:276:0:8").unwrap().as_deref(), Some("crop=640:276:0:8"));
+        for text in ["crop=640:276", "garbage", "crop=640:296:0:0", "crop=640:276:0:10", "crop=480:276:73:8"] {
+            assert!(cached(text).is_err(), "{text:?} was taken as the crop");
+        }
+    }
+
+    #[test]
+    fn a_box_off_center_is_a_lit_scene_even_when_large_enough_for_the_area_check() {
+        let crop = |w, h, x, y| Some(Crop { w, h, x, y });
         assert_eq!(classify(crop(1400, 700, 100, 50), 1920, 1080), (None, false));
         assert_eq!(classify(crop(1500, 1080, 420, 0), 1920, 1080), (None, false));
+    }
 
-        // Bars a few lines apart are still bars, which pattern_bars.mkv relies on.
+    #[test]
+    fn bars_a_few_lines_apart_like_pattern_bars_mkv_and_a_centered_windowbox_are_bars() {
+        let crop = |w, h, x, y| Some(Crop { w, h, x, y });
         assert_eq!(classify(crop(640, 276, 0, 44), 640, 360), (crop(640, 276, 0, 44), true));
         assert_eq!(classify(crop(1920, 800, 0, 140), 1920, 1080), (crop(1920, 800, 0, 140), true));
-        // Windowboxed: both axes cut, both roughly centered.
         assert_eq!(classify(crop(1440, 800, 240, 140), 1920, 1080), (crop(1440, 800, 240, 140), true));
     }
 }

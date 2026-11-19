@@ -7,19 +7,31 @@ All notable changes to this project are documented in this file, in the format o
 ### Breaking changes
 
 - avet no longer starts when it is given an argument it does not know.
+- avet refuses to start with its output folder inside the input folder.
+- `encode.toml` values the editor marks as wrong, such as the bitrate `+192k`, are refused.
 
 ### Added
 
 - `[target_quality]` works together with `avet.scale`.
 - Editors can suggest and check the settings in `encode.toml`.
 - avet logs a hint for a folder that holds videos but no `encode.toml`.
+- The log names the audio and subtitle tracks the language filter leaves out.
+- avet warns about an `encode.toml` in a folder inside a profile, which it ignores.
+- avet warns when HDR video is encoded at 8 bits.
+- The log says when a source is archived under a new name.
+- `LOG_NAME_LENGTH` shortens long file names in the log.
+- The Docker image uses NVIDIA graphics cards for target quality.
+- The log says how many chunks were already done when a job resumes.
+- avet warns about a stream in a TS recording it cannot identify.
 
 ### Changed
 
-- avet refuses to start with its output folder inside the input folder.
+- The Docker image is based on Ubuntu instead of Alpine.
 - Started with `nohup`, avet keeps running when the terminal closes.
-- The warning about a language filter that keeps no track names the file and the languages it has.
-- `encode.toml` values the editor marks as wrong, such as the bitrate `+192k`, are refused.
+- The warning about a language filter that keeps no track names the file and its languages.
+- Warnings about individual audio and subtitle tracks name the file.
+- The log mentions a bit-depth or chroma conversion once per file instead of once per chunk.
+- When no probe meets every target, target quality takes the one that looks best within the size limit.
 - The log no longer says that a typo in `encode.toml` clears on its own.
 
 ### Fixed
@@ -27,11 +39,13 @@ All notable changes to this project are documented in this file, in the format o
 - avet no longer hangs when the encoder stops while scaling or deinterlacing.
 - HLG from TV broadcasts stays HLG instead of turning into SDR.
 - Colors of 4:2:2 sources no longer sit half a line off.
-- A picture the file crops by an odd number of lines no longer shows a hidden line.
+- An odd crop set in the file no longer shows a hidden line.
+- A very large `POLL_INTERVAL` no longer crashes avet.
+- A job no longer fails when avet cannot save its interlace check.
 - Sources with very long names are archived.
 - A stop signal ends avet at once while a file is still being copied in.
 - Audio and subtitle tracks tagged with a two-letter language such as `en` pass the language filter.
-- An audio track that starts late in a TS recording is kept.
+- An audio track that starts within the first 5 minutes of a TS recording is kept.
 - Target quality no longer reports a missed quality floor when only the size limit is missed.
 - Target quality also scores the finished chunks of cropped HD videos without color tags.
 - Target quality scores a chunk that was finished right before a stop.
@@ -39,7 +53,17 @@ All notable changes to this project are documented in this file, in the format o
 - Mirrored videos no longer play upside down or the wrong way round.
 - A failure avet cannot record is no longer retried on every scan.
 - The output no longer gets wrong track flags when reading them is interrupted.
-- Target quality says when it ran out of probes instead of blaming the floor or the size limit.
+- Target quality no longer blames a limit when it ran out of probes.
+- TV recordings that start between key frames keep their HDR10 and HDR10+ details.
+- HDR10 videos whose file leaves out the color primaries keep BT.2020.
+- Interlaced videos whose file crops the top no longer show the hidden rows.
+- avet measures the crop again when its saved result is damaged.
+- A tool that crashes without a message now says how it ended.
+- The audio plan in the log names each track's own channel layout.
+- The log no longer reports an automatic keyframe interval that `keyint` in `[encoder_params]` overrides.
+- Files with non-ASCII names work when avet runs without a UTF-8 locale.
+- HDR videos whose file claims SDR colors keep the colors of their video stream.
+- A track titled with just its codec name, such as `AAC`, no longer becomes `AAC (AAC)`.
 
 ### Dependencies
 

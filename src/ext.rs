@@ -53,7 +53,6 @@ pub fn spawn(cmd: &mut Command, what: &str) -> Result<Child> {
     cmd.spawn().with_context(|| format!("start {what}")).context(crate::job::Transient)
 }
 
-/// Kills the command if it overruns.
 pub fn output_with_timeout(cmd: &mut Command, secs: u64, what: &str) -> Result<Output> {
     let mut child = spawn(cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()), what)?;
     let stdout = drain(child.stdout.take());
@@ -134,7 +133,7 @@ fn wait_briefly(child: &mut std::process::Child) -> bool {
 /// The error for a tool that ran and failed. A tool stopped from outside (the OOM killer,
 /// Ctrl-C) and a full disk both clear on their own; a tool that crashed does not.
 pub fn tool_error(what: &str, status: std::process::ExitStatus, message: &str) -> anyhow::Error {
-    let err = anyhow::anyhow!("{what} failed:\n{}", tail(message, 40));
+    let err = anyhow::anyhow!("{what} failed ({status}):\n{}", tail(message, 40));
     if stopped_from_outside(status) {
         err.context(crate::job::Killed).context(crate::job::Transient)
     } else if out_of_space(message) {
@@ -157,10 +156,10 @@ fn out_of_space(message: &str) -> bool {
         .any(|m| message.contains(m))
 }
 
-/// mkvmerge words its messages in the user's language otherwise, and avet reads some of them.
+/// mkvmerge otherwise words its messages in the user's language, and under a locale without UTF-8 drops the non-ASCII bytes of its arguments.
 pub fn mkvmerge() -> Command {
     let mut cmd = Command::new(external_bin("mkvmerge"));
-    cmd.args(["--ui-language", "en_US"]);
+    cmd.env("LC_ALL", "C.UTF-8").args(["--ui-language", "en_US"]);
     cmd
 }
 
@@ -267,6 +266,17 @@ mod tests {
         let killed = tool_error("SvtAv1EncApp", std::process::ExitStatus::from_raw(9), "");
         assert!(killed.downcast_ref::<crate::job::Transient>().is_some(), "got: {killed:#}");
         assert!(killed.context("chunk 00007").downcast_ref::<crate::job::Killed>().is_some());
+    }
+
+    #[test]
+    fn a_tool_that_dies_without_a_word_is_reported_with_its_exit_status() {
+        let out = output_with_timeout(Command::new("sh").args(["-c", "kill -SEGV $$"]), 30, "sh").unwrap();
+        let crashed = format!("{:#}", tool_error("FFVship", out.status, ""));
+        assert!(crashed.starts_with("FFVship failed (signal: 11 (SIGSEGV)"), "got: {crashed}");
+
+        let out = output_with_timeout(Command::new("sh").args(["-c", "exit 3"]), 30, "sh").unwrap();
+        let exited = format!("{:#}", tool_error("ffmpeg", out.status, ""));
+        assert!(exited.starts_with("ffmpeg failed (exit status: 3)"), "got: {exited}");
     }
 
     #[test]

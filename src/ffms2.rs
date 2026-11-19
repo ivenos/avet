@@ -167,7 +167,7 @@ unsafe extern "C" {
 }
 
 struct ErrorInfo {
-    _buf: Box<[c_char; FFMS_ERROR_BUFFER_SIZE]>,
+    buf: Box<[c_char; FFMS_ERROR_BUFFER_SIZE]>,
     pub raw: RawErrorInfo,
 }
 
@@ -180,12 +180,12 @@ impl ErrorInfo {
             buffer_size: FFMS_ERROR_BUFFER_SIZE as c_int,
             buffer: buf.as_mut_ptr(),
         };
-        ErrorInfo { _buf: buf, raw }
+        ErrorInfo { buf, raw }
     }
 
     fn message(&self) -> String {
         let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(self._buf.as_ptr() as *const u8, FFMS_ERROR_BUFFER_SIZE)
+            std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, FFMS_ERROR_BUFFER_SIZE)
         };
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..end]).to_string()
@@ -204,7 +204,7 @@ unsafe fn side_data(ptr: *const u8, size: c_int) -> Option<Vec<u8>> {
 }
 
 pub fn get_pixel_format(name: &str) -> c_int {
-    let cname = CString::new(name).unwrap();
+    let Ok(cname) = CString::new(name) else { return -1 };
     unsafe { FFMS_GetPixFmt(cname.as_ptr()) }
 }
 
@@ -419,9 +419,9 @@ impl PixelFormat {
     }
 }
 
-fn pixfmt_for(sub: PixelSubsampling, depth: u8) -> Option<c_int> {
+pub fn pixfmt_name(sub: PixelSubsampling, depth: u8) -> Option<&'static str> {
     use PixelSubsampling::*;
-    let name = match (sub, depth) {
+    Some(match (sub, depth) {
         (Yuv420,  8) => "yuv420p",
         (Yuv420, 10) => "yuv420p10le",
         (Yuv422,  8) => "yuv422p",
@@ -429,8 +429,30 @@ fn pixfmt_for(sub: PixelSubsampling, depth: u8) -> Option<c_int> {
         (Yuv444,  8) => "yuv444p",
         (Yuv444, 10) => "yuv444p10le",
         _ => return None,
-    };
-    Some(get_pixel_format(name))
+    })
+}
+
+fn pixfmt_for(sub: PixelSubsampling, depth: u8) -> Option<c_int> {
+    pixfmt_name(sub, depth).map(get_pixel_format)
+}
+
+/// SVT-AV1 accepts only 8/10-bit 4:2:0.
+fn output_shape(decoded: &PixelFormat, opts: OpenOpts) -> (u8, PixelSubsampling) {
+    let depth = opts.target_bit_depth.unwrap_or(decoded.bit_depth.min(10) as u8);
+    let subsampling = if opts.keep_subsampling { decoded.subsampling } else { PixelSubsampling::Yuv420 };
+    (depth, subsampling)
+}
+
+pub fn conversion_notes(decoded: &PixelFormat, target_bit_depth: Option<u8>) -> Vec<String> {
+    let (depth, subsampling) = output_shape(decoded, OpenOpts { target_bit_depth, keep_subsampling: false });
+    let mut notes = Vec::new();
+    if u32::from(depth) != decoded.bit_depth {
+        notes.push(format!("bit-depth conversion: {}-bit to {depth}-bit", decoded.bit_depth));
+    }
+    if decoded.subsampling != subsampling {
+        notes.push(format!("chroma conversion: {:?} to {subsampling:?}", decoded.subsampling));
+    }
+    notes
 }
 
 #[repr(C)]
@@ -519,9 +541,14 @@ fn pixel_layout(pix_fmt: c_int) -> Option<PixelLayout> {
 fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
     use PixelSubsampling::*;
 
+    let converted = |subsampling, bit_depth: u8| PixelFormat {
+        pix_fmt: pixfmt_for(subsampling, bit_depth).expect("pixfmt_for names every subsampling at 8 and 10 bits"),
+        bit_depth: u32::from(bit_depth),
+        subsampling,
+    };
     let Some(layout) = pixel_layout(pix_fmt) else {
         tracing::warn!("unrecognized FFMS pixel format {pix_fmt} - converting it to 10-bit 4:2:0");
-        return PixelFormat { pix_fmt: get_pixel_format("yuv420p10le"), bit_depth: 10, subsampling: Yuv420 };
+        return converted(Yuv420, 10);
     };
     let subsampling = match (layout.log2_chroma_w, layout.log2_chroma_h) {
         _ if layout.components < 3 => Yuv420,
@@ -535,16 +562,7 @@ fn detect_pixel_format(pix_fmt: c_int) -> PixelFormat {
     }
     // A real format, not the source's own: FFMS2 skips the conversion for a target it
     // already has, and the Y4M header would describe a layout the data does not have.
-    let bit_depth = if layout.depth > 8 { 10 } else { 8 };
-    let target = match (subsampling, bit_depth) {
-        (Yuv420, 8) => "yuv420p",
-        (Yuv420, _) => "yuv420p10le",
-        (Yuv422, 8) => "yuv422p",
-        (Yuv422, _) => "yuv422p10le",
-        (Yuv444, 8) => "yuv444p",
-        (Yuv444, _) => "yuv444p10le",
-    };
-    PixelFormat { pix_fmt: get_pixel_format(target), bit_depth, subsampling }
+    converted(subsampling, if layout.depth > 8 { 10 } else { 8 })
 }
 
 struct Index(*mut FFMS_Index);
@@ -600,6 +618,7 @@ pub struct VideoInfo {
 pub struct VideoSource {
     ptr: *mut FFMS_VideoSource,
     pub info: VideoInfo,
+    pub decoded: PixelFormat,
 }
 
 // FFMS2 is not thread-safe; each worker owns its own VideoSource on its own thread.
@@ -644,31 +663,17 @@ impl VideoSource {
             bail!("FFMS_GetFrame(0) failed: {}", ei2.message());
         }
         let raw_pix_fmt = unsafe { (*first_frame).encoded_pixel_format };
-        let mut pixel_format = detect_pixel_format(raw_pix_fmt);
+        let decoded = detect_pixel_format(raw_pix_fmt);
+        let mut pixel_format = decoded;
 
-        // Native resolution only; scaling happens later in the encode pipe (crop before scale).
         let out_w = unsafe { (*first_frame).encoded_width };
         let out_h = unsafe { (*first_frame).encoded_height };
         let resizer = FFMS_RESIZER_BICUBIC;
 
-        // SVT-AV1 accepts only 8/10-bit 4:2:0, so deeper and wider sources are converted.
-        let target_depth = opts.target_bit_depth
-            .or((pixel_format.bit_depth > 10).then_some(10u8));
-        let depth = target_depth.unwrap_or(pixel_format.bit_depth.min(10) as u8);
-
-        let subsampling = if opts.keep_subsampling { pixel_format.subsampling } else { PixelSubsampling::Yuv420 };
+        let (depth, subsampling) = output_shape(&decoded, opts);
         if depth as u32 != pixel_format.bit_depth || pixel_format.subsampling != subsampling {
             match pixfmt_for(subsampling, depth) {
                 Some(pf) => {
-                    if depth as u32 != pixel_format.bit_depth {
-                        tracing::info!(
-                            "bit-depth conversion: {}-bit to {}-bit",
-                            pixel_format.bit_depth, depth
-                        );
-                    }
-                    if pixel_format.subsampling != subsampling {
-                        tracing::info!("chroma conversion: {:?} to {subsampling:?}", pixel_format.subsampling);
-                    }
                     pixel_format = PixelFormat { pix_fmt: pf, bit_depth: depth as u32, subsampling };
                 }
                 None => {
@@ -713,7 +718,7 @@ impl VideoSource {
             orientation: Orientation::from_ffms2(props.flip, props.rotation),
         };
 
-        Ok(VideoSource { ptr, info })
+        Ok(VideoSource { ptr, info, decoded })
     }
 
     /// Milliseconds per frame, indexed like `FFMS_GetFrame`.
@@ -870,6 +875,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_conversions_are_named_by_what_reaches_the_encoder() {
+        use PixelSubsampling::*;
+        let decoded = |bit_depth, subsampling| PixelFormat { pix_fmt: 0, bit_depth, subsampling };
+        assert_eq!(conversion_notes(&decoded(12, Yuv422), None), ["bit-depth conversion: 12-bit to 10-bit", "chroma conversion: Yuv422 to Yuv420"]);
+        assert_eq!(conversion_notes(&decoded(8, Yuv420), Some(10)), ["bit-depth conversion: 8-bit to 10-bit"]);
+        assert_eq!(conversion_notes(&decoded(10, Yuv444), Some(8)), ["bit-depth conversion: 10-bit to 8-bit", "chroma conversion: Yuv444 to Yuv420"]);
+        assert!(conversion_notes(&decoded(8, Yuv420), None).is_empty());
+        assert!(conversion_notes(&decoded(10, Yuv420), Some(10)).is_empty());
+    }
+
+    #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_frame_struct_is_laid_out_like_ffms_h() {
         use std::mem::{offset_of, size_of};
@@ -919,6 +935,12 @@ mod tests {
 
         let unknown = detect_pixel_format(-1);
         assert_eq!((unknown.pix_fmt, unknown.bit_depth), (get_pixel_format("yuv420p10le"), 10));
+    }
+
+    #[test]
+    fn a_format_name_with_a_nul_is_no_format() {
+        assert_eq!(get_pixel_format("yuv420p\0"), -1);
+        assert_eq!(pixel_layout_of("yuv\0420p"), None);
     }
 
     #[test]

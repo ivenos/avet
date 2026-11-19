@@ -82,7 +82,7 @@ Reopen one of these with a case it gets wrong, not with a preference.
 - `target_quality.tolerance` defaults to 0.05.
 - Profile folders with a leading dot are scanned, folders with a dot inside a profile are not.
 - FFMS2 stays on its release tag plus the patch, not on a commit of its master.
-- MKVToolNix in the AppImage comes from mkvtoolnix.download, not from the runner's Ubuntu.
+- MKVToolNix in the image and the AppImage comes from mkvtoolnix.download, not from Ubuntu.
 - Renovate merges on its own only the actions listed in `.github/renovate.json` and minor and patch updates of crates.
 
 ## Commits
@@ -120,9 +120,9 @@ Fixed
 ## Dependencies
 
 - `Cargo.lock` is committed and CI builds with `--locked`.
-- The pinned sources (SVT-AV1, SVT-AV1-HDR, FFMS2, Vship, libvmaf, Rust) are set in both the `Dockerfile` and `.github/workflows/appimage.yml`; change them together. `RUST_VERSION` is in `.github/workflows/build-publish.yml` as well.
+- The pinned sources (SVT-AV1, SVT-AV1-HDR, FFMS2, FFmpeg, MKVToolNix, Vship, libvmaf, Rust) are set in both the `Dockerfile` and `.github/workflows/appimage.yml`; change them together. `RUST_VERSION` is in `.github/workflows/build-publish.yml` as well.
 - Both apply `packaging/ffms2-frame-hdr-metadata.patch` to FFMS2.
-- FFmpeg and MKVToolNix in `appimage.yml` follow the image's Alpine versions and are bumped by hand.
+- The Ubuntu base image is bumped by hand.
 - CI fails while one of these versions differs between the image and the AppImage.
 - GitHub Actions and base images stay on version tags, never commit SHAs or digests.
 - Pinned sources use release tags. Only a rolling-release source such as SVT-AV1-HDR pins a commit.

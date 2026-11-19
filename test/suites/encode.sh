@@ -16,7 +16,7 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "codec: no output"
 assert_video_codec "$O/test.mkv" av1
 assert_stream_value "$O/test.mkv" v:0 stream_disposition=default:stream_tags=language "1 jpn"
 
-# manual keyint in encoder_params: auto-keyint logged but not injected
+# manual keyint in encoder_params wins over auto-keyint, which the log leaves out
 I="$WORKDIR/2/in"; O="$WORKDIR/2/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
 cat > "$I/p/encode.toml" << 'EOF'
@@ -29,7 +29,7 @@ keyint = 240
 keyint = true
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "keyint override: no output"
-assert_log_contains     "auto-keyint"
+assert_log_not_contains "auto-keyint"
 assert_log_contains     "keyint=240"
 assert_log_not_contains "keyint=120"
 
@@ -88,10 +88,13 @@ preset = 12
 crf    = 50
 [avet]
 bit_depth = 10
+[scene_detection]
+extra_split = 24
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bit_depth 8 to 10: no output"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p10le"
-assert_log_contains  "bit-depth conversion: 8-bit to 10-bit"
+assert_log_contains  "[test] bit-depth conversion: 8-bit to 10-bit"
+[ "$(printf '%s\n' "$RUN_LOGS" | grep -c 'bit-depth conversion')" = 1 ] || fail "bit_depth 8 to 10: the conversion is not logged once per file"
 
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/hdr10.mkv" "$I/p/test.mkv"

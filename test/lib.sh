@@ -153,19 +153,23 @@ run_avet_timed() { # INPUT OUTPUT WAIT_S LOG_PATTERN
 }
 
 # Leaves avet running under AVET_CID, for a test that acts on a live daemon.
-start_avet() { # INPUT OUTPUT [POLL_INTERVAL]
+start_avet() { # INPUT OUTPUT [POLL_INTERVAL [DOCKER_ARG... IMAGE [ARG...]]]
     RUN_LOGS=""
+    local input="$1" output="$2" poll="${3:-2}"
+    shift 2
+    [ "$#" -eq 0 ] || shift
+    [ "$#" -gt 0 ] || set -- "$TEST_IMAGE"
     AVET_CID=$(docker run -d --label "avet-test-tools=${AVET_TEST_RUN:-$$}" \
         --user "$(id -u):$(id -g)" \
         ${TEST_CPUS:+--cpus="$TEST_CPUS"} \
         ${TEST_CPUSET:+--cpuset-cpus="$TEST_CPUSET"} \
-        -v "${1}:/input:z" \
-        -v "${2}:/output:z" \
+        -v "${input}:/input:z" \
+        -v "${output}:/output:z" \
         ${TEST_PROCESSED:+-v "${TEST_PROCESSED}:/input/processed:z"} \
-        -e POLL_INTERVAL="${3:-2}" \
+        -e POLL_INTERVAL="$poll" \
         -e "RUST_LOG=${TEST_RUST_LOG:-info}" \
         ${TEST_SOFTWARE_GPU:+-e AVET_SOFTWARE_GPU=1} \
-        "${TEST_IMAGE}")
+        "$@")
 }
 
 avet_logs() {

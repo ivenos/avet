@@ -4,33 +4,46 @@ ARG SVT_AV1_VERSION=v4.3.0
 # Rolling-release repo.
 ARG SVT_AV1_HDR_REF=0ce7e13af2396bf3bf06408a09f1138f82b01b28
 ARG FFMS2_VERSION=5.0
+ARG FFMPEG_VERSION=n8.1.3
+ARG MKVTOOLNIX_VERSION=99.0
 ARG VSHIP_VERSION=v5.1.2
 ARG VMAF_VERSION=v3.2.1
 ARG RUST_VERSION=1.100.0
 
-FROM alpine:3.24 AS base
+FROM ubuntu:24.04 AS base
 
 ARG TARGETARCH
 
 # nasm is x86-only, arm64 uses NEON.
-RUN apk add --no-cache \
-        build-base \
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
         clang \
         cmake \
         git \
         curl \
-        pkgconf \
+        ca-certificates \
+        pkg-config \
         autoconf \
         automake \
         libtool \
         meson \
-        ninja \
-        ffmpeg-dev \
-        vulkan-headers \
-        vulkan-loader-dev \
-        zlib-dev \
-        ca-certificates && \
-    if [ "$TARGETARCH" = "amd64" ]; then apk add --no-cache nasm; fi
+        ninja-build \
+        jq \
+        zlib1g-dev \
+        libbz2-dev \
+        liblzma-dev \
+        libopus-dev \
+        libmp3lame-dev \
+        libvorbis-dev \
+        libdav1d-dev \
+        libx264-dev \
+        libx265-dev \
+        libvpx-dev \
+        libsvtav1enc-dev \
+        libvulkan-dev && \
+    if [ "$TARGETARCH" = "amd64" ]; then apt-get install -y --no-install-recommends nasm; fi && \
+    rm -rf /var/lib/apt/lists/*
 
 FROM base AS svt-av1
 
@@ -69,7 +82,29 @@ RUN git clone --filter=blob:none --no-checkout \
     install -Dm644 -t /licenses/svt-av1-hdr /svt-av1-hdr/LICENSE.md /svt-av1-hdr/LICENSE-BSD2.md /svt-av1-hdr/PATENTS.md && \
     rm -rf /svt-av1-hdr
 
-FROM base AS ffms2
+# Ubuntu 24.04 ships 6.1, too old for Vship (AVCOL_SPC_YCGCO_RE).
+FROM base AS ffmpeg
+
+ARG FFMPEG_VERSION
+
+# The test suites encode their sources with x264, x265, libvpx and SVT-AV1.
+RUN git clone --depth 1 --branch ${FFMPEG_VERSION} \
+        https://github.com/FFmpeg/FFmpeg.git /ffmpeg && \
+    cd /ffmpeg && \
+    ./configure \
+        --prefix=/usr/local \
+        --enable-shared --disable-static \
+        --disable-doc --disable-ffplay \
+        --enable-gpl \
+        --enable-libopus --enable-libmp3lame --enable-libvorbis --enable-libdav1d \
+        --enable-libx264 --enable-libx265 --enable-libvpx --enable-libsvtav1 && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    install -Dm644 -t /licenses/ffmpeg LICENSE.md COPYING.GPLv2 COPYING.LGPLv2.1 && \
+    rm -rf /ffmpeg
+
+FROM ffmpeg AS ffms2
 
 ARG FFMS2_VERSION
 
@@ -84,6 +119,7 @@ RUN git clone --depth 1 --branch ${FFMS2_VERSION} \
     ./configure --prefix=/usr/local --enable-shared=yes --enable-static=no && \
     make -j$(nproc) && \
     make install && \
+    ldconfig && \
     install -Dm644 -t /licenses/ffms2 COPYING && \
     rm -rf /ffms2
 
@@ -105,7 +141,7 @@ FROM base AS vmaf
 
 ARG VMAF_VERSION
 
-# Without the VMAF models busybox xxd suffices.
+# CAMBI uses no VMAF model.
 RUN git clone --depth 1 --branch ${VMAF_VERSION} \
         https://github.com/Netflix/vmaf.git /vmaf && \
     meson setup /vmaf/libvmaf/build /vmaf/libvmaf \
@@ -124,8 +160,7 @@ FROM ffms2 AS builder
 ARG RUST_VERSION
 ARG TARGETARCH
 
-RUN apk add --no-cache jq && \
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
@@ -134,58 +169,75 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY .github/scripts/crate-licenses.sh ./
 
-ENV RUSTFLAGS="-C target-feature=-crt-static"
+# rust-lld, the default linker on x86_64, does not search /usr/local/lib.
+ENV RUSTFLAGS="-L native=/usr/local/lib"
 ARG AVET_VERSION
 # cargo compares the host's mtimes with the cached /src/target and can skip the rebuild.
 RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${TARGETARCH} \
     --mount=type=cache,target=/root/.cargo/git,id=cargo-git-${TARGETARCH} \
-    --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH} \
+    --mount=type=cache,target=/src/target,id=cargo-target-${TARGETARCH},sharing=locked \
     find src -type f -exec touch {} + && \
     cargo build --release --locked && \
     cp /src/target/release/avet /avet && \
     sh crate-licenses.sh /licenses/avet/crates
 
-FROM alpine:3.24 AS runtime
+FROM ubuntu:24.04 AS runtime
 
-ARG TARGETARCH
-# A new version invalidates the cached apk layer below.
+ARG MKVTOOLNIX_VERSION
+# A new version invalidates the cached apt layer below.
 ARG AVET_VERSION
 
-RUN apk add --no-cache \
-        ffmpeg \
-        mkvtoolnix \
-        libstdc++ \
-        libgcc \
-        vulkan-loader \
-        mesa-vulkan-swrast && \
-    if [ "$TARGETARCH" = "amd64" ]; then apk add --no-cache mesa-vulkan-intel mesa-vulkan-ati; fi
+# NVIDIA's Vulkan driver loads libEGL, libX11 and libXext from the image.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl && \
+    mkdir -p /etc/apt/keyrings && \
+    curl -fsSL -o /etc/apt/keyrings/gpg-pub-moritzbunkus.gpg https://mkvtoolnix.download/gpg-pub-moritzbunkus.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/gpg-pub-moritzbunkus.gpg] https://mkvtoolnix.download/ubuntu/ noble main" \
+        > /etc/apt/sources.list.d/mkvtoolnix.download.list && \
+    apt-get update && \
+    mkvtoolnix=$(apt-cache madison mkvtoolnix | awk -v v="$MKVTOOLNIX_VERSION" 'index($3, v "-") == 1 { print $3; exit }') && \
+    apt-get install -y --no-install-recommends \
+        "mkvtoolnix=$mkvtoolnix" \
+        libopus0 \
+        libmp3lame0 \
+        libvorbis0a \
+        libvorbisenc2 \
+        libdav1d7 \
+        libx264-164 \
+        libx265-199 \
+        libvpx9 \
+        libsvtav1enc1d1 \
+        libvulkan1 \
+        mesa-vulkan-drivers \
+        libegl1 \
+        libx11-6 \
+        libxext6 && \
+    apt-get purge -y --autoremove curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Alpine's packages carry only an SPDX identifier, so the texts come from the same release.
-RUN version() { apk list -I "$1" | sed -n "s/^$1-\([0-9.]*\)-r[0-9]* .*/\1/p"; } && \
-    ffmpeg=$(version ffmpeg) && mkvtoolnix=$(version mkvtoolnix) && \
-    mkdir -p /usr/share/licenses/ffmpeg /usr/share/licenses/mkvtoolnix && \
-    for f in LICENSE.md COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3; do \
-        wget -q -O "/usr/share/licenses/ffmpeg/$f" "https://raw.githubusercontent.com/FFmpeg/FFmpeg/n$ffmpeg/$f" || exit 1; \
-    done && \
-    wget -q -O /usr/share/licenses/mkvtoolnix/COPYING "https://codeberg.org/mbunkus/mkvtoolnix/raw/tag/release-$mkvtoolnix/COPYING"
-
+COPY --from=ffmpeg      /usr/local/bin/ffmpeg           /usr/local/bin/ffmpeg
+COPY --from=ffmpeg      /usr/local/bin/ffprobe          /usr/local/bin/ffprobe
+COPY --from=ffms2       /usr/local/lib/                 /usr/local/lib/
 COPY --from=svt-av1     /usr/local/bin/SvtAv1EncApp     /usr/local/bin/SvtAv1EncApp
 COPY --from=svt-av1-hdr /usr/local/hdr/bin/SvtAv1EncApp /usr/local/bin/SvtAv1EncApp-hdr
 COPY --from=ffms2       /usr/local/bin/ffmsindex        /usr/local/bin/ffmsindex
 COPY --from=builder     /avet                           /usr/local/bin/avet
-COPY --from=ffms2       /usr/local/lib/libffms2.so*     /usr/local/lib/
 COPY --from=vship       /usr/local/bin/FFVship          /usr/local/bin/FFVship
 COPY --from=vship       /usr/local/lib/libvship.so      /usr/local/lib/
 COPY --from=vmaf        /usr/local/bin/vmaf             /usr/local/bin/vmaf
+RUN ldconfig
 
 COPY LICENSE                                  /usr/share/licenses/avet/LICENSE
 COPY --from=builder     /licenses/avet/crates /usr/share/licenses/avet/crates
 COPY --from=svt-av1     /licenses/svt-av1     /usr/share/licenses/svt-av1
 COPY --from=svt-av1-hdr /licenses/svt-av1-hdr /usr/share/licenses/svt-av1-hdr
+COPY --from=ffmpeg      /licenses/ffmpeg      /usr/share/licenses/ffmpeg
 COPY --from=ffms2       /licenses/ffms2       /usr/share/licenses/ffms2
 COPY --from=vship       /licenses/vship       /usr/share/licenses/vship
 COPY --from=vmaf        /licenses/libvmaf     /usr/share/licenses/libvmaf
 
+# NVIDIA documents the graphics capability as required for Vulkan.
+ENV NVIDIA_DRIVER_CAPABILITIES=graphics,compute,utility
 ENV INPUT_DIR=/input
 ENV OUTPUT_DIR=/output
 ENV POLL_INTERVAL=60

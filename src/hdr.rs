@@ -17,7 +17,6 @@ pub struct HdrInfo {
     pub chroma_sample_position: Option<u32>,
     /// JPEG's siting, which AV1 cannot signal but Matroska can.
     pub chroma_center: bool,
-    /// Only set for full range. Studio is the encoder default and the common case.
     pub color_range: Option<u32>,
     pub not_yuv: bool,
     pub rgb: bool,
@@ -128,6 +127,8 @@ struct ProbeFrame {
     #[serde(default)]
     side_data_list: Vec<SideData>,
     color_transfer: Option<String>,
+    color_primaries: Option<String>,
+    color_space: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,23 +153,33 @@ struct SideData {
 }
 
 pub fn detect(source_file: &Path) -> Result<HdrInfo> {
-    let probe: ProbeOutput = crate::ext::ffprobe_json(
-        &[
-            "-v", "error",
-            "-select_streams", "v:0",
-            // A source whose first HDR10+ message sits on a later frame would read as HDR10.
-            "-read_intervals", "%+#48",
-            "-show_entries", "stream=codec_name,pix_fmt,color_primaries,color_transfer,color_space,chroma_location,color_range",
-            // Sections accumulate, so this does not replace the two around it.
-            "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
-            "-show_frames",
-            "-show_entries", "frame=side_data_list,color_transfer",
-            "-print_format", "json",
-        ],
-        source_file,
-    )
-    .context("HDR detection")?;
-    Ok(HdrInfo::from_probe(probe))
+    detect_with(|interval| {
+        crate::ext::ffprobe_json(
+            &[
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-read_intervals", interval,
+                "-show_entries", "stream=codec_name,pix_fmt,color_primaries,color_transfer,color_space,chroma_location,color_range",
+                // Sections accumulate, so this does not replace the two around it.
+                "-show_entries", "stream_side_data=dv_profile,dv_bl_signal_compatibility_id",
+                "-show_frames",
+                "-show_entries", "frame=side_data_list,color_transfer,color_primaries,color_space",
+                "-print_format", "json",
+            ],
+            source_file,
+        )
+    })
+    .context("HDR detection")
+}
+
+fn detect_with(mut probe: impl FnMut(&str) -> Result<ProbeOutput>) -> Result<HdrInfo> {
+    // A source whose first HDR10+ message sits on a later frame would read as HDR10.
+    let mut output = probe("%+#48")?;
+    // A recording joined mid-GOP decodes nothing before its first IRAP, which can be seconds in.
+    if output.frames.is_empty() {
+        output = probe("%+10")?;
+    }
+    Ok(HdrInfo::from_probe(output))
 }
 
 impl HdrInfo {
@@ -180,17 +191,27 @@ impl HdrInfo {
         let full_chroma = not_yuv || layout.is_some_and(|l| l.log2_chroma_w == 0);
         // Full-height chroma it halves between two rows, which is `left` whatever the source's siting.
         let full_height = layout.is_some_and(|l| l.log2_chroma_h == 0);
+        let first = probe.frames.first();
         // HLG for DVB and some cameras: the VUI says BT.2020 and an alternative transfer SEI says HLG.
-        let transfer = probe.frames.first()
+        let frame_transfer = first
             .and_then(|f| f.color_transfer.clone())
-            .filter(|t| t == "smpte2084" || t == "arib-std-b67")
-            .unwrap_or_else(|| stream.color_transfer.clone());
+            .filter(|t| t == "smpte2084" || t == "arib-std-b67");
+        let from_frame = frame_transfer.as_ref().is_some_and(|t| *t != stream.color_transfer);
+        let transfer = frame_transfer.unwrap_or_else(|| stream.color_transfer.clone());
+        // ffmpeg can write a Matroska Colour element that holds only the matrix and range.
+        let or_frame = |stream: &str, frame: Option<&String>| match (stream, frame) {
+            (_, Some(f)) if from_frame && !matches!(f.as_str(), "" | "unknown") => f.clone(),
+            ("" | "unknown", Some(f)) => f.clone(),
+            _ => stream.to_string(),
+        };
+        let primaries = or_frame(&stream.color_primaries, first.and_then(|f| f.color_primaries.as_ref()));
+        let matrix = or_frame(&stream.color_space, first.and_then(|f| f.color_space.as_ref()));
 
         let mut info = HdrInfo {
             codec_name: stream.codec_name.clone(),
-            color_primaries: map_color_primaries(&stream.color_primaries),
+            color_primaries: map_color_primaries(&primaries),
             transfer_characteristics: map_transfer(&transfer),
-            matrix_coefficients: map_matrix(&stream.color_space),
+            matrix_coefficients: map_matrix(&matrix),
             chroma_sample_position: match map_chroma(&stream.chroma_location) {
                 _ if full_chroma => None,
                 Some(2) if full_height => Some(1),
@@ -380,9 +401,7 @@ fn remap_active_area((left, right, top, bottom): (u16, u16, u16, u16), g: Geomet
 /// The color flags among `encoder_args` as mkvmerge options for `track`. mkvmerge takes
 /// none of them from an IVF input.
 pub fn mkvmerge_color_args(encoder_args: &[String], track: u32) -> Vec<String> {
-    let value = |flag: &str| {
-        encoder_args.chunks(2).find(|p| p.len() == 2 && p[0] == flag).map(|p| p[1].as_str())
-    };
+    let value = |flag: &str| crate::encode::arg_value(encoder_args, flag);
     let number = |flag: &str| value(flag).and_then(|v| v.parse::<u32>().ok());
 
     let mut args = Vec::new();
@@ -403,7 +422,7 @@ pub fn mkvmerge_color_args(encoder_args: &[String], track: u32) -> Vec<String> {
     if let Some(v) = number("--color-primaries") {
         push("--color-primaries", v.to_string());
     }
-    // SVT-AV1: 0 studio, 1 full. Matroska: 1 broadcast, 2 full.
+    // Matroska: 1 broadcast, 2 full.
     let full = number("--color-range") == Some(1);
     if described || full {
         push("--color-range", if full { "2" } else { "1" }.to_string());
@@ -441,7 +460,6 @@ fn parse_mastering_display(s: &str) -> Option<[(f64, f64); 5]> {
     Some([pair("G(")?, pair("B(")?, pair("R(")?, pair("WP(")?, pair("L(")?])
 }
 
-// ffprobe name to ITU-T H.273 numeric code (same values used by SVT-AV1)
 fn map_color_primaries(s: &str) -> Option<u32> {
     Some(match s {
         "bt709"     => 1,
@@ -510,7 +528,7 @@ fn map_chroma(s: &str) -> Option<u32> {
     })
 }
 
-// SVT-AV1: 0=studio, 1=full. Studio is the default, so only full needs signaling.
+// SVT-AV1: 0=studio, its default, 1=full.
 fn map_color_range(s: &str) -> Option<u32> {
     match s {
         "pc" | "full" => Some(1),
@@ -675,6 +693,77 @@ mod tests {
             "frames": [{"color_transfer": "bt470bg"}]
         }"#).unwrap());
         assert_eq!((sdr.transfer_characteristics, sdr.hdr_type.as_str()), (Some(1), "SDR"));
+    }
+
+    #[test]
+    fn primaries_and_matrix_the_stream_leaves_unknown_come_from_the_first_frame() {
+        let info = |json: &str| HdrInfo::from_probe(serde_json::from_str(json).unwrap());
+        let untagged = info(r#"{
+            "streams": [{"color_space": "bt2020nc", "color_range": "tv"}],
+            "frames": [{"color_primaries": "bt2020", "color_transfer": "smpte2084", "color_space": "bt2020nc"}]
+        }"#);
+        assert_eq!((untagged.color_primaries, untagged.transfer_characteristics, untagged.matrix_coefficients), (Some(9), Some(16), Some(9)));
+        assert_eq!(untagged.hdr_type, "HDR10");
+
+        let unknown = info(r#"{
+            "streams": [{"color_primaries": "unknown", "color_space": "unknown"}],
+            "frames": [{"color_primaries": "bt2020", "color_space": "bt2020nc"}]
+        }"#);
+        assert_eq!((unknown.color_primaries, unknown.matrix_coefficients), (Some(9), Some(9)));
+
+        let tagged = info(r#"{
+            "streams": [{"color_primaries": "bt709", "color_space": "bt709"}],
+            "frames": [{"color_primaries": "bt2020", "color_space": "bt2020nc"}]
+        }"#);
+        assert_eq!((tagged.color_primaries, tagged.matrix_coefficients), (Some(1), Some(1)));
+    }
+
+    #[test]
+    fn a_pq_or_hlg_transfer_from_the_first_frame_brings_its_primaries_and_matrix() {
+        let info = HdrInfo::from_probe(serde_json::from_str(r#"{
+            "streams": [{"color_primaries": "bt709", "color_transfer": "bt709", "color_space": "bt709"}],
+            "frames": [{"color_primaries": "bt2020", "color_transfer": "smpte2084", "color_space": "bt2020nc"}]
+        }"#).unwrap());
+        assert_eq!((info.color_primaries, info.transfer_characteristics, info.matrix_coefficients), (Some(9), Some(16), Some(9)));
+    }
+
+    fn probe_json(json: &str) -> Result<ProbeOutput> {
+        Ok(serde_json::from_str(json).unwrap())
+    }
+
+    #[test]
+    fn a_recording_that_decodes_nothing_in_its_first_packets_is_probed_again_by_time() {
+        let mut asked = Vec::new();
+        let info = detect_with(|interval| {
+            asked.push(interval.to_string());
+            probe_json(match interval {
+                "%+#48" => r#"{"streams": [{"codec_name": "hevc", "color_transfer": "smpte2084"}]}"#,
+                _ => r#"{
+                    "streams": [{"codec_name": "hevc", "color_transfer": "smpte2084"}],
+                    "frames": [{"side_data_list": [
+                        {"side_data_type": "Mastering display metadata", "red_x": "34000/50000", "red_y": "16000/50000",
+                         "green_x": "13250/50000", "green_y": "34500/50000", "blue_x": "7500/50000", "blue_y": "3000/50000",
+                         "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+                         "min_luminance": "1/10000", "max_luminance": "10000000/10000"},
+                        {"side_data_type": "Content light level metadata", "max_content": 1000, "max_average": 400},
+                        {"side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}
+                    ]}]
+                }"#,
+            })
+        })
+        .unwrap();
+        assert_eq!(asked, ["%+#48", "%+10"]);
+        assert_eq!(info.hdr_type, "HDR10+");
+        assert_eq!(info.content_light_level.as_deref(), Some("1000,400"));
+        assert!(info.missing_static_metadata().is_empty());
+
+        let mut asked = 0;
+        let info = detect_with(|_| {
+            asked += 1;
+            probe_json(r#"{"streams": [{"color_transfer": "smpte2084"}], "frames": [{"side_data_list": []}]}"#)
+        })
+        .unwrap();
+        assert_eq!((asked, info.hdr_type.as_str()), (1, "HDR10"));
     }
 
     #[test]

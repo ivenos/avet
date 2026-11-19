@@ -107,6 +107,7 @@ pub fn run(job: &Job, ctx: &JobContext) -> Result<()> {
         tracing::info!("[{stem}] still being written - looking again on the next scan");
         return Ok(());
     }
+    tracing::info!("[{stem}] starting {}", job.source_file.display());
 
     let temp = TempDir::for_video(&job.output_dir(&ctx.output_dir), stem);
     temp.claim_source(&job.source_file, stem)?;
@@ -135,15 +136,18 @@ fn run_encode(
     temp: &TempDir,
     started: Instant,
 ) -> Result<()> {
-    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
+    let audio_plan = audio::plan(&job.source_file, &config.audio, stem)?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
     }
     audio::check_encoders(&job.source_file, &audio_plan)?;
-    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
+    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles, audio_plan.probe(), stem)?;
 
     let video_file = frame_accurate_source(&job.source_file, temp, stem)?;
     let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
+    for note in ffms2::conversion_notes(&video_source.decoded, config.avet.bit_depth) {
+        tracing::info!("[{stem}] {note}");
+    }
     let video_info = video_source.info.clone();
     let source_timestamps = video_source.timestamps_ms()?;
     drop(video_source);
@@ -223,6 +227,9 @@ fn run_encode(
     if hdr.hdr10plus && hdr.hdr_type != "HDR10+" {
         tracing::info!("[{stem}] HDR: also HDR10+ (dynamic metadata carried)");
     }
+    if hdr.hdr_type != "SDR" && config.avet.bit_depth == Some(8) {
+        tracing::warn!("[{stem}] HDR: {} is encoded at bit_depth = 8, which shows banding", hdr.hdr_type);
+    }
     let missing = hdr.missing_static_metadata();
     if !missing.is_empty() {
         tracing::warn!("[{stem}] HDR metadata incomplete - missing: {}", missing.join(", "));
@@ -291,7 +298,7 @@ fn run_encode(
         hdr_args.extend(colors);
     }
 
-    let auto_keyint: Option<u32> = if config.avet.keyint {
+    let auto_keyint: Option<u32> = if config.avet.keyint && !config.encoder_params.contains_key("keyint") {
         let ki = (fps * 5.0).round().max(1.0) as u32;
         tracing::info!("[{stem}] auto-keyint: {ki} ({fps:.3} fps, keyframe every ~5s)");
         Some(ki)
@@ -341,6 +348,7 @@ fn run_encode(
             &config.scene_detection,
             scene_vf.as_deref(),
             fps,
+            stem,
         )?;
         let detected = scenes.last().map_or(0, |s| s.end_frame + 1);
         let gap = (video_info.num_frames as u64).saturating_sub(detected);
@@ -349,7 +357,7 @@ fn run_encode(
             shift_scenes(&mut scenes, gap);
         }
         crate::resume::write_scenes(&temp.scenes_path, &scenes)?;
-        tracing::info!("[{stem}] {} chunks", scenes.len());
+        tracing::info!("[{stem}] {} chunk{}", scenes.len(), if scenes.len() == 1 { "" } else { "s" });
         scenes
     };
 
@@ -432,7 +440,7 @@ fn run_encode(
             (None, None, None)
         };
 
-    tracing::info!("[{stem}] encoding: {total_chunks} chunks, {num_workers} worker(s)");
+    tracing::info!("[{stem}] encoding: {total_chunks} chunk{}, {num_workers} worker(s)", if total_chunks == 1 { "" } else { "s" });
 
     let source_byte_index = if config.target_quality.is_some() {
         probe_source_byte_index(&job.source_file, ffms2_frames, stem)?
@@ -448,11 +456,13 @@ fn run_encode(
     for scene in &resumed {
         tracing::debug!("[{stem}] chunk {} already done", scene.padded_index());
     }
+    if !resumed.is_empty() {
+        tracing::info!("[{stem}] resuming: {} of {} chunks done", resumed.len(), scenes.len());
+    }
     let resumed_frames: u64 = resumed.iter().map(|s| s.frame_count()).sum();
     let unmeasured: Vec<&SceneEntry> = match &crf_cache {
         Some(cache) if target_quality::measurable(&encode_opts) => resumed.iter().copied().filter(|s| cache.unmeasured(&s.padded_index())).collect(),
-        Some(_) => Vec::new(),
-        None => Vec::new(),
+        _ => Vec::new(),
     };
 
     let wctx = WorkerCtx {
@@ -654,7 +664,7 @@ fn finalize(
 ) -> Result<()> {
     let stem = job.stem();
     audio::extract(&job.source_file, &temp.tracks_path, audio_plan, &subtitles.extract)?;
-    let languages = audio::Languages::probe(&job.source_file)?;
+    let languages = audio::Languages::probe(&job.source_file, audio_plan.probe())?;
 
     let final_output = job.output_dir(&ctx.output_dir).join(format!("{stem}.mkv"));
     // An empty file is a leftover, not a result; the scanner ignores it for the same reason.
@@ -918,6 +928,9 @@ fn archive_source(job: &Job, ctx: &JobContext) -> Result<()> {
 
     move_file(&job.source_file, &dest)
         .with_context(|| format!("move source: {} to {}", job.source_file.display(), dest.display()))?;
+    if dest.file_name() != Some(name) {
+        tracing::info!("[{}] archived as {}, the name was taken", job.stem(), dest.display());
+    }
     remove_emptied_dirs(job);
     Ok(())
 }
@@ -1003,7 +1016,7 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     if let Some(ctx) = probe_context(w) {
         let pct = target_quality::chunk_size_pct(size_bytes, &w.source_byte_index, scene.start_frame, scene.end_frame);
         if pct > ctx.tq.max_encoded_percent {
-            tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.0}% of the source, over max_encoded_percent", w.stem);
+            tracing::warn!("[{}] chunk {chunk_key} came out at {pct:.1}% of the source, over max_encoded_percent", w.stem);
         }
         record_measured(w, &ctx, scene, &chunk, reference.as_ref())?;
     }
@@ -1025,7 +1038,6 @@ fn encode_one(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     Ok(())
 }
 
-/// A chunk finished before an abort, scored now instead of encoded again.
 fn measure_finished(w: &WorkerCtx, scene: &SceneEntry) -> Result<()> {
     let Some(ctx) = probe_context(w) else { return Ok(()) };
     tracing::info!("[{}] chunk {} already done, measuring it", w.stem, scene.padded_index());
@@ -1238,13 +1250,18 @@ pub fn handle_failure(
     // A source replaced or gone mid-job is no verdict on the file now in its place.
     let source_moved = !job.source_file.exists() || (temp.recorded_id().is_some() && !temp.source_unchanged(&job.source_file));
 
+    let retried = shutting_down || source_moved || is_transient(err) || !mark_failed(job, &temp, stem, err, profile);
     // Still loud - a typo in encode.toml has to be seen - but not a verdict on the file.
-    if shutting_down || source_moved || is_transient(err) {
+    if retried {
         let wait = if shutting_down { ctx.poll } else { RETRIES.failed(job, profile, ctx.poll, Instant::now()) };
         tracing::error!("[{stem}] job failed - retrying {}\n{}", retry_when(wait, ctx.poll), reason(err));
-        return;
+    } else {
+        RETRIES.clear(job);
+        tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
     }
+}
 
+fn mark_failed(job: &Job, temp: &TempDir, stem: &str, err: &anyhow::Error, profile: Option<&str>) -> bool {
     let marked = temp.create_dirs().and_then(|()| {
         if temp.recorded_id().is_none()
             && let Err(e) = crate::resume::source_id(&job.source_file)
@@ -1260,17 +1277,12 @@ pub fn handle_failure(
         }
         crate::resume::write_atomic(&temp.failed_path, format!("{err:#}").as_bytes())
     });
-    if let Err(e) = marked {
+    if let Err(e) = &marked {
         tracing::warn!("[{stem}] could not write failure marker: {e:#}");
-        let wait = RETRIES.failed(job, profile, ctx.poll, Instant::now());
-        tracing::error!("[{stem}] job failed - retrying {}\n{}", retry_when(wait, ctx.poll), reason(err));
-        return;
     }
-    RETRIES.clear(job);
-    tracing::error!("[{stem}] job failed - source kept, temp dir preserved\n{err:#}");
+    marked.is_ok()
 }
 
-/// `{err:#}` without the Transient marker.
 fn reason(err: &anyhow::Error) -> String {
     let marker = Transient.to_string();
     err.chain().map(ToString::to_string).filter(|link| *link != marker).collect::<Vec<_>>().join(": ")
@@ -1286,12 +1298,12 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
         tracing::warn!("[{stem}] video = copy: ignoring {}", ignored.join(", "));
     }
 
-    let audio_plan = audio::plan(&job.source_file, &config.audio)?;
+    let audio_plan = audio::plan(&job.source_file, &config.audio, stem)?;
     for line in audio_plan.summary_lines() {
         tracing::info!("[{stem}] audio {line}");
     }
     audio::check_encoders(&job.source_file, &audio_plan)?;
-    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles)?;
+    let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles, audio_plan.probe(), stem)?;
 
     tracing::info!("[{stem}] copy video, processing audio");
     let source_shift_ms = -probe_source_video(&job.source_file)?.matroska_start_ms;
@@ -1358,7 +1370,7 @@ fn compute_output_params(
 
     // Interlaced 4:2:0 alternates fields by chroma row, so a crop from row 2 would swap them.
     let src_crop = match (src_crop, deinterlace) {
-        (Some(c), Some(_)) if c.y % 4 != 0 => Some(Crop { y: c.y - c.y % 4, h: c.h + c.y % 4, ..c }),
+        (Some(c), Some(_)) if c.y % 4 == 2 && c.h > 2 => Some(Crop { y: c.y + 2, h: c.h - 2, ..c }),
         (c, _) => c,
     };
 
@@ -2216,14 +2228,15 @@ mod output_param_tests {
     }
 
     #[test]
-    fn an_interlaced_crop_starts_on_a_whole_pair_of_chroma_rows() {
+    fn an_interlaced_crop_starts_on_the_next_whole_pair_of_chroma_rows_inside_it() {
         let tff = Some(crate::interlace::FieldOrder::Tff);
         let crop = |y, h, deinterlace| {
             compute_output_params(720, 576, Some(&format!("crop=720:{h}:0:{y}")), None, deinterlace, "t").1.map(|c| (c.y, c.h))
         };
-        assert_eq!(crop(70, 436, tff), Some((68, 438)));
+        assert_eq!(crop(70, 436, tff), Some((72, 434)));
         assert_eq!(crop(72, 432, tff), Some((72, 432)));
         assert_eq!(crop(70, 436, None), Some((70, 436)));
+        assert_eq!(crop(2, 572, tff), Some((4, 570)));
     }
 
     #[test]
@@ -2326,9 +2339,6 @@ mod lifecycle_tests {
         assert!(second.file_name().unwrap().len() <= 255);
         assert!(second.to_string_lossy().ends_with(".2.mkv"));
         std::fs::write(&second, b"second").unwrap();
-
-        let part = crate::scanner::fit_name(&first.file_name().unwrap().to_string_lossy(), ".part");
-        assert!(part.len() <= 255 && part.ends_with(".part"));
     }
 
     #[test]

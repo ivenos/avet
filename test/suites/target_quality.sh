@@ -23,6 +23,7 @@ run_avet_timed "$I" "$O" 90 "requires a GPU"
 # keep this green. This wording needs FFVship to have run and enumerated a device.
 assert_log_contains "found only a software Vulkan device"
 assert_log_contains "llvmpipe"
+assert_log_contains "gpus: all for NVIDIA"
 assert_file_not_exists "$O/test.mkv"
 assert_log_contains "retrying on the next scan"
 assert_file_not_exists "$O/.avet_test/.failed"
@@ -93,22 +94,35 @@ assert_log_not_contains "not measured"
 grep -q '"measured"' "$O/.avet_test/tq.json" 2>/dev/null || fail "crop_hd: the finished chunk was not measured"
 [ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_)')" ] || fail "crop_hd: probe files were left behind"
 
-# a chunk finished but not yet measured when avet stops is measured on the next start, not encoded again
-$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 48 -pix_fmt yuv420p -c:v ffv1 "$WORKDIR/sdr48.mkv"
-I="$WORKDIR/resume/in"; O="$WORKDIR/resume/out"; mkdir -p "$I/p" "$O"
-cp "$WORKDIR/sdr48.mkv" "$I/p/test.mkv"
-printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n[scene_detection]\nextra_split = 24\n[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 3\n' > "$I/p/encode.toml"
-TEST_SOFTWARE_GPU=1 start_avet "$I" "$O" 999999
-n=0
-until grep -q '"00001"' "$O/.avet_test/done.json" 2>/dev/null || [ $n -ge 3000 ]; do sleep 0.1; n=$((n + 1)); done
-kill_avet
-grep -q '"00001"' "$O/.avet_test/done.json" || fail "resume: chunk 1 never finished"
 measured_1() { sed -n '/"00001"/,/}/p' "$O/.avet_test/tq.json" | grep -q '"measured"'; }
-measured_1 && fail "resume: chunk 1 was measured before avet was stopped"
-TEST_SOFTWARE_GPU=1 run_avet "$I" "$O" "$O/test.mkv" 600 || fail "resume: no output"
+resume() { # NAME SOURCE [AVET_LINES]: avet stops once chunk 1 is done and starts again
+    I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"
+    cp "$2" "$I/p/test.mkv"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n%b[scene_detection]\nextra_split = 24\n[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 3\n' \
+        "${3:-}" > "$I/p/encode.toml"
+    TEST_SOFTWARE_GPU=1 start_avet "$I" "$O" 999999
+    n=0
+    until grep -q '"00001"' "$O/.avet_test/done.json" 2>/dev/null || [ $n -ge 3000 ]; do sleep 0.1; n=$((n + 1)); done
+    kill_avet
+    grep -q '"00001"' "$O/.avet_test/done.json" || fail "$1: chunk 1 never finished"
+    measured_1 && fail "$1: chunk 1 was measured before avet was stopped"
+    TEST_SOFTWARE_GPU=1 run_avet "$I" "$O" "$O/test.mkv" 600 || fail "$1: no output"
+    assert_log_not_contains "chunk 00001 using cached target crf"
+}
+
+# a scaled chunk finished but not yet measured when avet stops is measured against its reference on the next start
+$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 48 -pix_fmt yuv420p -c:v ffv1 "$WORKDIR/sdr48.mkv"
+resume resume "$WORKDIR/sdr48.mkv" 'scale = 90\n'
 assert_log_contains "chunk 00001 already done, measuring it"
-assert_log_not_contains "chunk 00001 using cached target crf"
+assert_log_not_contains "under the floor"
 measured_1 || fail "resume: chunk 1 is still not measured"
+
+# a deinterlaced chunk, which has no reference to be held against, is not measured on the next start either
+$FF -f lavfi -i "testsrc2=size=320x180:rate=50" -frames:v 48 -vf "tinterlace=mode=interleave_top,setfield=tff,format=yuv420p" \
+    -c:v libx264 -qp 0 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 "$WORKDIR/int48.mkv"
+resume resume_deinterlaced "$WORKDIR/int48.mkv"
+[ "$(cat "$O/.avet_test/interlace.cache" 2>/dev/null)" = tff ] || fail "resume_deinterlaced: not detected as top field first"
+assert_log_not_contains "already done, measuring it"
 
 # RGB reaches the encoder as 4:2:0 YUV, which costs it the floor, and is still compared as the same picture
 $FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -c:v libx264rgb -qp 0 -preset ultrafast "$WORKDIR/rgb.mkv"
@@ -117,6 +131,8 @@ search rgb "$WORKDIR/rgb.mkv"
 assert_log_contains "chunk 00001 probe 1/3 crf"
 assert_log_contains "floor unreachable"
 assert_log_not_contains "two different pictures"
+assert_log_not_contains "not measured"
+grep -q '"measured"' "$O/.avet_test/tq.json" 2>/dev/null || fail "rgb: the finished chunk was not measured"
 
 # an option the encoder refuses fails the job when the probes encode from the scaled reference
 I="$WORKDIR/refused/in"; O="$WORKDIR/refused/out"; mkdir -p "$I/p" "$O"

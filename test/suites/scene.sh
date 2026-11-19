@@ -56,6 +56,7 @@ keep_temp = true
 downscale_height = 180
 EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "downscale: no output"
+assert_log_contains "scene detection on 320x180"
 assert_video_height "$O/test.mkv" 720
 assert_scenes_cover "$O/.avet_test/scenes.json"
 assert_video_frames "$O/test.mkv" 240

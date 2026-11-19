@@ -9,7 +9,6 @@ pub const NAME_MAX: usize = 255;
 
 const EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "ts", "m2ts", "flv", "webm", "m4v"];
 
-/// `name` cut back at its end so that it still fits NAME_MAX with `suffix` added.
 pub fn fit_name(name: &str, suffix: &str) -> String {
     let mut end = name.len().min(NAME_MAX.saturating_sub(suffix.len()));
     while !name.is_char_boundary(end) {
@@ -164,7 +163,10 @@ fn holds_video(dir: &Path) -> bool {
 }
 
 fn collect_video_files(dir: &Path, rel: &Path, files: &mut Vec<(PathBuf, PathBuf)>) {
-
+    let nested = dir.join("encode.toml");
+    if !rel.as_os_str().is_empty() && nested.is_file() {
+        report(format!("ignoring {}: only the encode.toml of the profile folder applies", nested.display()));
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -272,6 +274,20 @@ mod tests {
         let jobs = scan(&input, &output).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].source_file.file_name().unwrap(), "film.mkv");
+    }
+
+    #[test]
+    fn a_profile_with_a_leading_dot_is_scanned_and_a_dot_folder_inside_a_profile_is_not() {
+        let (_tmp, input, output) = make_dirs();
+        let profile = input.join(".anime");
+        fs::create_dir_all(profile.join(".hidden")).unwrap();
+        fs::write(profile.join("encode.toml"), b"encoder = \"svt-av1\"\n").unwrap();
+        fs::write(profile.join("film.mkv"), b"fake").unwrap();
+        fs::write(profile.join(".hidden").join("other.mkv"), b"fake").unwrap();
+
+        let jobs = scan(&input, &output).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].source_file, profile.join("film.mkv"));
     }
 
     #[test]

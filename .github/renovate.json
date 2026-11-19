@@ -65,7 +65,15 @@
       "groupName": "Rust toolchain"
     },
     {
+      "description": "The image installs Ubuntu packages by their release's names.",
       "matchDepNames": ["ubuntu"],
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "matchDepNames": ["ubuntu"],
+      "matchDatasources": ["github-runners"],
       "groupName": "Ubuntu runners",
       "commitMessagePrefix": "ci:",
       "postUpgradeTasks": { "commands": [] }
@@ -95,6 +103,26 @@
       "matchStrings": ["ARG FFMS2_VERSION=(?<currentValue>[^\\n]+)"],
       "datasourceTemplate": "github-releases",
       "depNameTemplate": "FFMS/ffms2",
+      "versioningTemplate": "loose"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/", "/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": ["FFMPEG_VERSION[=:]\\s*\"?(?<currentValue>n[0-9.]+)\"?"],
+      "datasourceTemplate": "github-tags",
+      "depNameTemplate": "FFmpeg",
+      "packageNameTemplate": "FFmpeg/FFmpeg",
+      "versioningTemplate": "regex:^n(?<major>\\d+)\\.(?<minor>\\d+)(\\.(?<patch>\\d+))?$"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/(^|/)Dockerfile$/", "/^\\.github/workflows/appimage\\.yml$/"],
+      "matchStrings": ["MKVTOOLNIX_VERSION[=:]\\s*\"?(?<currentValue>[0-9.]+)\"?"],
+      "datasourceTemplate": "deb",
+      "depNameTemplate": "MKVToolNix",
+      "packageNameTemplate": "mkvtoolnix",
+      "registryUrlTemplate": "https://mkvtoolnix.download/ubuntu?suite=noble&components=main&binaryArch=amd64",
+      "extractVersionTemplate": "^(?<version>\\d+\\.\\d+)-",
       "versioningTemplate": "loose"
     },
     {

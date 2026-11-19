@@ -281,4 +281,47 @@ run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HLG SEI: no output"
 assert_log_contains   "HDR: HLG"
 assert_color_transfer "$O/test.mkv" "arib-std-b67"
 
+# Dolby Vision RPUs that stop mid-chunk: the frames after them carry none
+I="$WORKDIR/20/in"; O="$WORKDIR/20/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/dv81_rpu_stops.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\ndv = true\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "DV whose RPUs stop: no output"
+assert_log_contains "encoding: 1 chunk,"
+assert_log_contains "24 of 72 frames have no Dolby Vision metadata"
+assert_video_frames "$O/test.mkv" 72
+assert_frames_with_side_data "$O/test.mkv" "Dolby Vision Metadata" 48
+
+# HDR10 and HDR10+ recorded from mid-GOP, the first IRAP past the 48 packets detection reads
+I="$WORKDIR/21/in"; O="$WORKDIR/21/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/hdr10plus_recording.ts" "$I/p/test.ts"
+decoded=$(ffprobe -v quiet -select_streams v:0 -read_intervals '%+#48' -show_frames -show_entries frame=pts -of csv=p=0 "$I/p/test.ts" | wc -l)
+[ "$decoded" = 0 ] || fail "HDR10+ recording: the first 48 packets decode $decoded frames"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+TEST_SCENE_REPAIR=1 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10+ recording: no output"
+assert_log_contains     "HDR: HDR10+"
+assert_log_not_contains "HDR metadata incomplete"
+assert_hdr_static_match "$O/test.mkv" "$FIXTURES_DIR/hdr10plus_gop.mkv"
+assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" "$(packet_count "$O/test.mkv")"
+
+# HDR10 whose Matroska Colour element holds only the matrix: the primaries come from the VUI
+I="$WORKDIR/22/in"; O="$WORKDIR/22/out"; mkdir -p "$I/p" "$O"
+ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 24 -pix_fmt yuv420p10le \
+    -c:v libx265 -preset ultrafast \
+    -x265-params "log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:max-cll=1000,400:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)" \
+    -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc "$I/p/test.mkv"
+[ "$(stream_value "$I/p/test.mkv" v:0 stream=color_primaries)" = unknown ] || fail "HDR10 colour: the source stream has its primaries"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10 colour: no output"
+assert_log_contains    "HDR: HDR10"
+assert_color_primaries "$O/test.mkv" "bt2020"
+assert_color_transfer  "$O/test.mkv" "smpte2084"
+
+# HDR10 at bit_depth = 8 is encoded with a warning
+I="$WORKDIR/23/in"; O="$WORKDIR/23/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/hdr10.mkv" "$I/p/test.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\nbit_depth = 8\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10 at 8 bits: no output"
+assert_log_contains  "[test] HDR: HDR10 is encoded at bit_depth = 8, which shows banding"
+assert_video_pix_fmt "$O/test.mkv" "yuv420p"
+
 test_done

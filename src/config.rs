@@ -19,7 +19,6 @@ pub struct Config {
     pub subtitles: SubtitleConfig,
     #[serde(default)]
     pub scene_detection: SceneDetectionConfig,
-    /// Per-chunk CVVDP JOD target instead of a fixed CRF. None = fixed CRF.
     pub target_quality: Option<TargetQualityConfig>,
 }
 
@@ -94,7 +93,6 @@ pub struct AudioConfig {
     #[serde(default)]
     #[cfg_attr(test, schemars(inner(regex(pattern = LANGUAGE_CODE))))]
     pub language_whitelist: Vec<String>,
-    /// Override for lossless sources; unset fields inherit from [audio].
     pub lossless: Option<AudioProfile>,
     #[serde(default)]
     pub codec_rules: HashMap<String, AudioProfile>,
@@ -145,7 +143,6 @@ impl schemars::JsonSchema for Bitrate {
     }
 }
 
-/// Any key, and those `Config::validate` checks with their checks.
 #[cfg(test)]
 fn encoder_params_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     let code = serde_json::json!({ "type": ["integer", "string"], "minimum": 0, "maximum": u32::MAX, "pattern": r"^\+?[0-9]+$" });
@@ -360,11 +357,11 @@ impl SceneDetectionConfig {
     /// Only used after indexing and detection, so a bad value would cost minutes first.
     fn validate(&self) -> Result<()> {
         if self.min_scene_len == 0 {
-            bail!("scene_detection.min_scene_len must be >= 1");
+            bail!("scene_detection.min_scene_len must be at least 1");
         }
         if self.extra_split > 0 && self.extra_split < MIN_EXTRA_SPLIT {
             bail!(
-                "scene_detection.extra_split must be >= {MIN_EXTRA_SPLIT} frames (got {}); use 0 to disable",
+                "scene_detection.extra_split must be at least {MIN_EXTRA_SPLIT} frames (got {}); use 0 to disable",
                 self.extra_split
             );
         }
@@ -489,7 +486,7 @@ impl Config {
         }
         for key in COLOR_KEYS {
             if let Some(v) = self.encoder_params.get(key)
-                && (matches!(v, toml::Value::Boolean(_)) || toml_value_to_arg(v).parse::<u32>().is_err())
+                && (matches!(v, toml::Value::Boolean(_) | toml::Value::Float(_)) || toml_value_to_arg(v).parse::<u32>().is_err())
             {
                 bail!("encoder_params.{key} must be its numeric code, such as 9 for BT.2020 primaries (got {v})");
             }
@@ -515,37 +512,37 @@ impl Config {
                 );
             }
             if tq.jod.is_nan() {
-                bail!("target_quality.jod is required: the CVVDP JOD floor to hold, in (0, 10)");
+                bail!("target_quality.jod is required: the CVVDP JOD floor to hold, above 0 and below 10");
             }
             if !(tq.jod > 0.0 && tq.jod < 10.0) {
                 // 10 is the top of the scale, reachable only by an identical image.
-                bail!("target_quality.jod must be in (0, 10) (got {})", tq.jod);
+                bail!("target_quality.jod must be above 0 and below 10 (got {})", tq.jod);
             }
             if tq.min_crf < 1 {
-                bail!("target_quality.min_crf must be >= 1 (got {})", tq.min_crf);
+                bail!("target_quality.min_crf must be at least 1 (got {})", tq.min_crf);
             }
             if tq.min_crf >= tq.max_crf {
-                bail!("target_quality.min_crf must be < max_crf ({} >= {})", tq.min_crf, tq.max_crf);
+                bail!("target_quality.min_crf must be below max_crf (got {} and {})", tq.min_crf, tq.max_crf);
             }
             if tq.max_crf > 70 {
-                bail!("target_quality.max_crf must be <= 70 (got {})", tq.max_crf);
+                bail!("target_quality.max_crf must be at most 70 (got {})", tq.max_crf);
             }
             if tq.min_probes < 2 {
-                bail!("target_quality.min_probes must be >= 2 (got {})", tq.min_probes);
+                bail!("target_quality.min_probes must be at least 2 (got {})", tq.min_probes);
             }
             if tq.max_probes < tq.min_probes {
-                bail!("target_quality.max_probes must be >= min_probes ({} < {})", tq.max_probes, tq.min_probes);
+                bail!("target_quality.max_probes must be at least min_probes (got {} and {})", tq.max_probes, tq.min_probes);
             }
             if tq.probe_preset > 13 {
-                bail!("target_quality.probe_preset must be 0..=13 (got {})", tq.probe_preset);
+                bail!("target_quality.probe_preset must be 0 to 13 (got {})", tq.probe_preset);
             }
             // TOML accepts `nan`, and every comparison against it is false.
             if !tq.tolerance.is_finite() || tq.tolerance < 0.0 {
-                bail!("target_quality.tolerance must be a finite value >= 0 (got {})", tq.tolerance);
+                bail!("target_quality.tolerance must be finite and at least 0 (got {})", tq.tolerance);
             }
             if !tq.max_encoded_percent.is_finite() || tq.max_encoded_percent <= 0.0 {
                 bail!(
-                    "target_quality.max_encoded_percent must be a finite value > 0 (got {})",
+                    "target_quality.max_encoded_percent must be finite and above 0 (got {})",
                     tq.max_encoded_percent
                 );
             }
@@ -553,7 +550,7 @@ impl Config {
                 if let Some(c) = limit
                     && (!c.is_finite() || c < 0.0)
                 {
-                    bail!("target_quality.{key} must be a finite value >= 0 (got {c})");
+                    bail!("target_quality.{key} must be finite and at least 0 (got {c})");
                 }
             }
         }
@@ -588,7 +585,7 @@ impl Config {
     }
 }
 
-/// ffprobe reports three-letter codes, so an `en` would drop every tagged track.
+/// Containers store ISO 639-2 codes, so an `en` would drop nearly every tagged track.
 fn validate_languages(key: &str, whitelist: &[String]) -> Result<()> {
     for entry in whitelist {
         let base = entry.trim().split(['-', '_']).next().unwrap_or_default();
@@ -624,7 +621,7 @@ fn validate_bitrate_values(ctx: &str, bitrate: Option<&Bitrate>) -> Result<()> {
     };
     for value in values {
         let bits = parse_bitrate(value)
-            .with_context(|| format!("{ctx}: bitrate \"{value}\" is not a number with an optional k or M suffix"))?;
+            .with_context(|| format!("{ctx}: bitrate \"{value}\""))?;
         if bits < 1000 {
             let hint = if value.trim().ends_with(|c: char| c.is_ascii_digit()) {
                 format!("; write it as \"{value}k\" for kbit/s")
@@ -647,9 +644,9 @@ pub(crate) fn parse_bitrate(value: &str) -> Result<u64> {
         _ => (text, 1),
     };
     if !digits.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        bail!("not a number");
+        bail!("not a number with an optional k or M suffix");
     }
-    let number: f64 = digits.parse().map_err(|_| anyhow::anyhow!("not a number"))?;
+    let number: f64 = digits.parse().map_err(|_| anyhow::anyhow!("not a number with an optional k or M suffix"))?;
     if !number.is_finite() || number <= 0.0 {
         bail!("not a positive number");
     }
@@ -1163,7 +1160,7 @@ mod tests {
         assert!(err.contains("jod is required"), "got: {err}");
 
         let err = Config::from_str_for_test("encoder = \"svt-av1\"\n[target_quality]\njod = 0\n").unwrap_err().to_string();
-        assert!(err.contains("must be in (0, 10) (got 0)"), "got: {err}");
+        assert!(err.contains("must be above 0 and below 10 (got 0)"), "got: {err}");
     }
 
     #[test]

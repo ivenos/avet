@@ -45,6 +45,7 @@ setup plain 40
 killed_after "chunk 2/"
 TEST_RUST_LOG=debug run_avet "$I" "$O" "$O/test.mkv" 300 || fail "plain: no output after the restart"
 assert_log_contains "already done"
+assert_log_contains "[test] resuming: $finished of $total chunks done"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
@@ -68,6 +69,7 @@ killed_after "chunk 2/"
 write_profile 40
 run_avet "$I" "$O" "$O/test.mkv" 300 || fail "changed: no output after the restart"
 assert_log_contains "encode profile changed"
+assert_log_not_contains "resuming:"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
