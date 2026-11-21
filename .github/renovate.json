@@ -84,7 +84,7 @@
       "customType": "regex",
       "managerFilePatterns": ["/(^|/)Dockerfile$/"],
       "matchStrings": ["ARG SVT_AV1_VERSION=(?<currentValue>[^\\n]+)"],
-      "datasourceTemplate": "gitlab-releases",
+      "datasourceTemplate": "github-releases",
       "depNameTemplate": "AOMediaCodec/SVT-AV1",
       "versioningTemplate": "semver"
     },
@@ -154,7 +154,7 @@
       "customType": "regex",
       "managerFilePatterns": ["/^\\.github/workflows/appimage\\.yml$/"],
       "matchStrings": ["SVT_AV1_VERSION:\\s*\"?(?<currentValue>[^\"\\s]+)\"?"],
-      "datasourceTemplate": "gitlab-releases",
+      "datasourceTemplate": "github-releases",
       "depNameTemplate": "AOMediaCodec/SVT-AV1",
       "versioningTemplate": "semver"
     },

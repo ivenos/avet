@@ -137,7 +137,7 @@ jobs:
       - name: Build SVT-AV1
         run: |
           git clone --depth 1 --branch "$SVT_AV1_VERSION" \
-            https://gitlab.com/AOMediaCodec/SVT-AV1.git /tmp/svt-av1
+            https://github.com/AOMediaCodec/SVT-AV1.git /tmp/svt-av1
           cmake -B /tmp/svt-av1/build /tmp/svt-av1 \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local \

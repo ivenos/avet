@@ -51,7 +51,7 @@ ARG SVT_AV1_VERSION
 ARG TARGETARCH
 
 RUN git clone --depth 1 --branch ${SVT_AV1_VERSION} \
-        https://gitlab.com/AOMediaCodec/SVT-AV1.git /svt-av1 && \
+        https://github.com/AOMediaCodec/SVT-AV1.git /svt-av1 && \
     cmake -B /svt-av1/build /svt-av1 \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/usr/local \

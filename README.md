@@ -19,7 +19,7 @@ avet is an AV1 encoding service that watches a folder, splits each video at its 
 
 ## Features
 
-- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) per profile
+- [SVT-AV1](https://github.com/AOMediaCodec/SVT-AV1) or [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr) per profile
 - Resumes from the last finished chunk after a restart
 - Target quality: a CRF per chunk from a [CVVDP](https://codeberg.org/Line-fr/Vship) score, with optional [CAMBI](https://github.com/Netflix/vmaf/blob/master/resource/doc/cambi.md) banding limits (GPU required)
 - HDR10, HLG, HDR10+ and Dolby Vision profiles 7 and 8
@@ -278,7 +278,7 @@ Copyright © Iven Schlösser. avet is free software, licensed under the [GNU Gen
 
 The Docker image and the AppImage bundle third-party software, each under its own license:
 
-- [SVT-AV1](https://gitlab.com/AOMediaCodec/SVT-AV1) and [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr): BSD 3-Clause Clear License with the Alliance for Open Media Patent License 1.0
+- [SVT-AV1](https://github.com/AOMediaCodec/SVT-AV1) and [SVT-AV1-HDR](https://github.com/juliobbv-p/svt-av1-hdr): BSD 3-Clause Clear License with the Alliance for Open Media Patent License 1.0
 - [FFmpeg](https://ffmpeg.org): GPL-2.0-or-later
 - [FFMS2](https://github.com/FFMS/ffms2): MIT as source, GPL as a binary built against FFmpeg
 - [Vship](https://codeberg.org/Line-fr/Vship): MIT NON-AI License
