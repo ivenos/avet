@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG SVT_AV1_VERSION=v4.3.0
+ARG SVT_AV1_VERSION=v4.3.1
 # Rolling-release repo.
 ARG SVT_AV1_HDR_REF=0ce7e13af2396bf3bf06408a09f1138f82b01b28
 ARG FFMS2_VERSION=5.0

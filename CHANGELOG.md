@@ -72,7 +72,7 @@ All notable changes to this project are documented in this file, in the format o
 - toml 1.1.6+spec-1.1.0 -> 1.2.0
 - rust 1.99.0 -> 1.100.0
 - av-scenechange 0.24.1 -> 0.25.0
-- AOMediaCodec/SVT-AV1 v4.2.0 -> v4.3.0
+- AOMediaCodec/SVT-AV1 v4.2.0 -> v4.3.1
 - MKVToolNix 99.0 -> 103.0
 - FFmpeg n8.1.3 -> n9.0.2
 
