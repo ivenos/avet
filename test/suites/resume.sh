@@ -73,4 +73,18 @@ assert_log_not_contains "resuming:"
 assert_intact
 assert_packets_identical "$O/test.mkv" v:0 "$CLEAN" v:0
 
+# another video of the same size in the source's place: nothing of the old one reaches the output
+I="$WORKDIR/100/in"; O="$WORKDIR/100/out"; FX="$WORKDIR/100/fx"; mkdir -p "$I/p" "$O" "$FX"
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=s=320x180:r=24" -frames:v 96 -c:v rawvideo -pix_fmt yuv420p "$FX/a.mkv"
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=s=320x180:r=24,negate" -frames:v 96 -c:v rawvideo -pix_fmt yuv420p "$FX/b.mkv"
+[ "$(wc -c < "$FX/a.mkv")" = "$(wc -c < "$FX/b.mkv")" ] || fail "same size: the fixtures differ in size"
+cp "$FX/a.mkv" "$I/p/test.mkv"
+write_profile 40
+killed_after "chunk 1/"
+cp "$FX/b.mkv" "$I/p/test.mkv"
+run_avet "$I" "$O" "$O/test.mkv" 300 || fail "same size: no output after the restart"
+assert_log_contains     "temp dir belongs to a different source"
+assert_log_not_contains "resuming:"
+assert_frames_match     "$O/test.mkv" "$FX/b.mkv"
+
 test_done

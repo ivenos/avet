@@ -257,4 +257,100 @@ stop_avet 20
 [ "$AVET_RC" = 0 ] || fail "idle: avet did not stop within 20s of SIGTERM (rc $AVET_RC)"
 assert_log_contains "signal received"
 
+# a broken file named like a full disk is failed, not waited out
+setup 500 '[avet]\nvideo = "copy"\n'
+head -c 4096 /dev/urandom > "$I/p/No space left on device.mkv"
+start_avet "$I" "$O" 1
+wait_for_file "$O/.avet_No space left on device/.failed" 60 || fail "disk full name: the broken file got no .failed"
+kill_avet
+assert_log_not_contains "retrying"
+
+# ffmpeg answers SIGTERM with exit code 255: retried, and three in a row lock the file out
+stopped_ffmpeg() { # NAME TIMES
+    setup "$1" '[avet]\nvideo = "copy"\n[audio]\nmode = "encode"\ncodec = "flac"\n'
+    cp "$FIXTURES_DIR/pattern.mkv" "$I/p/test.mkv"
+    mkdir -p "$WORKDIR/$1/wrap"
+    echo "$2" > "$WORKDIR/$1/wrap/left"
+    cat > "$WORKDIR/$1/wrap/ffmpeg" << 'EOF'
+#!/bin/sh
+left=$(cat /wrap/left)
+case " $* " in *tracks.mkv*)
+    if [ "$left" -gt 0 ]; then
+        echo $((left - 1)) > /wrap/left
+        /usr/local/bin/ffmpeg -re "$@" &
+        p=$!
+        sleep 0.5
+        kill -TERM $p
+        wait $p
+        exit $?
+    fi ;;
+esac
+exec /usr/local/bin/ffmpeg "$@"
+EOF
+    chmod +x "$WORKDIR/$1/wrap/ffmpeg"
+    start_avet "$I" "$O" 1 -v "$WORKDIR/$1/wrap:/wrap:z" --entrypoint sh "$TEST_IMAGE" \
+        -c 'cp /usr/local/bin/avet /wrap/avet && exec /wrap/avet'
+}
+stopped_ffmpeg 501 1
+wait_for_log "[test] done" 120 || fail "ffmpeg stopped once: the job was not retried to the end"
+kill_avet
+assert_log_contains    "job failed - retrying"
+assert_file_not_exists "$O/.avet_test/.failed"
+assert_file_exists     "$O/test.mkv"
+stopped_ffmpeg 502 99
+wait_for_file "$O/.avet_test/.failed" 120 || fail "ffmpeg stopped every time: no .failed"
+kill_avet
+assert_log_contains    "stopped 3 times in a row"
+assert_file_not_exists "$O/test.mkv"
+
+# a line break in a file name stays on its log line
+setup 503 '[avet]\nvideo = "copy"\n'
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/film
+2026-01-01T00:00:00.000000Z ERROR forged.mkv"
+start_avet "$I" "$O" 1
+wait_for_log "done" 60 || fail "line break: the job did not finish"
+kill_avet
+printf '%s\n' "$RUN_LOGS" | grep -q '^2026-01-01T00:00:00.000000Z ERROR forged' && \
+    fail "line break: the file name forged a log line"
+assert_log_contains '[film\n2026-01-01T00:00:00.000000Z ERROR forged] starting'
+
+# ffmpeg stopped before the scene detector's first byte is retried as well
+setup 504 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n'
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+mkdir -p "$WORKDIR/504/wrap"
+cat > "$WORKDIR/504/wrap/ffmpeg" << 'EOF'
+#!/bin/sh
+case " $* " in *"yuv4mpegpipe pipe:1"*)
+    if [ ! -e /wrap/fired ]; then
+        touch /wrap/fired
+        exit 255
+    fi ;;
+esac
+exec /usr/local/bin/ffmpeg "$@"
+EOF
+chmod +x "$WORKDIR/504/wrap/ffmpeg"
+start_avet "$I" "$O" 1 -v "$WORKDIR/504/wrap:/wrap:z" --entrypoint sh "$TEST_IMAGE" \
+    -c 'cp /usr/local/bin/avet /wrap/avet && exec /wrap/avet'
+wait_for_log "[test] done" 120 || fail "ffmpeg stopped before its first byte: the job was not retried to the end"
+kill_avet
+assert_log_contains    "job failed - retrying"
+assert_file_not_exists "$O/.avet_test/.failed"
+assert_file_exists     "$O/test.mkv"
+
+# cropdetect stopped from outside each time reaches the limit of three killed runs
+setup 505 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\ncrop = true\n'
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+mkdir -p "$WORKDIR/505/wrap"
+cat > "$WORKDIR/505/wrap/ffmpeg" << 'EOF'
+#!/bin/sh
+case " $* " in *cropdetect*) exit 255 ;; esac
+exec /usr/local/bin/ffmpeg "$@"
+EOF
+chmod +x "$WORKDIR/505/wrap/ffmpeg"
+start_avet "$I" "$O" 1 -v "$WORKDIR/505/wrap:/wrap:z" --entrypoint sh "$TEST_IMAGE" \
+    -c 'cp /usr/local/bin/avet /wrap/avet && exec /wrap/avet'
+wait_for_file "$O/.avet_test/.failed" 60 || fail "cropdetect stopped each time: no .failed after three runs"
+kill_avet
+assert_file_exists "$I/p/test.mkv"
+
 test_done

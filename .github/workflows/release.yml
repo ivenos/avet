@@ -29,7 +29,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Stamp the changelog and tag the commit
+      - name: Stamp the changelog
         if: github.event_name == 'workflow_dispatch'
         run: |
           if [ "$GITHUB_REF" != refs/heads/main ]; then
@@ -38,6 +38,13 @@ jobs:
           fi
           sh .github/scripts/crate-changelog.sh
           sh .github/scripts/changelog.sh release "$VERSION"
+
+      - name: Check the changelog section
+        run: sh .github/scripts/changelog.sh notes "${VERSION#v}" > /dev/null
+
+      - name: Tag the commit
+        if: github.event_name == 'workflow_dispatch'
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "chore: release $VERSION" CHANGELOG.md

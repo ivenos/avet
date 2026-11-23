@@ -94,6 +94,29 @@ assert_log_not_contains "not measured"
 grep -q '"measured"' "$O/.avet_test/tq.json" 2>/dev/null || fail "crop_hd: the finished chunk was not measured"
 [ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_)')" ] || fail "crop_hd: probe files were left behind"
 
+# only the chunk that starts near the end of the file is held against a reference
+$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 160 -pix_fmt yuv420p -c:v libx264 -preset veryfast -crf 14 -bf 3 \
+    -x264-params scenecut=0:keyint=48 "$WORKDIR/gop.mkv"
+search 830 "$WORKDIR/gop.mkv" '' '[scene_detection]\nextra_split = 72\n'
+assert_log_contains "chunk 00003 starts near the end of the file"
+assert_log_not_contains "chunk 00001 starts near the end"
+assert_log_not_contains "floor unreachable"
+assert_video_frames "$O/test.mkv" 160
+assert_frames_match "$O/test.mkv" "$SRC" null 20
+[ -z "$(ls "$O/.avet_test" | grep -E '^(probe_|cvvdp_|cambi_|reference_)')" ] || fail "near the end: probe files were left behind"
+
+# a chunk whose frames grow past the source's first size is held against a reference, which FFVship can read
+X="-c:v libx264 -preset veryfast -crf 14 -bf 3 -pix_fmt yuv420p -x264-params scenecut=0:keyint=100:repeat-headers=1 -f mpegts"
+$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 48 $X -output_ts_offset 0 "$WORKDIR/grow_a.ts"
+$FF -f lavfi -i "testsrc2=size=640x360:rate=24" -frames:v 122 $X -output_ts_offset 2.5 "$WORKDIR/grow_b.ts"
+I="$WORKDIR/831/in"; O="$WORKDIR/831/out"; mkdir -p "$I/p" "$O"
+cat "$WORKDIR/grow_a.ts" "$WORKDIR/grow_b.ts" > "$I/p/test.ts"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[avet]\nkeep_temp = true\n[scene_detection]\nextra_split = 48\n[target_quality]\njod = 9.0\nmin_crf = 10\nmax_probes = 2\n' > "$I/p/encode.toml"
+TEST_SOFTWARE_GPU=1 run_avet "$I" "$O" "$O/test.mkv" 900 || fail "size change: no output"
+assert_log_contains "chunk 00002 has frames of another size"
+assert_video_frames "$O/test.mkv" 170
+assert_file_not_exists "$O/.avet_test/.failed"
+
 measured_1() { sed -n '/"00001"/,/}/p' "$O/.avet_test/tq.json" | grep -q '"measured"'; }
 resume() { # NAME SOURCE [AVET_LINES]: avet stops once chunk 1 is done and starts again
     I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; mkdir -p "$I/p" "$O"
@@ -142,7 +165,62 @@ TEST_SOFTWARE_GPU=1 run_avet_timed "$I" "$O" 120 "job failed"
 assert_file_exists     "$O/.avet_test/.failed"
 assert_file_not_exists "$O/test.mkv"
 
+# a disk out of inodes when a score file is due is waited out, for FFVship and for vmaf
+score_disk_full() { # NUMBER TOOL_BEFORE_IT [TARGET_QUALITY_LINES]
+    I="$WORKDIR/$1/in"; O="$WORKDIR/$1/out"; W="$WORKDIR/$1/wrap"; mkdir -p "$I/p" "$O" "$W"
+    cp "$WORKDIR/sdr.mkv" "$I/p/test.mkv"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\n[target_quality]\njod = 5.0\nmin_crf = 10\nmax_probes = 2\n%b' \
+        "${3:-}" > "$I/p/encode.toml"
+    touch "$W/fill"
+    cat > "$W/$2" << 'EOF'
+#!/bin/sh
+"/usr/local/bin/$(basename "$0")" "$@"
+rc=$?
+case " $* " in *" --json "*|*" -b "*)
+    if [ -e /wrap/fill ]; then
+        rm /wrap/fill
+        # tmpfs gives an unlinked file's inode back at its last close.
+        for a; do
+            if [ "$prev" = --json ]; then sleep 600 < "$a" > /dev/null 2>&1 & fi
+            prev=$a
+        done
+        n=0
+        while touch "/full/.filler$n" 2>/dev/null; do n=$((n + 1)); done
+    fi ;;
+esac
+exit $rc
+EOF
+    chmod +x "$W/$2"
+    TEST_SOFTWARE_GPU=1 start_avet "$I" "$O" 1 --tmpfs /full:size=64m,nr_inodes=512,mode=1777 -e OUTPUT_DIR=/full \
+        -v "$W:/wrap:z" --entrypoint sh "$TEST_IMAGE" -c 'cp /usr/local/bin/avet /wrap/avet && exec /wrap/avet'
+    wait_for_log "job failed" 300 || fail "$1: the score file never ran out of space"
+    if docker exec "$AVET_CID" test -e /full/.avet_test/.failed; then
+        kill_avet
+        fail "$1: a full disk wrote a .failed marker"
+        return
+    fi
+    assert_log_contains "job failed - retrying"
+    docker exec "$AVET_CID" sh -c 'rm -f /full/.filler*'
+    wait_for_log "[test] done" 300 || fail "$1: the job did not finish once there was space"
+    kill_avet
+    assert_log_not_contains "source kept"
+}
+score_disk_full 500 SvtAv1EncApp
+score_disk_full 501 FFVship 'max_cambi = 20\n'
+
 docker run --rm --entrypoint vmaf "$TEST_IMAGE" --version >/dev/null 2>&1 || \
     fail "bundled vmaf does not start"
+
+# a cut whose first packets have no time keeps the size cap
+$FF -f lavfi -i "testsrc2=size=320x180:rate=24" -frames:v 96 -c:v libx265 -crf 22 \
+    -x265-params "log-level=error:keyint=24:min-keyint=24:bframes=4:open-gop=1:scenecut=0" "$WORKDIR/open_gop.mkv" 2>/dev/null
+$FF -ss 1.5 -i "$WORKDIR/open_gop.mkv" -c copy "$WORKDIR/cut.mkv"
+ffprobe -v error -select_streams v:0 -show_entries packet=pts -of csv=p=0 "$WORKDIR/cut.mkv" | grep -q N/A \
+    || fail "cut: every packet has a time"
+TEST_SCENE_REPAIR=1
+search 892 "$WORKDIR/cut.mkv" 'max_encoded_percent = 1\n'
+unset TEST_SCENE_REPAIR
+assert_log_not_contains "size cap disabled"
+assert_log_contains     "over max_encoded_percent"
 
 test_done

@@ -159,6 +159,16 @@ fn encoder_params_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema 
 
 pub(crate) const COLOR_KEYS: [&str; 5] = ["color-primaries", "transfer-characteristics", "matrix-coefficients", "color-range", "chroma-sample-position"];
 
+pub(crate) fn color_key_example(key: &str) -> &'static str {
+    match key {
+        "transfer-characteristics" => "16 for PQ",
+        "matrix-coefficients" => "9 for BT.2020 non-constant luminance",
+        "color-range" => "0 for studio or 1 for full",
+        "chroma-sample-position" => "1 for left or 2 for top-left",
+        _ => "9 for BT.2020 primaries",
+    }
+}
+
 impl Bitrate {
     pub fn resolve(&self, channels: Option<u32>) -> Option<&str> {
         match self {
@@ -397,6 +407,7 @@ impl SceneDetectionConfig {
 #[serde(deny_unknown_fields)]
 pub struct TargetQualityConfig {
     /// NaN until the profile sets it.
+    #[serde(deserialize_with = "set_jod")]
     #[cfg_attr(test, schemars(extend("exclusiveMinimum" = 0, "exclusiveMaximum" = 10)))]
     pub jod: f64,
     #[cfg_attr(test, schemars(range(min = 1, max = 69)))]
@@ -417,6 +428,16 @@ pub struct TargetQualityConfig {
     pub max_cambi: Option<f64>,
     #[cfg_attr(test, schemars(range(min = 0)))]
     pub max_cambi_diff: Option<f64>,
+}
+
+const JOD_RANGE: &str = "above 0 and below 10";
+
+fn set_jod<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    let jod = f64::deserialize(deserializer)?;
+    if jod.is_nan() {
+        return Err(serde::de::Error::custom(format!("target_quality.jod must be {JOD_RANGE} (got nan)")));
+    }
+    Ok(jod)
 }
 
 impl Default for TargetQualityConfig {
@@ -488,7 +509,7 @@ impl Config {
             if let Some(v) = self.encoder_params.get(key)
                 && (matches!(v, toml::Value::Boolean(_) | toml::Value::Float(_)) || toml_value_to_arg(v).parse::<u32>().is_err())
             {
-                bail!("encoder_params.{key} must be its numeric code, such as 9 for BT.2020 primaries (got {v})");
+                bail!("encoder_params.{key} must be its numeric code, such as {} (got {v})", color_key_example(key));
             }
         }
         if let Some(tq) = &self.target_quality {
@@ -512,11 +533,11 @@ impl Config {
                 );
             }
             if tq.jod.is_nan() {
-                bail!("target_quality.jod is required: the CVVDP JOD floor to hold, above 0 and below 10");
+                bail!("target_quality.jod is required: the CVVDP JOD floor to hold, {JOD_RANGE}");
             }
             if !(tq.jod > 0.0 && tq.jod < 10.0) {
                 // 10 is the top of the scale, reachable only by an identical image.
-                bail!("target_quality.jod must be above 0 and below 10 (got {})", tq.jod);
+                bail!("target_quality.jod must be {JOD_RANGE} (got {})", tq.jod);
             }
             if tq.min_crf < 1 {
                 bail!("target_quality.min_crf must be at least 1 (got {})", tq.min_crf);
@@ -794,6 +815,40 @@ mod tests {
         let r = cfg.resolve("eac3", false);
         assert_eq!(r.codec, Some("libopus"));
         assert!(matches!(r.bitrate, Some(Bitrate::Single(s)) if s == "192k"));
+    }
+
+    #[test]
+    fn override_options_replace_those_of_audio_and_empty_ones_inherit_them() {
+        let level = |r: ResolvedAudio<'_>| r.options.get("compression_level").and_then(toml::Value::as_integer);
+        let cfg = audio(
+            r#"
+            mode    = "encode"
+            codec   = "libopus"
+            bitrate = "192k"
+            options = { compression_level = 5 }
+            [lossless]
+            codec   = "flac"
+            options = { compression_level = 12 }
+            [codec_rules]
+            ac3  = { codec = "aac", options = { cutoff = 18000 } }
+            eac3 = { codec = "aac" }
+            "#,
+        );
+        assert_eq!(level(cfg.resolve("truehd", true)), Some(12));
+        let rule = cfg.resolve("ac3", false);
+        assert_eq!(rule.options.get("cutoff").and_then(toml::Value::as_integer), Some(18000));
+        assert_eq!(level(rule), None);
+        assert_eq!(level(cfg.resolve("eac3", false)), Some(5));
+        assert_eq!(level(cfg.resolve("aac", false)), Some(5));
+
+        let cfg = audio(
+            r#"
+            options = { compression_level = 5 }
+            [lossless]
+            codec   = "flac"
+            "#,
+        );
+        assert_eq!(level(cfg.resolve("truehd", true)), Some(5));
     }
 
     #[test]
@@ -1101,6 +1156,28 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_color_key_names_codes_that_key_takes() {
+        for (key, codes) in [
+            ("color-primaries", &[9][..]),
+            ("transfer-characteristics", &[16]),
+            ("matrix-coefficients", &[9]),
+            ("color-range", &[0, 1]),
+            ("chroma-sample-position", &[1, 2]),
+        ] {
+            let err = Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\n{key} = -1\n"))
+                .unwrap_err()
+                .to_string();
+            let example = err.split_once("such as ").and_then(|(_, rest)| rest.split_once(" (got")).unwrap().0;
+            let named: Vec<u32> = example
+                .split_whitespace()
+                .filter(|word| word.chars().all(|c| c.is_ascii_digit()))
+                .map(|word| word.parse().unwrap())
+                .collect();
+            assert_eq!(named, codes, "{key}: {err}");
+        }
+    }
+
+    #[test]
     fn a_crf_has_to_be_a_number() {
         let crf = |value: &str| Config::from_str_for_test(&format!("encoder = \"svt-av1\"\n[encoder_params]\ncrf = {value}\n"));
         for good in ["30", "27.5", "\"30\""] {
@@ -1161,6 +1238,22 @@ mod tests {
 
         let err = Config::from_str_for_test("encoder = \"svt-av1\"\n[target_quality]\njod = 0\n").unwrap_err().to_string();
         assert!(err.contains("must be above 0 and below 10 (got 0)"), "got: {err}");
+    }
+
+    #[test]
+    fn a_jod_set_to_nan_is_reported_as_out_of_range_not_as_missing() {
+        let profile = |value: &str| format!("encoder = \"svt-av1\"\n[target_quality]\njod = {value}\n");
+        for value in ["nan", "+nan", "-nan"] {
+            let err = format!("{:#}", Config::from_str_for_test(&profile(value)).unwrap_err());
+            assert!(err.contains("target_quality.jod must be above 0 and below 10 (got nan)"), "{value}: {err}");
+            assert!(!err.contains("is required"), "{value}: {err}");
+        }
+        for value in ["inf", "-inf", "0", "10"] {
+            assert!(Config::from_str_for_test(&profile(value)).is_err(), "{value}");
+        }
+        for value in ["9", "9.5", "0.01", "9.99"] {
+            Config::from_str_for_test(&profile(value)).unwrap_or_else(|e| panic!("{value}: {e:#}"));
+        }
     }
 
     #[test]

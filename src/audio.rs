@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -102,6 +102,7 @@ struct FfprobeTags {
 
 struct AudioTrack {
     audio_index: usize,
+    stream_index: usize,
     codec_name: String,
     profile: Option<String>,
     channels: Option<u32>,
@@ -327,10 +328,12 @@ fn probe_audio_tracks(source_file: &Path, options: &[&str]) -> Result<(Vec<Audio
     let tracks = parsed
         .streams
         .into_iter()
-        .filter(|s| s.codec_type.as_deref() == Some("audio"))
         .enumerate()
-        .map(|(i, s)| AudioTrack {
+        .filter(|(_, s)| s.codec_type.as_deref() == Some("audio"))
+        .enumerate()
+        .map(|(i, (stream_index, s))| AudioTrack {
             audio_index: i,
+            stream_index,
             codec_name: s.codec_name.unwrap_or_else(|| "unknown".into()),
             profile: s.profile,
             channels: s.channels,
@@ -345,6 +348,41 @@ fn probe_audio_tracks(source_file: &Path, options: &[&str]) -> Result<(Vec<Audio
         })
         .collect();
     Ok((tracks, untyped))
+}
+
+pub fn other_program_streams(source: &Path, options: &[&str], stem: &str) -> Result<HashSet<usize>> {
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)] programs: Vec<Program>,
+        #[serde(default)] streams: Vec<Stream>,
+    }
+    #[derive(Deserialize)]
+    struct Program { #[serde(default)] streams: Vec<Member> }
+    #[derive(Deserialize)]
+    struct Member { index: usize }
+    #[derive(Deserialize)]
+    struct Stream { index: usize, codec_type: Option<String> }
+
+    let probe = crate::ext::ffprobe_json::<Probe>(
+        &[options, STREAMS_ONLY, &["-v", "error", "-show_entries", "program_stream=index:stream=index,codec_type", "-of", "json"]].concat(),
+        source,
+    )
+    .context("probe the programs");
+    let Some(probe) = lenient(probe, stem, "keeping the tracks of every program")? else { return Ok(HashSet::new()) };
+    let programs: Vec<Vec<usize>> = probe.programs.iter().map(|p| p.streams.iter().map(|m| m.index).collect()).collect();
+    let kind = |wanted: &[&str], s: &Stream| s.codec_type.as_deref().is_some_and(|t| wanted.contains(&t));
+    let first_video = probe.streams.iter().find(|s| kind(&["video"], s)).map(|s| s.index);
+    let others = streams_of_other_programs(&programs, first_video);
+    Ok(probe.streams.iter().filter(|s| others.contains(&s.index) && kind(&["audio", "subtitle"], s)).map(|s| s.index).collect())
+}
+
+fn streams_of_other_programs(programs: &[Vec<usize>], first_video: Option<usize>) -> HashSet<usize> {
+    let Some(video) = first_video else { return HashSet::new() };
+    let own: HashSet<usize> = programs.iter().filter(|p| p.contains(&video)).flatten().copied().collect();
+    if own.is_empty() {
+        return HashSet::new();
+    }
+    programs.iter().flatten().copied().filter(|s| !own.contains(s)).collect()
 }
 
 fn source_span(source_file: &Path) -> Result<Option<(f64, f64)>> {
@@ -648,10 +686,15 @@ pub fn plan(source_file: &Path, config: &AudioConfig, stem: &str) -> Result<Audi
             (tracks, probe) = (deeper, LATE_TRACKS);
         }
     }
+    let other_programs = other_program_streams(source_file, probe, stem)?;
+    if !other_programs.is_empty() {
+        tracing::info!("[{stem}] {} audio or subtitle track(s) of another program of the transport stream left out", other_programs.len());
+    }
     if tracks.is_empty() {
         return Ok(none());
     }
     let streams = tracks.len();
+    tracks.retain(|t| !other_programs.contains(&t.stream_index));
     let (tracks, empty): (Vec<AudioTrack>, Vec<AudioTrack>) = tracks
         .into_iter()
         .partition(|t| described(&t));
@@ -860,8 +903,12 @@ pub fn extract(
     for (index, _) in subtitles {
         cmd.args(["-map", &format!("0:s:{index}")]);
     }
-    for (out_idx, (_, codec)) in subtitles.iter().enumerate() {
+    let cuts = early_cue_filters(source_file, plan.probe, subtitles)?;
+    for (out_idx, (index, codec)) in subtitles.iter().enumerate() {
         cmd.args([format!("-c:s:{out_idx}"), codec.unwrap_or("copy").to_string()]);
+        if let Some(cut) = cuts.get(index) {
+            cmd.args([format!("-bsf:s:{out_idx}"), cut.clone()]);
+        }
     }
 
     for (out_idx, t) in tracks.iter().enumerate() {
@@ -892,6 +939,77 @@ pub fn extract(
     }
 
     Ok(())
+}
+
+/// mkvmerge drops a cue with a negative start.
+fn early_cue_filters(source: &Path, options: &[&str], subtitles: &[(usize, Option<&'static str>)]) -> Result<HashMap<usize, String>> {
+    #[derive(Deserialize)]
+    struct Probe { #[serde(default)] streams: Vec<Stream>, #[serde(default)] format: Format }
+    #[derive(Deserialize)]
+    struct Stream { codec_name: Option<String>, start_time: Option<String> }
+    #[derive(Deserialize, Default)]
+    struct Format { #[serde(default)] format_name: String, start_time: Option<String> }
+    #[derive(Deserialize)]
+    struct Packets { #[serde(default)] packets: Vec<Packet> }
+    #[derive(Deserialize)]
+    struct Packet { pts_time: Option<String>, size: Option<String> }
+
+    if subtitles.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let probe = |spec: &str| -> Result<Probe> {
+        crate::ext::ffprobe_json(
+            &[options, &["-v", "error", "-select_streams", spec, "-show_entries",
+              "stream=codec_name,start_time:format=format_name,start_time", "-of", "json"]].concat(),
+            source,
+        )
+        .context("probe the start of the subtitle tracks")
+    };
+    let secs = |s: Option<&String>| s.and_then(|v| v.parse::<f64>().ok());
+    let tracks = probe("s")?;
+    let Some(container) = secs(tracks.format.start_time.as_ref()).filter(|_| tracks.format.format_name != "mpegts") else {
+        return Ok(HashMap::new());
+    };
+    let mut early = Vec::new();
+    for &(index, _) in subtitles {
+        let Some(stream) = tracks.streams.get(index) else { continue };
+        let codec = stream.codec_name.as_deref().unwrap_or_default();
+        if !crate::subtitle::is_text(codec) || !secs(stream.start_time.as_ref()).is_some_and(|start| start < container) {
+            continue;
+        }
+        let packets: Packets = crate::ext::ffprobe_json_with_timeout(
+            &[options, &["-v", "error", "-select_streams", &format!("s:{index}"),
+              "-read_intervals", &format!("%{container}"),
+              "-show_entries", "packet=pts_time,size", "-of", "json"]].concat(),
+            source,
+            crate::ext::whole_file_timeout(source, 3600),
+        )
+        .context("probe the first subtitle cues")?;
+        // mov_text fills the time before a cue with an empty sample of two bytes.
+        let least = if codec == "mov_text" { 3 } else { 0 };
+        if packets.packets.iter().any(|p| {
+            p.size.as_deref().and_then(|s| s.parse::<u64>().ok()).is_some_and(|size| size >= least)
+                && secs(p.pts_time.as_ref()).is_some_and(|t| t < container)
+        }) {
+            early.push(index);
+        }
+    }
+    if early.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let video = probe("v:0")?;
+    let picture = secs(video.streams.first().and_then(|s| s.start_time.as_ref())).map_or(0.0, |v| (v - container).max(0.0));
+    let filter = cut_early_cues(picture);
+    Ok(early.into_iter().map(|index| (index, filter.clone())).collect())
+}
+
+fn cut_early_cues(picture: f64) -> String {
+    let p = format!("{picture:.6}");
+    format!(
+        "noise=drop=lt(pts*tb\\,{p})*lte((pts+duration)*tb\\,{p}),\
+         setts=pts=if(lt(PTS*TB\\,{p})\\,{p}/TB\\,PTS):dts=if(lt(DTS*TB\\,{p})\\,{p}/TB\\,DTS):\
+         duration=if(lt(PTS*TB\\,{p})\\,PTS+DURATION-{p}/TB\\,DURATION)"
+    )
 }
 
 fn encode_args(cmd: &mut Command, out_idx: usize, t: &PlannedTrack) {
@@ -1122,6 +1240,7 @@ pub fn mux_final(
     source_file: &Path,
     video_language: Option<&str>,
     source_shift_ms: i64,
+    chapter_shift_ms: i64,
     sources: &Sources,
     output_path: &Path,
 ) -> Result<Option<Vec<bool>>> {
@@ -1199,8 +1318,8 @@ pub fn mux_final(
             cmd.arg("--sync").arg(format!("-1:{shift}"));
         }
     }
-    if source_shift_ms != 0 && has_chapters(source_file)? {
-        cmd.arg("--chapter-sync").arg(source_shift_ms.to_string());
+    if chapter_shift_ms != 0 && has_chapters(source_file)? {
+        cmd.arg("--chapter-sync").arg(chapter_shift_ms.to_string());
     }
     cmd.arg(source_file);
 
@@ -1285,11 +1404,14 @@ fn extraction_shift_ms(source: &Path, tracks_path: &Path, sources: &Sources) -> 
         .context("probe the start of the extracted tracks")
     };
     let source_probe = probe(source, &spec, sources.probe)?;
+    let secs = |s: Option<&String>| s.and_then(|v| v.parse::<f64>().ok());
     if source_probe.format.format_name != "mpegts" {
-        return Ok(0);
+        return match secs(source_probe.format.start_time.as_ref()) {
+            Some(container) => early_subtitle_shift_ms(source, sources, container),
+            None => Ok(0),
+        };
     }
     let extracted = probe(tracks_path, "0", sources.probe)?;
-    let secs = |s: Option<&String>| s.and_then(|v| v.parse::<f64>().ok());
     let (Some(first), Some(container), Some(kept)) = (
         secs(source_probe.streams.first().and_then(|s| s.start_time.as_ref())),
         secs(source_probe.format.start_time.as_ref()),
@@ -1298,6 +1420,53 @@ fn extraction_shift_ms(source: &Path, tracks_path: &Path, sources: &Sources) -> 
         return Ok(0);
     };
     Ok(((first - container - kept) * 1000.0).round() as i64)
+}
+
+/// ffmpeg's Matroska muxer moves all of tracks.mkv later to keep a cue from before the container start.
+fn early_subtitle_shift_ms(source: &Path, sources: &Sources, container: f64) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct Probe { #[serde(default)] streams: Vec<Stream> }
+    #[derive(Deserialize)]
+    struct Stream { codec_name: Option<String>, start_time: Option<String> }
+    #[derive(Deserialize)]
+    struct Packets { #[serde(default)] packets: Vec<Packet> }
+    #[derive(Deserialize)]
+    struct Packet { pts_time: Option<String> }
+
+    if sources.extracted_subtitles.is_empty() {
+        return Ok(0);
+    }
+    let probe: Probe = crate::ext::ffprobe_json(
+        &[sources.probe, &["-v", "error", "-select_streams", "s", "-show_entries", "stream=codec_name,start_time", "-of", "json"]].concat(),
+        source,
+    )
+    .context("probe the start of the subtitle tracks")?;
+    let secs = |s: Option<&str>| s.and_then(|v| v.parse::<f64>().ok());
+
+    let mut cues = Vec::new();
+    for &index in &sources.extracted_subtitles {
+        let Some(stream) = probe.streams.get(index) else { continue };
+        if stream.codec_name.as_deref().is_some_and(crate::subtitle::is_text)
+            || !secs(stream.start_time.as_deref()).is_some_and(|start| start < container)
+        {
+            continue;
+        }
+        let packets: Packets = crate::ext::ffprobe_json_with_timeout(
+            &[sources.probe, &["-v", "error", "-select_streams", &format!("s:{index}"),
+              "-read_intervals", &format!("%{container}"),
+              "-show_entries", "packet=pts_time", "-of", "json"]].concat(),
+            source,
+            crate::ext::whole_file_timeout(source, 3600),
+        )
+        .context("probe the first subtitle cues")?;
+        cues.extend(packets.packets.iter().find_map(|p| secs(p.pts_time.as_deref())));
+    }
+    Ok(cue_lead_ms(container, cues))
+}
+
+fn cue_lead_ms(container: f64, cues: impl IntoIterator<Item = f64>) -> i64 {
+    let earliest = cues.into_iter().fold(container, f64::min);
+    ((earliest - container) * 1000.0).round() as i64
 }
 
 /// mkvmerge keeps the absolute time of a wrapping MPEG-TS, and the tracks it takes land past the end.
@@ -1356,6 +1525,39 @@ fn absolute_time_shift_ms(first_packet: Option<f64>, start: f64, duration: f64) 
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn only_the_tracks_of_another_program_are_foreign() {
+        let of = |programs: &[&[usize]], video| {
+            let programs: Vec<Vec<usize>> = programs.iter().map(|p| p.to_vec()).collect();
+            let mut s: Vec<usize> = streams_of_other_programs(&programs, video).into_iter().collect();
+            s.sort();
+            s
+        };
+        assert_eq!(of(&[&[0, 1], &[2, 3]], Some(0)), [2, 3]);
+        assert_eq!(of(&[&[2, 3], &[0, 1]], Some(0)), [2, 3]);
+        assert_eq!(of(&[&[0, 1, 4], &[2, 4]], Some(0)), [2]);
+        assert!(of(&[&[0, 1, 2]], Some(0)).is_empty());
+        assert!(of(&[], Some(0)).is_empty());
+        assert!(of(&[&[1, 2], &[3]], Some(0)).is_empty());
+        assert!(of(&[&[0, 1], &[2]], None).is_empty());
+    }
+
+    #[test]
+    fn an_early_cue_keeps_its_end_and_starts_at_the_first_picture() {
+        let f = cut_early_cues(0.021333);
+        assert!(f.starts_with("noise=drop=lt(pts*tb\\,0.021333)*lte((pts+duration)*tb\\,0.021333),setts="), "{f}");
+        assert!(f.contains("duration=if(lt(PTS*TB\\,0.021333)\\,PTS+DURATION-0.021333/TB\\,DURATION)"), "{f}");
+    }
+
+    #[test]
+    fn tracks_are_moved_back_by_the_lead_of_the_earliest_cue() {
+        assert_eq!(cue_lead_ms(5.0, [3.0]), -2000);
+        assert_eq!(cue_lead_ms(4.979, [3.0, 4.0]), -1979);
+        assert_eq!(cue_lead_ms(5.0, [5.0]), 0);
+        assert_eq!(cue_lead_ms(5.0, [7.0]), 0);
+        assert_eq!(cue_lead_ms(5.0, []), 0);
+    }
 
     #[test]
     fn a_subtitle_past_the_end_of_the_file_is_moved_back_by_the_start() {
@@ -1588,7 +1790,7 @@ mod tests {
     #[test]
     fn samples_without_a_matroska_codec_id_keep_their_depth() {
         let track = |fmt: &str, bits: u32| AudioTrack {
-            audio_index: 0, codec_name: "pcm_bluray".into(), profile: None, channels: Some(2),
+            audio_index: 0, stream_index: 0, codec_name: "pcm_bluray".into(), profile: None, channels: Some(2),
             channel_layout: None, sample_rate: 48000, bits_per_raw_sample: bits,
             sample_fmt: fmt.into(), initial_padding: 0, stream_id: None, language: None, title: None,
         };

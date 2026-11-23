@@ -31,6 +31,8 @@ jobs:
       OWNER: ${{ github.repository_owner }}
       OWNER_ID: ${{ github.repository_owner_id }}
       PR_BODY: ${{ github.event.pull_request.body }}
+      PR_COMMITS: ${{ github.event.pull_request.commits }}
+      PR_FILES: ${{ github.event.pull_request.changed_files }}
     steps:
       - name: Verify CLA
         id: verify
@@ -48,6 +50,12 @@ jobs:
           gh api --paginate "repos/$REPO/pulls/$PR/commits" \
             --jq '.[] | {sha, login: .author.login, name: .commit.author.name, email: .commit.author.email, message: .commit.message}' > "$commits"
 
+          # GitHub lists at most 250 commits and 3000 files of a pull request.
+          listed=$(jq -s length "$commits")
+          if ! [ "$listed" -ge "$PR_COMMITS" ]; then
+            echo "The pull request has $PR_COMMITS commits, of which only $listed can be checked. Split it into smaller pull requests." >> "$errors"
+          fi
+
           jq -rs --arg author "$AUTHOR" --arg owner "$OWNER" '
             .[] | select(.login != $author and .login != $owner)
             | "Commit \(.sha[:7]) is authored by \(.login // "\(.name) <\(.email)>, which is not linked to a GitHub account"). Only the pull request author and the maintainer commit to a pull request."
@@ -64,8 +72,12 @@ jobs:
             | "Commit \($sha[:7]) has a co-author (\(.)) other than the pull request author and the maintainer."
           ' "$commits" >> "$errors"
 
-          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | .filename, .previous_filename // empty')
-          if grep -qxF .github/CLA.md <<< "$files"; then
+          files=$(gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] | {filename, previous_filename}')
+          listed=$(jq -s length <<< "$files")
+          if ! [ "$listed" -ge "$PR_FILES" ]; then
+            echo "The pull request changes $PR_FILES files, of which only $listed can be checked. Split it into smaller pull requests." >> "$errors"
+          fi
+          if jq -r '.filename, .previous_filename // empty' <<< "$files" | grep -qxF .github/CLA.md; then
             echo "The pull request changes .github/CLA.md, which only the maintainer does." >> "$errors"
           fi
 

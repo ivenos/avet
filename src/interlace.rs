@@ -26,6 +26,8 @@ impl FieldOrder {
     }
 }
 
+const SAMPLED_PERCENTS: [u64; 3] = [20, 50, 80];
+
 /// A stream flagged interlaced whose frames idet finds combed. Cached in the job's temp dir.
 pub fn detect(source: &Path, duration_secs: f64, cache: &Path, stem: &str) -> Result<Option<FieldOrder>> {
     match std::fs::read_to_string(cache).as_deref().map(str::trim) {
@@ -38,12 +40,12 @@ pub fn detect(source: &Path, duration_secs: f64, cache: &Path, stem: &str) -> Re
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!("[{stem}] interlace: cannot read {} ({e}) - measuring again", cache.display()),
     }
-    if !flagged_interlaced(source)? {
+    if !flagged_interlaced(source, duration_secs, stem)? {
         return Ok(None);
     }
 
     let mut total = Counts::default();
-    for pct in [20u64, 50, 80] {
+    for pct in SAMPLED_PERCENTS {
         let seek = (duration_secs * pct as f64 / 100.0) as u64;
         let c = run_idet(source, seek)?;
         total = Counts { tff: total.tff + c.tff, bff: total.bff + c.bff, progressive: total.progressive + c.progressive };
@@ -85,33 +87,60 @@ impl Counts {
     }
 }
 
-fn flagged_interlaced(source: &Path) -> Result<bool> {
+fn flagged_interlaced(source: &Path, duration_secs: f64, stem: &str) -> Result<bool> {
     #[derive(serde::Deserialize)]
     struct Probe {
         #[serde(default)] streams: Vec<Stream>,
-        #[serde(default)] frames: Vec<Frame>,
+        #[serde(default)] format: Format,
     }
     #[derive(serde::Deserialize)]
     struct Stream { field_order: Option<String> }
-    #[derive(serde::Deserialize)]
-    struct Frame { #[serde(default)] interlaced_frame: u8 }
+    #[derive(serde::Deserialize, Default)]
+    struct Format { start_time: Option<String> }
 
     let probe: Probe = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=field_order", "-of", "json"],
+        &["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=field_order:format=start_time", "-of", "json"],
         source,
     )
     .context("probe the field order")?;
     match probe.streams.first().and_then(|s| s.field_order.as_deref()) {
         Some("tt" | "bb" | "tb" | "bt") => return Ok(true),
-        Some("progressive") => return Ok(false),
-        _ => {}
+        Some("progressive") => {}
+        _ => {
+            if frames_flagged(source, "%+#5").context("probe the frames' interlace flags")? {
+                return Ok(true);
+            }
+        }
     }
+    let start = probe.format.start_time.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    match frames_flagged(source, &sampled_intervals(start, duration_secs)) {
+        Ok(flagged) => Ok(flagged),
+        Err(e) if crate::job::is_transient(&e) => Err(e),
+        Err(e) => {
+            tracing::warn!("[{stem}] interlace: cannot read the flags further in: {e:#}");
+            Ok(false)
+        }
+    }
+}
+
+/// ffprobe's `-read_intervals` takes absolute timestamps, unlike ffmpeg's `-ss`.
+fn sampled_intervals(start: f64, duration_secs: f64) -> String {
+    SAMPLED_PERCENTS
+        .map(|pct| format!("{:.3}%+#5", start + duration_secs * pct as f64 / 100.0))
+        .join(",")
+}
+
+fn frames_flagged(source: &Path, intervals: &str) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Probe { #[serde(default)] frames: Vec<Frame> }
+    #[derive(serde::Deserialize)]
+    struct Frame { #[serde(default)] interlaced_frame: u8 }
+
     let probe: Probe = crate::ext::ffprobe_json(
-        &["-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#5",
+        &["-v", "error", "-select_streams", "v:0", "-read_intervals", intervals,
           "-show_entries", "frame=interlaced_frame", "-of", "json"],
         source,
-    )
-    .context("probe the frames' interlace flags")?;
+    )?;
     Ok(probe.frames.iter().any(|f| f.interlaced_frame == 1))
 }
 
@@ -167,6 +196,12 @@ mod tests {
         }
         std::fs::write(&cache, "tf").unwrap();
         assert!(cached().is_err(), "a cut-off cache passed as progressive");
+    }
+
+    #[test]
+    fn the_flags_are_read_where_idet_looks_counted_from_the_container_start() {
+        assert_eq!(sampled_intervals(0.0, 100.0), "20.000%+#5,50.000%+#5,80.000%+#5");
+        assert_eq!(sampled_intervals(10.0, 18.0), "13.600%+#5,19.000%+#5,24.400%+#5");
     }
 
     #[test]

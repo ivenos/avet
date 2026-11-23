@@ -587,12 +587,14 @@ assert_stream_times_match() {
     [ -z "$diff" ] || fail "stream times: $out $out_spec: $diff"
 }
 
-# Start and end relative to the first video frame, and the title.
+# Start and end relative to the first video frame, and the whole title.
 chapter_list() {
     local first
     first=$(frame_times_abs "$1" | head -n 1)
     ffprobe -v error -show_entries chapter=start_time,end_time:chapter_tags=title \
-        -of csv=p=0 "$1" | awk -F, -v base="$first" '{ printf "%.3f %.3f %s\n", $1 - base, $2 - base, $3 }'
+        -of csv=p=0 "$1" | awk -v base="$first" '{
+            split($0, f, ",")
+            printf "%.3f %.3f %s\n", f[1] - base, f[2] - base, substr($0, length(f[1]) + length(f[2]) + 3) }'
 }
 
 # Within 2 ms: the last chapter ends with the file, which each muxer rounds on its own.
@@ -601,9 +603,12 @@ assert_chapters_match() {
     a=$(chapter_list "$1")
     b=$(chapter_list "$2")
     [ -n "$b" ] || { fail "chapters: the source $2 has none"; return; }
-    diff=$(printf '%s\n' "$a" | paste -d '|' - "$(_tmp_file printf '%s\n' "$b")" | awk -F'|' '
-        { split($1, x, " "); split($2, y, " ")
-          if (x[3] != y[3] || (x[1] - y[1])^2 > 0.000004 || (x[2] - y[2])^2 > 0.000004) { printf "chapter %d", NR; exit } }')
+    diff=$(awk '
+        function title(line) { sub(/^[^ ]+ [^ ]+ ?/, "", line); return line }
+        NR == FNR { want[FNR] = $0; next }
+        { split($0, x, " "); split(want[FNR], y, " ")
+          if (title($0) != title(want[FNR]) || (x[1] - y[1])^2 > 0.000004 || (x[2] - y[2])^2 > 0.000004) { printf "chapter %d", FNR; exit } }
+        ' "$(_tmp_file printf '%s\n' "$b")" "$(_tmp_file printf '%s\n' "$a")")
     [ -z "$diff" ] && [ "$(printf '%s\n' "$a" | wc -l)" = "$(printf '%s\n' "$b" | wc -l)" ] || \
         fail "chapters: $1 has [$(echo $a)], the source [$(echo $b)]"
 }
@@ -710,15 +715,37 @@ subtitle_events() {
         | awk -F, -v base="$first" '{ printf "%.3f %s %s\n", $1 - base, $2, ($3 > 0 ? "show" : "clear") }'
 }
 
-# Within 2 ms: every muxer rounds to its own time base.
+# The text of every event without its styling, one event per line.
+subtitle_text() {
+    ffmpeg -hide_banner -v error -i "$1" -map "0:$2" -c:s text -f srt - \
+        | awk 'BEGIN { RS = ""; FS = "\n" } { line = $3; for (i = 4; i <= NF; i++) line = line " / " $i; print line }'
+}
+
+subtitle_events_from_picture() { subtitle_events "$1" "$2" | awk '$1 >= 0'; }
+
+# Within 2 ms: every muxer rounds to its own time base. FROM_PICTURE compares only the events
+# from the first picture on, as mkvmerge drops a cue that starts before time zero.
 assert_subtitle_events_match() {
-    local out="$1" out_spec="$2" src="$3" src_spec="$4" diff
-    diff=$(paste -d ' ' "$(_tmp_file subtitle_events "$out" "$out_spec")" "$(_tmp_file subtitle_events "$src" "$src_spec")" | awk '
+    local out="$1" out_spec="$2" src="$3" src_spec="$4" from_picture="${5:-}" events=subtitle_events diff a b n
+    [ -z "$from_picture" ] || events=subtitle_events_from_picture
+    diff=$(paste -d ' ' "$(_tmp_file "$events" "$out" "$out_spec")" "$(_tmp_file "$events" "$src" "$src_spec")" | awk '
         NF != 6 { printf "event %d exists on one side only", NR - 1; exit }
         { d = $1 - $4; if (d < 0) d = -d
           if (d > 0.002 || $2 != $5 || $3 != $6) { printf "event %d is %s %s %s, the source %s %s %s", NR - 1, $1, $2, $3, $4, $5, $6; exit } }
         END { if (NR == 0) print "no events" }')
-    [ -z "$diff" ] || fail "subtitles: $out $out_spec: $diff"
+    [ -z "$diff" ] || { fail "subtitles: $out $out_spec: $diff"; return; }
+    # ffprobe prints a stream of a transport stream twice, under its program as well.
+    case "$(stream_value "$src" "$src_spec" stream=codec_name)" in
+        hdmv_pgs_subtitle*|dvd_subtitle*|dvb_subtitle*|xsub*) return ;;
+    esac
+    a=$(subtitle_text "$out" "$out_spec")
+    b=$(subtitle_text "$src" "$src_spec")
+    if [ -n "$from_picture" ]; then
+        n=$("$events" "$src" "$src_spec" | wc -l)
+        a=$(printf '%s\n' "$a" | tail -n "$n")
+        b=$(printf '%s\n' "$b" | tail -n "$n")
+    fi
+    [ -n "$b" ] && [ "$a" = "$b" ] || fail "subtitles: $out $out_spec has the text [$(echo $a)], the source [$(echo $b)]"
 }
 
 # Frame numbers of the keyframes, one per line.
@@ -875,15 +902,34 @@ assert_frames_with_side_data() {
         fail "frames with '$pattern': expected $expected, got $actual ($file)"
 }
 
-# The HDR10+ AverageRGB of every frame of OUT, in display order, is that of REFERENCE
+# Every HDR10+ field of each frame that carries them, in display order, one frame per line.
+hdr10plus_fields() {
+    ffprobe -v error -select_streams v:0 -show_entries frame_side_data -of default "$1" | awk '
+        /^\[SIDE_DATA\]/ { fields = ""; keep = 0; next }
+        /^side_data_type=/ { keep = /SMPTE2094-40/; next }
+        /^\[\/SIDE_DATA\]/ { if (keep) print fields; keep = 0; next }
+        keep { fields = fields " " $0 }'
+}
+
+# The HDR10+ metadata of every frame of OUT, in display order, is that of REFERENCE
 # decoded from its start.
 assert_hdr10plus_matches() {
-    local out="$1" ref="$2" got want
+    local out="$1" ref="$2" got want diff
     assert_probeable "$out" || return
-    got=$(hdr10plus_average_rgb "$out")
-    want=$(hdr10plus_average_rgb "$ref")
+    got=$(hdr10plus_fields "$out")
+    want=$(hdr10plus_fields "$ref")
     [ -n "$want" ] || { fail "HDR10+ per frame: $ref carries none"; return; }
-    [ "$got" = "$want" ] || fail "HDR10+ per frame: $out has AverageRGB '$got', $ref '$want'"
+    [ "$got" != "$want" ] || return 0
+    diff=$(awk '
+        NR == FNR { want[FNR] = $0; n = FNR; next }
+        $0 != want[FNR] {
+            split(want[FNR], w, " ")
+            for (i = 1; i <= NF && $i == w[i]; i++) ;
+            printf "frame %d has %s, expected %s", FNR - 1, $i, w[i]; found = 1; exit
+        }
+        END { if (!found) printf "%d frames carry it, expected %d", FNR, n }
+        ' "$(_tmp_file printf '%s\n' "$want")" "$(_tmp_file printf '%s\n' "$got")")
+    fail "HDR10+ per frame: $out against $ref: $diff"
 }
 
 hdr10plus_average_rgb() {

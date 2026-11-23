@@ -26,6 +26,7 @@ pub fn plan(source: &Path, config: &SubtitleConfig, options: &[&str], stem: &str
     struct Probe { streams: Vec<Stream> }
     #[derive(Deserialize)]
     struct Stream {
+        index: usize,
         id: Option<String>,
         codec_name: Option<String>,
         #[serde(default)]
@@ -36,11 +37,12 @@ pub fn plan(source: &Path, config: &SubtitleConfig, options: &[&str], stem: &str
 
     let probe: Probe = crate::ext::ffprobe_json(
         &[options, crate::audio::STREAMS_ONLY, &["-v", "error", "-select_streams", "s",
-          "-show_entries", "stream=id,codec_name:stream_tags=language", "-of", "json"]].concat(),
+          "-show_entries", "stream=index,id,codec_name:stream_tags=language", "-of", "json"]].concat(),
         source,
     )
     .context("probe subtitle streams")?;
     let streams = probe.streams.len();
+    let other_programs = crate::audio::other_program_streams(source, options, stem)?;
 
     let selected = |language: Option<&str>| {
         crate::config::language_selected(&config.language_whitelist, language)
@@ -53,6 +55,9 @@ pub fn plan(source: &Path, config: &SubtitleConfig, options: &[&str], stem: &str
     let mut languages = Vec::new();
     let mut read = None;
     for (index, stream) in probe.streams.into_iter().enumerate() {
+        if other_programs.contains(&stream.index) {
+            continue;
+        }
         languages.push(stream.tags.language.clone().unwrap_or_else(|| "und".into()));
         let codec = stream.codec_name.unwrap_or_else(|| "unknown".into());
         match route(&codec) {
@@ -105,6 +110,10 @@ pub fn same_track<'a, T>(tracks: &'a [T], number: impl Fn(&T) -> Option<u64>, in
         Some(n) => tracks.iter().filter(|t| number(t) == Some(n)).collect(),
         None => tracks.get(index).filter(|_| tracks.len() == streams).into_iter().collect(),
     }
+}
+
+pub fn is_text(codec: &str) -> bool {
+    matches!(codec, "subrip" | "text" | "ass" | "webvtt" | "mov_text")
 }
 
 #[derive(Debug, PartialEq)]

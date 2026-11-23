@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::BufWriter;
 use std::path::Path;
@@ -34,6 +35,15 @@ pub struct EncodeOptions {
     pub dynamic_hdr: DynamicHdr,
     /// Replaces what FFMS2 decodes, which loses a carried HDR10+ value at every seek.
     pub hdr10plus_frames: Option<crate::hevc::Hdr10PlusFrames>,
+    pub linear_decode: bool,
+}
+
+const ENCODER_READER: usize = 0;
+const REFERENCE_READER: usize = 1;
+
+thread_local! {
+    // FFMS_SEEK_LINEAR decodes from frame 0 in every newly opened source.
+    static LINEAR_SOURCES: RefCell<[Option<VideoSource>; 2]> = const { RefCell::new([None, None]) };
 }
 
 pub fn encode_chunk(
@@ -46,7 +56,7 @@ pub fn encode_chunk(
     overrides: EncodeOverrides,
 ) -> Result<u64> {
     let (encoder_bin, encoder_name, encoder_args) = encoder_invocation(config, output_path, opts, overrides)?;
-    let mut vs = open_source(source_file, index_file, opts)?;
+    let mut vs = take_source(source_file, index_file, opts, ENCODER_READER)?;
 
     let mut hdr_metadata = Vec::new();
     let capture = opts.dynamic_hdr.any().then_some(&mut hdr_metadata);
@@ -70,6 +80,7 @@ pub fn encode_chunk(
         }
         insert_hdr_metadata(output_path, &hdr_metadata, opts.dynamic_hdr, geometry, scene)?;
     }
+    keep_source(vs, opts, ENCODER_READER);
 
     Ok(std::fs::metadata(output_path)
         .with_context(|| format!("chunk output not found: {}", output_path.display()))?
@@ -95,15 +106,27 @@ fn encoder_invocation(
 }
 
 fn open_source(source_file: &Path, index_file: &Path, opts: &EncodeOptions) -> Result<VideoSource> {
-    let mut vs = VideoSource::open(
-        source_file,
-        index_file,
-        OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: opts.deinterlace.is_some() },
-    )
+    let open_opts = OpenOpts { target_bit_depth: opts.target_bit_depth, keep_subsampling: opts.deinterlace.is_some() };
+    let mut vs = if opts.linear_decode {
+        VideoSource::open_linear(source_file, index_file, open_opts)
+    } else {
+        VideoSource::open(source_file, index_file, open_opts)
+    }
     .context("open FFMS2 VideoSource")?;
     vs.info.fps_num = opts.fps_num;
     vs.info.fps_den = opts.fps_den;
     Ok(vs)
+}
+
+fn take_source(source_file: &Path, index_file: &Path, opts: &EncodeOptions, reader: usize) -> Result<VideoSource> {
+    let kept = if opts.linear_decode { LINEAR_SOURCES.with_borrow_mut(|s| s[reader].take()) } else { None };
+    kept.map_or_else(|| open_source(source_file, index_file, opts), Ok)
+}
+
+fn keep_source(vs: VideoSource, opts: &EncodeOptions, reader: usize) {
+    if opts.linear_decode {
+        LINEAR_SOURCES.with_borrow_mut(|s| s[reader] = Some(vs));
+    }
 }
 
 fn filter_chain(opts: &EncodeOptions, format: &PixelFormat) -> Vec<String> {
@@ -139,7 +162,7 @@ pub fn write_reference(
     config: &Config,
     opts: &EncodeOptions,
 ) -> Result<()> {
-    let mut vs = open_source(source_file, index_file, opts)?;
+    let mut vs = take_source(source_file, index_file, opts, REFERENCE_READER)?;
     let mut filters = filter_chain(opts, &vs.info.pixel_format);
     filters.push(reference_tags(&merged_encoder_args(config, opts)));
 
@@ -167,7 +190,9 @@ pub fn write_reference(
             None => err,
         });
     }
-    write_res.context("write Y4M frames to ffmpeg reference")
+    write_res.context("write Y4M frames to ffmpeg reference")?;
+    keep_source(vs, opts, REFERENCE_READER);
+    Ok(())
 }
 
 /// As a `setparams` filter: named as an output option, a tag makes ffmpeg convert the pixels to it.
@@ -551,6 +576,54 @@ pub fn validate_output(path: &Path, expected_frames: Option<u64>) -> Result<()> 
     Ok(())
 }
 
+/// mkvmerge skips a video track it cannot read and stores some under a codec ID ffmpeg cannot read back.
+pub fn validate_copied_video(output: &Path, source: &Path) -> Result<()> {
+    let source_codecs = video_codecs(source).context("probe the source's video codec")?;
+    let output_codecs = video_codecs(output).context("probe the output's video codec")?;
+    if let Some(problem) = copied_video_problem(&source_codecs, &output_codecs) {
+        bail!("{problem}");
+    }
+    Ok(())
+}
+
+pub fn refuse_lost_video(source: &Path) -> Result<()> {
+    let source_codecs = video_codecs(source).context("probe the source's video codec")?;
+    match copied_video_problem(&source_codecs, &[]) {
+        Some(problem) => bail!("{problem}"),
+        None => Ok(()),
+    }
+}
+
+fn copied_video_problem(source: &[String], output: &[String]) -> Option<String> {
+    let wanted = source.first()?;
+    if output.contains(wanted) {
+        return None;
+    }
+    Some(if output.is_empty() {
+        format!("mkvmerge could not copy the {wanted} video: the output has no video track")
+    } else {
+        format!("mkvmerge could not copy the {wanted} video: the output has {}", output.join(", "))
+    })
+}
+
+fn video_codecs(path: &Path) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Root { #[serde(default)] streams: Vec<Stream> }
+    #[derive(serde::Deserialize)]
+    struct Stream { codec_name: Option<String>, #[serde(default)] disposition: Disposition }
+    #[derive(serde::Deserialize, Default)]
+    struct Disposition { #[serde(default)] attached_pic: u8 }
+
+    let root: Root = crate::ext::ffprobe_json(
+        &["-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name:stream_disposition=attached_pic", "-of", "json"],
+        path,
+    )?;
+    Ok(root.streams.into_iter()
+        .filter(|s| s.disposition.attached_pic == 0)
+        .map(|s| s.codec_name.unwrap_or_else(|| "unknown".into()))
+        .collect())
+}
+
 /// Video frames in a muxed file. One ffprobe pass over the container, no decoding.
 fn video_packet_count(path: &Path) -> Result<u64> {
     #[derive(serde::Deserialize)]
@@ -586,6 +659,16 @@ mod tests {
 
     fn cfg(encoder_params: HashMap<String, toml::Value>) -> Config {
         Config { encoder: Some(Encoder::SvtAv1), encoder_params, ..Default::default() }
+    }
+
+    #[test]
+    fn a_copied_video_has_to_arrive_under_the_codec_of_the_source() {
+        let names = |codecs: &[&str]| codecs.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(copied_video_problem(&names(&["h264"]), &names(&["h264"])), None);
+        assert_eq!(copied_video_problem(&names(&["h264", "hevc"]), &names(&["hevc", "h264"])), None);
+        assert_eq!(copied_video_problem(&names(&[]), &names(&[])), None);
+        assert!(copied_video_problem(&names(&["mjpeg"]), &names(&[])).unwrap().contains("no video track"));
+        assert!(copied_video_problem(&names(&["ffv1"]), &names(&["unknown"])).unwrap().contains("unknown"));
     }
 
     #[test]

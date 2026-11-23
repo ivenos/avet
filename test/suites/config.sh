@@ -240,4 +240,14 @@ run_avet_timed "$I" "$O" 120 "job failed"
 assert_log_contains    "Source Width must be less than or equal to 16384"
 assert_file_exists     "$O/.avet_test/.failed"
 
+I="$WORKDIR/600/in"; O="$WORKDIR/600/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+: > "$I/p/empty.mkv"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
+level=$(sed -n 's/.*`RUST_LOG=\([^`]*\)`.*/\1/p' "$(dirname "$0")/../../.github/ISSUE_TEMPLATE/bug_report.yml")
+[ -n "$level" ] || fail "the bug report template names no RUST_LOG"
+TEST_RUST_LOG=$level run_avet "$I" "$O" "$O/test.mkv" 120 || fail "bug report log level: no output"
+assert_log_contains     "skip: empty"
+assert_log_not_contains "SC-Detect"
+
 test_done

@@ -78,6 +78,17 @@ wait_for_log "invalid value" 30
 kill_avet
 assert_log_contains "invalid value"
 
+# a retry a very large POLL_INTERVAL away does not end avet
+I="$WORKDIR/700/in"; O="$WORKDIR/700/out"; mkdir -p "$I/p" "$O"
+cp "$FIXTURES_DIR/sdr_simple.mkv" "$I/p/test.mkv"
+printf 'not = [valid\n' > "$I/p/encode.toml"
+start_avet "$I" "$O" 18446744073709551615
+wait_for_log "job failed - retrying" 60 || fail "huge POLL_INTERVAL: the refused encode.toml was not reported"
+sleep 2
+[ "$(docker inspect -f '{{.State.Running}}' "$AVET_CID")" = true ] || fail "huge POLL_INTERVAL: avet stopped running"
+kill_avet
+assert_log_contains "poll_s=4294967295"
+
 # two files sharing a stem: neither runs
 # Same output, same temp dir, same name under processed/.
 I="$WORKDIR/7/in"; O="$WORKDIR/7/out"; mkdir -p "$I/a" "$I/b" "$O"

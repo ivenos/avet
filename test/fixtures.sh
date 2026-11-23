@@ -207,6 +207,11 @@ dovi_tool inject-rpu -i dv_base.hevc --rpu-in rpu81.bin -o dv81.hevc >/dev/null
 hdr10plus_tool inject -i dv81.hevc -j hdr10plus.json -o dv81_hdr10plus.hevc >/dev/null
 mkvmerge -q -o dv81_hdr10plus.mkv --default-duration 0:24fps dv81_hdr10plus.hevc
 
+echo "  hdr10plus_anchors.mkv"
+sed 's/917,938/917,500/g' hdr10plus.json > hdr10plus_anchors.json
+hdr10plus_tool inject -i dv81.hevc -j hdr10plus_anchors.json -o hdr10plus_anchors.hevc >/dev/null
+mkvmerge -q -o hdr10plus_anchors.mkv --default-duration 0:24fps hdr10plus_anchors.hevc
+
 echo "  dv81_late_rpu.mkv"
 cat dv_lead.hevc dv81.hevc > dv81_late.hevc
 mkvmerge -q -o dv81_late_rpu.mkv --default-duration 0:24fps dv81_late.hevc
@@ -231,10 +236,10 @@ hdr10plus_tool inject -i hdr10plus_part24.hevc -j hdr10plus24.json -o hdr10plus_
 cat hdr10plus_first.hevc hdr10plus_part72.hevc > hdr10plus_sparse.hevc
 mkvmerge -q -o hdr10plus_sparse.mkv --default-duration 0:24fps hdr10plus_sparse.hevc
 
-rm -f dovi.json hdr10plus.json hdr10plus24.json duplicate.json fel.bin rpu81.bin rpu84.bin rpu5.bin rpu7.bin \
+rm -f dovi.json hdr10plus.json hdr10plus_anchors.json hdr10plus_anchors.hevc hdr10plus24.json duplicate.json fel.bin rpu81.bin rpu84.bin rpu5.bin rpu7.bin \
     dv_base.hevc dv_hlg.hevc dv_el.hevc dv_el_rpu.hevc dv81.hevc dv81_hdr10plus.hevc dv84.hevc dv5.hevc dv7.hevc \
     dv_lead.hevc dv81_late.hevc hdr10plus_part24.hevc hdr10plus_part72.hevc hdr10plus_first.hevc hdr10plus_sparse.hevc
-chown "$OWNER" dv81_hdr10plus.mkv dv81_late_rpu.mkv dv84.mkv dv5.mkv dv7_fel.mkv hdr10plus_sparse.mkv
+chown "$OWNER" dv81_hdr10plus.mkv hdr10plus_anchors.mkv dv81_late_rpu.mkv dv84.mkv dv5.mkv dv7_fel.mkv hdr10plus_sparse.mkv
 GEN
 
 GEN_RC=$?
@@ -310,7 +315,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 Dialogue: 0,0:00:03.00,0:00:05.50,Default,,0,0,0,,{\b1}Dritte Spur
 ASS
 head -c 4096 /dev/urandom > font.ttf
-printf 'CHAPTER01=00:00:00.000\nCHAPTER01NAME=Opening\nCHAPTER02=00:00:03.500\nCHAPTER02NAME=Middle\nCHAPTER03=00:00:07.250\nCHAPTER03NAME=End\n' > chapters.txt
+printf 'CHAPTER01=00:00:00.000\nCHAPTER01NAME=Opening\nCHAPTER02=00:00:03.500\nCHAPTER02NAME=Middle\nCHAPTER03=00:00:07.250\nCHAPTER03NAME=The End\n' > chapters.txt
 mkvmerge -q -o pattern.mkv \
     --language 1:eng --track-name 1:English --default-track-flag 1:yes \
     --language 2:ger --track-name 2:Kommentar --default-track-flag 2:no --commentary-flag 2:yes \

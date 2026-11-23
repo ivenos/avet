@@ -143,13 +143,33 @@ fn run_encode(
     audio::check_encoders(&job.source_file, &audio_plan)?;
     let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles, audio_plan.probe(), stem)?;
 
-    let video_file = frame_accurate_source(&job.source_file, temp, stem)?;
-    let video_source = open_indexed(&video_file, &temp.index_path, stem)?;
+    let mut video_file = if temp.remux_path.exists() {
+        temp.remux_path.clone()
+    } else {
+        frame_accurate_source(&job.source_file, temp, stem)?
+    };
+    let mut video_source = open_indexed(&video_file, &temp.index_path, stem)?;
+    let source_video = probe_source_video(&job.source_file)?;
+    let (fps_num, fps_den) = (source_video.fps_num, source_video.fps_den);
+    let mut source_timestamps = video_source.timestamps_ms()?;
+    let transport_packets = if source_video.container == "mpegts" { transport_stream_packets(&job.source_file)? } else { Vec::new() };
+    if video_file == job.source_file && transport_stream_needs_copy(&transport_packets, &source_timestamps, fps_num, fps_den) {
+        tracing::warn!("[{stem}] the decoder's timestamps do not fit the packets: working from a Matroska copy of the video");
+        drop(video_source);
+        discard_encode_state(temp)?;
+        discard_file(&temp.hdr10plus_path, temp)?;
+        video_file = matroska_copy(&job.source_file, temp)?;
+        video_source = open_indexed(&video_file, &temp.index_path, stem)?;
+        source_timestamps = video_source.timestamps_ms()?;
+    }
+    let linear_decode = reads_linearly(&source_video, &source_timestamps, &transport_packets);
+    if linear_decode {
+        tracing::info!("[{stem}] FFMS2 cannot seek in this source: decoding it from the start");
+    }
     for note in ffms2::conversion_notes(&video_source.decoded, config.avet.bit_depth) {
         tracing::info!("[{stem}] {note}");
     }
     let video_info = video_source.info.clone();
-    let source_timestamps = video_source.timestamps_ms()?;
     drop(video_source);
 
     let threads_per_worker = config.encoder_params
@@ -163,28 +183,11 @@ fn run_encode(
         .unwrap_or(6);
     let num_workers = workers::calculate(&video_info, stem, threads_per_worker);
 
-    let source_video = probe_source_video(&job.source_file)?;
-    let (fps_num, fps_den) = (source_video.fps_num, source_video.fps_den);
     let fps = fps_num as f64 / fps_den as f64;
 
     // The encoders refuse more than 240 or, the HDR fork, 480 fps, so they get a fraction and the timestamps the rest.
     let max_fps = if config.encoder == Some(Encoder::SvtAv1Hdr) { 480.0 } else { 240.0 };
     let fps_divisor = if fps > max_fps { (fps / max_fps).ceil() as u32 } else { 1 };
-    let timestamps = match vfr_timestamps(&source_timestamps, fps_num, fps_den, stem) {
-        Some(ts) => {
-            tracing::info!("[{stem}] variable frame rate: keeping the source timestamps");
-            write_timestamps(&temp.timestamps_path, &ts, source_video.offset_ms)?;
-            Some(temp.timestamps_path.as_path())
-        }
-        None if fps_divisor > 1 => {
-            tracing::info!("[{stem}] {fps:.3} fps: encoding at a 1/{fps_divisor} rate, the source timestamps keep the real one");
-            let first = source_timestamps.first().copied().unwrap_or(0.0);
-            let ts: Vec<f64> = source_timestamps.iter().map(|t| t - first).collect();
-            write_timestamps(&temp.timestamps_path, &ts, source_video.offset_ms)?;
-            Some(temp.timestamps_path.as_path())
-        }
-        None => None,
-    };
 
     let hdr = crate::hdr::detect(&job.source_file)?;
     let chroma_center = hdr.chroma_center;
@@ -223,6 +226,9 @@ fn run_encode(
         ),
         (None, "SDR") => {}
         (None, t) => tracing::info!("[{stem}] HDR: {t}"),
+    }
+    if config.avet.dv && hdr.dv_rpu_profile.is_none() && crate::hdr::dv_in_another_stream(&job.source_file)? {
+        tracing::warn!("[{stem}] HDR: Dolby Vision is in a separate video stream: only the base layer is encoded");
     }
     if hdr.hdr10plus && hdr.hdr_type != "HDR10+" {
         tracing::info!("[{stem}] HDR: also HDR10+ (dynamic metadata carried)");
@@ -263,6 +269,7 @@ fn run_encode(
     };
 
     let duration_secs = video_info.num_frames as f64 / fps;
+    crate::hdr::refuse_changing_colors(&video_file, duration_secs)?;
     let visible = source_video.visible(video_info.width, video_info.height);
     let crop_str: Option<String> = if config.avet.crop {
         crate::crop::detect(&video_file, duration_secs, &temp.crop_cache, stem, visible)?
@@ -319,6 +326,7 @@ fn run_encode(
         target_bit_depth: config.avet.bit_depth,
         dynamic_hdr,
         hdr10plus_frames,
+        linear_decode,
     };
 
     let merged_args = encode::merged_encoder_args(config, &encode_opts);
@@ -353,7 +361,7 @@ fn run_encode(
         let detected = scenes.last().map_or(0, |s| s.end_frame + 1);
         let gap = (video_info.num_frames as u64).saturating_sub(detected);
         if gap > 0 && leading_frames(&video_file, &source_timestamps, gap)? == gap {
-            tracing::info!("[{stem}] the first {gap} frames do not decode on their own: scene cuts move by as many");
+            tracing::info!("[{stem}] the first {gap} frames do not decode on their own and are left out: scene cuts move by as many");
             shift_scenes(&mut scenes, gap);
         }
         crate::resume::write_scenes(&temp.scenes_path, &scenes)?;
@@ -396,7 +404,34 @@ fn run_encode(
         }
         Some(_) => {}
     }
-    validate_scene_list(&scenes, ffms2_frames)?;
+    let first_frame = match scenes.first() {
+        Some(s) if s.start_frame > 0 && leading_frames(&video_file, &source_timestamps, s.start_frame)? == s.start_frame => s.start_frame,
+        _ => 0,
+    };
+    validate_scene_list(&scenes, first_frame, ffms2_frames)?;
+
+    let shown_timestamps = &source_timestamps[first_frame as usize..];
+    let offset_ms = match shown_timestamps.first() {
+        Some(&first_ms) if first_frame > 0 && video_file == job.source_file => shown_offset_ms(&job.source_file, first_ms)?,
+        // The Matroska muxer gives the copy a time zero of its own.
+        Some(&first_ms) if first_frame > 0 => source_video.offset_ms + (first_ms - source_timestamps[0]).round() as i64,
+        _ => source_video.offset_ms,
+    };
+    let timestamps = match vfr_timestamps(shown_timestamps, fps_num, fps_den, stem) {
+        Some(ts) => {
+            tracing::info!("[{stem}] variable frame rate: keeping the source timestamps");
+            write_timestamps(&temp.timestamps_path, &ts, offset_ms)?;
+            Some(temp.timestamps_path.as_path())
+        }
+        None if fps_divisor > 1 => {
+            tracing::info!("[{stem}] {fps:.3} fps: encoding at a 1/{fps_divisor} rate, the source timestamps keep the real one");
+            let first = shown_timestamps.first().copied().unwrap_or(0.0);
+            let ts: Vec<f64> = shown_timestamps.iter().map(|t| t - first).collect();
+            write_timestamps(&temp.timestamps_path, &ts, offset_ms)?;
+            Some(temp.timestamps_path.as_path())
+        }
+        None => None,
+    };
 
     let total_chunks = scenes.len();
     let total_frames: u64 = scenes.iter().map(|s| s.frame_count()).sum();
@@ -443,7 +478,7 @@ fn run_encode(
     tracing::info!("[{stem}] encoding: {total_chunks} chunk{}, {num_workers} worker(s)", if total_chunks == 1 { "" } else { "s" });
 
     let source_byte_index = if config.target_quality.is_some() {
-        probe_source_byte_index(&job.source_file, ffms2_frames, stem)?
+        probe_source_byte_index(&video_file, ffms2_frames, stem)?
     } else {
         Vec::new()
     };
@@ -544,8 +579,8 @@ fn run_encode(
         video_args.extend(["--chroma-siting".into(), "0:2,2".into()]);
     }
     // mkvmerge ignores --sync on a track that gets a timestamps file, which carries it instead.
-    if timestamps.is_none() && source_video.offset_ms != 0 {
-        video_args.extend(["--sync".into(), format!("0:{}", source_video.offset_ms)]);
+    if timestamps.is_none() && offset_ms != 0 {
+        video_args.extend(["--sync".into(), format!("0:{offset_ms}")]);
     }
     let (out_w, out_h) = scale_target
         .or(encode_opts.crop.map(|c| (c.w, c.h)))
@@ -556,6 +591,7 @@ fn run_encode(
         args: video_args,
         timestamps,
         source_shift_ms: -source_video.matroska_start_ms,
+        chapter_shift_ms: -source_video.chapter_start_ms,
         remove: true,
         expected_frames: Some(total_frames),
     };
@@ -598,23 +634,113 @@ fn leading_frames(source: &Path, timestamps_ms: &[f64], gap: u64) -> Result<u64>
     else {
         return Ok(0);
     };
-    Ok(timestamps_ms.iter().take_while(|&&t| t < first_ms - 0.5).count() as u64)
+    Ok(frames_before_first_shown(timestamps_ms, first_ms))
 }
 
-/// The first chunk takes the leading frames, every later cut moves by as many.
+/// ffmpeg's `-ss -c copy` into Matroska stamps the leading frames with the first shown one's time.
+fn frames_before_first_shown(timestamps_ms: &[f64], first_ms: f64) -> u64 {
+    let before = timestamps_ms.iter().take_while(|&&t| t < first_ms - 0.5).count();
+    let same = timestamps_ms[before..].iter().take_while(|&&t| t <= first_ms + 0.5).count();
+    (before + same.saturating_sub(1)) as u64
+}
+
+#[derive(serde::Deserialize)]
+struct TsPacket { pts_time: Option<String>, #[serde(default)] flags: String }
+
+impl TsPacket {
+    fn pts(&self) -> Option<f64> { self.pts_time.as_deref()?.parse().ok() }
+}
+
+fn transport_stream_packets(source: &Path) -> Result<Vec<TsPacket>> {
+    #[derive(serde::Deserialize)]
+    struct Probe { #[serde(default)] packets: Vec<TsPacket> }
+
+    let probe: Probe = crate::ext::ffprobe_json_with_timeout(
+        &["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "json"],
+        source,
+        crate::ext::whole_file_timeout(source, 3600),
+    )
+    .context("probe the source's packet times")?;
+    Ok(probe.packets)
+}
+
+fn transport_stream_needs_copy(packets: &[TsPacket], ts: &[f64], fps_num: u32, fps_den: u32) -> bool {
+    let times: Vec<f64> = packets.iter().filter_map(TsPacket::pts).collect();
+    let frame_ms = 1000.0 * fps_den as f64 / fps_num as f64;
+    stretched_transport_stream(ts, &times, frame_ms) || times_restart(&times, frame_ms)
+}
+
+/// FFMS_SEEK_LINEAR counts decoded frames, so one the decoder drops at the start shifts all later ones.
+fn opens_on_undecodable_frames(packets: &[TsPacket]) -> bool {
+    let Some(first) = packets.first() else { return false };
+    let Some(first_pts) = first.pts() else { return true };
+    !first.flags.starts_with('K') || packets.iter().skip(1).take(16).any(|p| p.pts().is_some_and(|t| t < first_pts))
+}
+
+/// FFMS2 takes its time-jump threshold from an MPEG-TS's first two PTS, so a one-tick step makes every B-frame a jump.
+fn stretched_transport_stream(ts: &[f64], packet_times_s: &[f64], frame_ms: f64) -> bool {
+    let (Some(first), Some(last)) = (ts.first(), ts.last()) else { return false };
+    let constant_span_ms = ts.len().saturating_sub(1) as f64 * frame_ms;
+    if spans_match(last - first, constant_span_ms, frame_ms) {
+        return false;
+    }
+    let times = || packet_times_s.iter().copied();
+    let packet_span_ms = (times().fold(f64::MIN, f64::max) - times().fold(f64::MAX, f64::min)) * 1000.0;
+    packet_span_ms > 0.0 && !spans_match(last - first, packet_span_ms, frame_ms)
+}
+
+/// H.264 and HEVC hold at most 16 frames for reordering.
+fn times_restart(packet_times_s: &[f64], frame_ms: f64) -> bool {
+    let reorder_s = 17.0 * frame_ms / 1000.0;
+    let mut latest = f64::MIN;
+    packet_times_s.iter().any(|&t| {
+        let back = t < latest - reorder_s;
+        latest = latest.max(t);
+        back
+    })
+}
+
+/// FFMS2 seeks by the index's key frames and times, which packed B-frames and repeated times make wrong.
+fn reads_linearly(source: &SourceVideo, timestamps_ms: &[f64], packets: &[TsPacket]) -> bool {
+    match source.container.as_str() {
+        "avi" => source.codec == "mpeg4" && source.has_b_frames > 0,
+        // Matroska stores milliseconds, so a copy makes times this close equal.
+        "mpegts" => !opens_on_undecodable_frames(packets) && timestamps_ms.windows(2).any(|w| (w[1] - w[0]).abs() < 1.0),
+        _ => false,
+    }
+}
+
+fn spans_match(span_ms: f64, wanted_ms: f64, frame_ms: f64) -> bool {
+    (span_ms - wanted_ms).abs() <= (2.0 * frame_ms).max(wanted_ms * 0.005)
+}
+
+/// ffmpeg rebases audio to the container start; a stream starts at a leading frame in MPEG-TS, at the first shown in Matroska.
+fn shown_offset_ms(source: &Path, first_ms: f64) -> Result<i64> {
+    #[derive(serde::Deserialize)]
+    struct Probe { #[serde(default)] format: Format }
+    #[derive(serde::Deserialize, Default)]
+    struct Format { start_time: Option<String> }
+
+    let probe: Probe = crate::ext::ffprobe_json(
+        &["-v", "error", "-show_entries", "format=start_time", "-of", "json"],
+        source,
+    )
+    .context("probe the container start time")?;
+    let start_s = probe.format.start_time.and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+    Ok(((first_ms - start_s * 1000.0).round() as i64).max(0))
+}
+
 fn shift_scenes(scenes: &mut [SceneEntry], by: u64) {
-    for (i, s) in scenes.iter_mut().enumerate() {
-        if i > 0 {
-            s.start_frame += by;
-        }
+    for s in scenes {
+        s.start_frame += by;
         s.end_frame += by;
     }
 }
 
 /// `total_frames` is summed from this list and `validate_output` checks the finished file
 /// against that sum, so a gap between two chunks would pass as a complete encode.
-fn validate_scene_list(scenes: &[SceneEntry], frames: u64) -> Result<()> {
-    let mut next = 0;
+fn validate_scene_list(scenes: &[SceneEntry], first_frame: u64, frames: u64) -> Result<()> {
+    let mut next = first_frame;
     for s in scenes {
         if s.end_frame < s.start_frame {
             bail!("chunk {} ends at frame {} before its start {}", s.index, s.end_frame, s.start_frame);
@@ -643,6 +769,7 @@ struct MuxVideo<'a> {
     path: &'a Path,
     args: Vec<String>,
     source_shift_ms: i64,
+    chapter_shift_ms: i64,
     /// Timecodes v2 file replacing the encode's constant frame rate.
     timestamps: Option<&'a Path>,
     /// Delete `path` after muxing; true only when it is avet's own temp file.
@@ -676,13 +803,22 @@ fn finalize(
 
     // Into the temp dir first: the next scan reads a half-written output as "already done".
     tracing::info!("[{stem}] muxing to {}", final_output.display());
+    // mkvmerge writes through an existing file, and a stopped publish leaves this name on the output.
+    if let Err(e) = std::fs::remove_file(&temp.mux_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e).with_context(|| format!("remove {}", temp.mux_path.display()));
+    }
     let from_tracks = audio::mux_final(
         video.path, &video.args, video.timestamps,
         &temp.tracks_path, &languages.of_tracks(audio_plan, &subtitles.extract),
         &job.source_file, languages.video(),
-        video.source_shift_ms, &audio::Sources::new(audio_plan, subtitles), &temp.mux_path,
+        video.source_shift_ms, video.chapter_shift_ms, &audio::Sources::new(audio_plan, subtitles), &temp.mux_path,
     )?;
     if video.expected_frames.is_none() {
+        if !track_types(&temp.mux_path)?.iter().any(|t| t == "video") {
+            encode::refuse_lost_video(&job.source_file)?;
+        }
         realign_copied_video(&job.source_file, temp, stem, from_tracks.as_deref())?;
     }
     if let Err(e) = crate::mkv::trim_av1_codec_private(&temp.mux_path) {
@@ -695,6 +831,9 @@ fn finalize(
 
     tracing::info!("[{stem}] validating output");
     encode::validate_output(&temp.mux_path, video.expected_frames)?;
+    if video.expected_frames.is_none() {
+        encode::validate_copied_video(&temp.mux_path, &job.source_file)?;
+    }
 
     if !temp.source_unchanged(&job.source_file) {
         return Err(anyhow::Error::new(Transient)
@@ -708,9 +847,10 @@ fn finalize(
     let (source_bytes, output_bytes) = (bytes(&job.source_file), bytes(&temp.mux_path));
     // Before the rename: the scanner skips an output without the marker and leaves its source.
     temp.mark_delivered(config.avet.keep_temp)?;
-    std::fs::rename(&temp.mux_path, &final_output).with_context(|| {
-        format!("move {} to {}", temp.mux_path.display(), final_output.display())
-    })?;
+    if let Err(e) = publish(&temp.mux_path, &final_output, stem) {
+        let _ = std::fs::remove_file(&temp.delivered_path);
+        return Err(e);
+    }
     // The archived source can sit on another file system, whose rename may reach the disk first.
     sync_dir(&final_output);
 
@@ -733,6 +873,40 @@ fn finalize(
     }
     tracing::info!("[{stem}] done: {}", done_summary(source_bytes, output_bytes, started.elapsed().as_secs(), details));
     Ok(())
+}
+
+fn refuse_finished_output(path: &Path) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() > 0 => bail!("output already exists: {}", path.display()),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("read {}", path.display())),
+        _ => Ok(()),
+    }
+}
+
+/// link(2) fails on a name that exists, where rename(2) replaces it.
+fn publish(from: &Path, to: &Path, stem: &str) -> Result<()> {
+    for _ in 0..2 {
+        match std::fs::hard_link(from, to) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(from) {
+                    tracing::warn!("[{stem}] could not remove {}: {e}", from.display());
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                refuse_finished_output(to)?;
+                std::fs::remove_file(to).with_context(|| format!("replace empty {}", to.display()))?;
+            }
+            Err(_) => break,
+        }
+    }
+    rename_unless_finished(from, to)
+}
+
+/// For a file system without hard links.
+fn rename_unless_finished(from: &Path, to: &Path) -> Result<()> {
+    refuse_finished_output(to)?;
+    std::fs::rename(from, to).with_context(|| format!("move {} to {}", from.display(), to.display()))
 }
 
 fn done_summary(source_bytes: u64, output_bytes: u64, secs: u64, details: &[String]) -> String {
@@ -801,6 +975,10 @@ fn frame_accurate_source(source: &Path, temp: &TempDir, stem: &str) -> Result<Pa
     }
 
     tracing::info!("[{stem}] AVI with B-frames: working from a Matroska copy of the video");
+    matroska_copy(source, temp)
+}
+
+fn matroska_copy(source: &Path, temp: &TempDir) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&temp.index_path);
     let part = temp.remux_path.with_extension("mkv.part");
     let mut cmd = std::process::Command::new(crate::ext::external_bin("ffmpeg"));
@@ -942,19 +1120,36 @@ fn move_file(from: &Path, to: &Path) -> Result<()> {
         other => return Ok(other?),
     }
     let part = to.with_file_name(crate::scanner::fit_name(&to.file_name().unwrap_or_default().to_string_lossy(), ".part"));
-    let copied = std::fs::copy(from, &part)
-        .and_then(|_| std::fs::File::open(&part)?.sync_all())
-        .and_then(|()| std::fs::rename(&part, to));
+    let copied = copy_to_new(from, &part).and_then(|()| std::fs::rename(&part, to));
     if let Err(e) = copied {
         let _ = std::fs::remove_file(&part);
         return Err(e).context("copy across file systems");
     }
     sync_dir(to);
-    if let Err(e) = std::fs::remove_file(from) {
-        let _ = std::fs::remove_file(to);
-        return Err(e).context("remove the original after copying it");
+    remove_original(from, to)
+}
+
+/// `std::fs::copy` opens the target without O_EXCL and so writes through a symlink there.
+fn copy_to_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut source = std::fs::File::open(from)?;
+    let permissions = source.metadata()?.permissions();
+    let _ = std::fs::remove_file(to);
+    let mut copy = std::fs::OpenOptions::new().write(true).create_new(true).mode(permissions.mode()).open(to)?;
+    copy.set_permissions(permissions)?;
+    std::io::copy(&mut source, &mut copy)?;
+    copy.sync_all()
+}
+
+fn remove_original(from: &Path, copy: &Path) -> Result<()> {
+    match std::fs::remove_file(from) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            let _ = std::fs::remove_file(copy);
+            Err(e).context("remove the original after copying it")
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Best effort: not every network file system can sync a directory.
@@ -1306,11 +1501,12 @@ fn run_copy(job: &Job, ctx: &JobContext, config: &Config, stem: &str, temp: &Tem
     let subtitles = crate::subtitle::plan(&job.source_file, &config.subtitles, audio_plan.probe(), stem)?;
 
     tracing::info!("[{stem}] copy video, processing audio");
-    let source_shift_ms = -probe_source_video(&job.source_file)?.matroska_start_ms;
+    let source_video = probe_source_video(&job.source_file)?;
+    let (source_shift_ms, chapter_shift_ms) = (-source_video.matroska_start_ms, -source_video.chapter_start_ms);
     // mkvmerge times the B-frames of an AVI no better than FFMS2 orders them.
     let video_file = frame_accurate_source(&job.source_file, temp, stem)?;
     let video = MuxVideo {
-        path: &video_file, args: Vec::new(), timestamps: None, source_shift_ms,
+        path: &video_file, args: Vec::new(), timestamps: None, source_shift_ms, chapter_shift_ms,
         remove: false, expected_frames: None,
     };
     finalize(job, ctx, config, temp, &audio_plan, &subtitles, video, started, &[])
@@ -1441,7 +1637,7 @@ fn profile_fingerprint(
     // Without `..`, so a new field has to be placed; the skipped ones are in `merged_args` or follow from the source.
     let EncodeOptions {
         hdr_args: _, keyint: _, chroma_loc: _,
-        scale, crop, deinterlace, mirror, fps_num, fps_den, target_bit_depth, dynamic_hdr, hdr10plus_frames,
+        scale, crop, deinterlace, mirror, fps_num, fps_den, target_bit_depth, dynamic_hdr, hdr10plus_frames, linear_decode,
     } = opts;
     let mut parts = vec![
         format!("{encoder:?}"),
@@ -1459,6 +1655,9 @@ fn profile_fingerprint(
     }
     if let Some(mirror) = mirror {
         parts.push(format!("mirror={mirror:?}"));
+    }
+    if *linear_decode {
+        parts.push("linear_decode".to_string());
     }
     if dynamic_hdr.any() {
         parts.push(format!("{dynamic_hdr:?}"));
@@ -1515,21 +1714,30 @@ fn invalidate_stale_cache(temp: &TempDir, fingerprint: &str, stem: &str) -> Resu
     if prev.is_some() {
         tracing::warn!("[{stem}] encode profile changed, discarding cached scenes and chunks");
         // A leftover that survives would be resumed under the new fingerprint.
-        for removed in [
-            std::fs::remove_file(&temp.scenes_path),
-            std::fs::remove_file(&temp.done_path),
-            std::fs::remove_file(&temp.tq_path),
-            std::fs::remove_dir_all(&temp.chunks_dir),
-        ] {
-            if let Err(e) = removed
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e).with_context(|| format!("discard the stale state in {}", temp.path.display()));
-            }
-        }
-        temp.create_dirs()?;
+        discard_encode_state(temp)?;
     }
     crate::resume::write_atomic(&temp.fingerprint_path, fingerprint.as_bytes())
+}
+
+fn discard_encode_state(temp: &TempDir) -> Result<()> {
+    discard_file(&temp.scenes_path, temp)?;
+    discard_file(&temp.done_path, temp)?;
+    discard_file(&temp.tq_path, temp)?;
+    if let Err(e) = std::fs::remove_dir_all(&temp.chunks_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e).with_context(|| format!("discard the stale state in {}", temp.path.display()));
+    }
+    temp.create_dirs()
+}
+
+fn discard_file(path: &Path, temp: &TempDir) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(e).with_context(|| format!("discard the stale state in {}", temp.path.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Size and mtime have to hold still for 3 s: NFS caches attributes for `acregmin`,
@@ -1600,7 +1808,7 @@ fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
 fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Result<Vec<u64>> {
     let parsed: Packets = match crate::ext::ffprobe_json_with_timeout(
         &["-v", "error", "-select_streams", "v:0",
-          "-show_entries", "packet=size,pts", "-of", "json"],
+          "-show_entries", "packet=size,pts,flags", "-of", "json"],
         source,
         crate::ext::whole_file_timeout(source, 3600),
     ) {
@@ -1612,15 +1820,17 @@ fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Result<Vec
         }
     };
 
-    if parsed.packets.len() as u64 != frames {
+    // An edit list marks the packets it hides with ffprobe's D flag.
+    let shown: Vec<Pkt> = parsed.packets.into_iter().filter(|p| !p.flags.contains('D')).collect();
+    if shown.len() as u64 != frames {
         tracing::warn!(
             "[{stem}] the source has {} video packets but {frames} frames - size cap disabled",
-            parsed.packets.len()
+            shown.len()
         );
         return Ok(Vec::new());
     }
 
-    match cumulative_packet_bytes(&parsed.packets) {
+    match cumulative_packet_bytes(&shown) {
         Some(cum) => Ok(cum),
         None => {
             tracing::warn!("[{stem}] only some of the source's video packets are timestamped - size cap disabled");
@@ -1632,31 +1842,24 @@ fn probe_source_byte_index(source: &Path, frames: u64, stem: &str) -> Result<Vec
 #[derive(serde::Deserialize)]
 struct Packets { #[serde(default)] packets: Vec<Pkt> }
 #[derive(serde::Deserialize)]
-struct Pkt { #[serde(default)] size: Option<String>, #[serde(default)] pts: Option<i64> }
+struct Pkt { #[serde(default)] size: Option<String>, #[serde(default)] pts: Option<i64>, #[serde(default)] flags: String }
 
-/// Decode order in, presentation order out. None where only part of the stream is
-/// timestamped: sorting would move those few packets in front of everything.
 fn cumulative_packet_bytes(packets: &[Pkt]) -> Option<Vec<u64>> {
     let timestamped = packets.iter().filter(|p| p.pts.is_some()).count();
-    if timestamped != 0 && timestamped != packets.len() {
+    if timestamped != 0 && timestamped * 2 <= packets.len() {
         return None;
     }
 
-    let mut sizes: Vec<(i64, u64)> = packets
-        .iter()
-        .enumerate()
-        .map(|(i, pk)| {
-            let size = pk.size.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
-            (pk.pts.unwrap_or(i as i64), size)
-        })
-        .collect();
-    sizes.sort_by_key(|&(pts, _)| pts);
+    let size = |pk: &Pkt| pk.size.as_deref().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let mut sorted: Vec<(i64, u64)> = packets.iter().filter_map(|pk| Some((pk.pts?, size(pk)))).collect();
+    sorted.sort_by_key(|&(pts, _)| pts);
+    let mut sorted = sorted.into_iter().map(|(_, bytes)| bytes);
 
-    let mut cum = Vec::with_capacity(sizes.len() + 1);
+    let mut cum = Vec::with_capacity(packets.len() + 1);
     let mut acc = 0u64;
     cum.push(0);
-    for &(_, size) in &sizes {
-        acc += size;
+    for pk in packets {
+        acc += if pk.pts.is_some() { sorted.next().unwrap_or(0) } else { size(pk) };
         cum.push(acc);
     }
     Some(cum)
@@ -1675,11 +1878,15 @@ fn vfr_timestamps(ts: &[f64], fps_num: u32, fps_den: u32, stem: &str) -> Option<
     if constant {
         return None;
     }
-    if !rebased.windows(2).all(|w| w[1] > w[0]) {
+    if rebased.windows(2).any(|w| w[1] < w[0]) {
         tracing::warn!("[{stem}] source timestamps are not increasing - using a constant frame rate");
         return None;
     }
-    Some(rebased)
+    let mut last = f64::NEG_INFINITY;
+    Some(rebased.into_iter().map(|t| {
+        last = if t > last { t } else { last + 1.0 };
+        last
+    }).collect())
 }
 
 fn write_timestamps(path: &Path, ts: &[f64], offset_ms: i64) -> Result<()> {
@@ -1700,9 +1907,13 @@ struct SourceVideo {
     offset_ms: i64,
     /// mkvmerge reads a Matroska source's own tracks and chapters without that rebase.
     matroska_start_ms: i64,
+    chapter_start_ms: i64,
     sar: Option<(u32, u32)>,
     /// Matroska PixelCrop or MP4 `clap` as left, top, right, bottom.
     container_crop: [u32; 4],
+    container: String,
+    codec: String,
+    has_b_frames: u32,
 }
 
 impl SourceVideo {
@@ -1742,6 +1953,10 @@ impl SourceVideo {
 struct VideoProbe { streams: Vec<VideoProbeStream>, #[serde(default)] format: VideoProbeFormat }
 #[derive(serde::Deserialize)]
 struct VideoProbeStream {
+    #[serde(default)]
+    codec_name: String,
+    #[serde(default)]
+    has_b_frames: u32,
     avg_frame_rate: String,
     #[serde(default)]
     r_frame_rate: String,
@@ -1763,7 +1978,7 @@ struct VideoProbeFormat { #[serde(default)] format_name: String, start_time: Opt
 fn probe_source_video(source: &Path) -> Result<SourceVideo> {
     let probe: VideoProbe = crate::ext::ffprobe_json(
         &["-v", "error", "-select_streams", "v:0",
-          "-show_entries", "stream=avg_frame_rate,r_frame_rate,start_time,sample_aspect_ratio",
+          "-show_entries", "stream=codec_name,has_b_frames,avg_frame_rate,r_frame_rate,start_time,sample_aspect_ratio",
           "-show_entries", "stream_side_data=crop_top,crop_bottom,crop_left,crop_right",
           "-show_entries", "format=format_name,start_time",
           "-of", "json"],
@@ -1785,6 +2000,7 @@ impl SourceVideo {
         let ms = |t: Option<&str>| t.and_then(|t| t.parse::<f64>().ok()).map(|s| (s * 1000.0).round() as i64);
         let container_start = ms(probe.format.start_time.as_deref()).unwrap_or(0);
         let video_start = ms(stream.start_time.as_deref()).unwrap_or(container_start);
+        let matroska = probe.format.format_name.contains("matroska");
 
         let sar = stream.sample_aspect_ratio.as_deref()
             .and_then(|r| r.split_once(':'))
@@ -1797,9 +2013,13 @@ impl SourceVideo {
             fps_num,
             fps_den,
             offset_ms: (video_start - container_start).max(0),
-            matroska_start_ms: if probe.format.format_name.contains("matroska") { container_start } else { 0 },
+            matroska_start_ms: if matroska { container_start } else { 0 },
+            chapter_start_ms: if matroska { container_start } else { container_start.max(0) },
             sar,
             container_crop,
+            container: probe.format.format_name,
+            codec: stream.codec_name,
+            has_b_frames: stream.has_b_frames,
         })
     }
 }
@@ -1866,6 +2086,10 @@ mod tests {
 
         let mut o = opts();
         o.mirror = Some(crate::ffms2::Mirror::Horizontal);
+        assert_ne!(base, profile_fingerprint(enc, &args, &o, &sc, None));
+
+        let mut o = opts();
+        o.linear_decode = true;
         assert_ne!(base, profile_fingerprint(enc, &args, &o, &sc, None));
     }
 
@@ -2084,9 +2308,20 @@ mod output_param_tests {
         let none = packets(r#"{"packets": [{"size": "100"}, {"size": "10"}]}"#);
         assert_eq!(cumulative_packet_bytes(&none).unwrap(), [0, 100, 110]);
 
-        // Mixed: sorting would move the untimestamped packets to the front.
         let mixed = packets(r#"{"packets": [{"size": "100"}, {"size": "10", "pts": 90000}]}"#);
         assert_eq!(cumulative_packet_bytes(&mixed), None);
+    }
+
+    #[test]
+    fn a_few_packets_without_a_time_keep_their_decode_position_and_the_size_cap() {
+        let few = packets(
+            r#"{"packets": [{"size": "1", "pts": 0}, {"size": "2"}, {"size": "4", "pts": 30},
+                            {"size": "8", "pts": 10}, {"size": "16", "pts": 20}]}"#,
+        );
+        assert_eq!(cumulative_packet_bytes(&few).unwrap(), [0, 1, 3, 11, 27, 31]);
+
+        let most_missing = packets(r#"{"packets": [{"size": "1", "pts": 0}, {"size": "2"}, {"size": "4"}]}"#);
+        assert_eq!(cumulative_packet_bytes(&most_missing), None);
     }
 
     #[test]
@@ -2130,6 +2365,52 @@ mod output_param_tests {
 
     fn source_video(json: &str) -> SourceVideo {
         SourceVideo::from_probe(serde_json::from_str(json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn b_frame_reordering_is_no_restart_and_a_join_back_in_time_is() {
+        let frame_ms = 1000.0 / 24.0;
+        let f = frame_ms / 1000.0;
+        assert!(!times_restart(&[0.0, 3.0 * f, f, 2.0 * f, 6.0 * f, 4.0 * f, 5.0 * f], frame_ms));
+        assert!(!times_restart(&[0.0, 16.0 * f, f, 2.0 * f, 3.0 * f], frame_ms));
+        assert!(!times_restart(&[], frame_ms));
+        assert!(times_restart(&[8.0, 8.04, 8.08, 1.4, 1.44], frame_ms));
+    }
+
+    #[test]
+    fn only_mpeg4_avi_with_b_frames_and_transport_streams_with_repeated_times_decode_linearly() {
+        let source = |container: &str, codec: &str, b_frames: u32| source_video(&format!(
+            r#"{{"streams": [{{"avg_frame_rate": "24/1", "codec_name": "{codec}", "has_b_frames": {b_frames}}}],
+            "format": {{"format_name": "{container}"}}}}"#
+        ));
+        let distinct = [0.0, 41.7, 83.3, 125.0];
+        let repeated = [0.0, 41.7, 8333.3, 8333.33, 8375.0];
+        let clean = ts_packets(&[("0.0", "K__"), ("0.125", "___"), ("0.042", "___")]);
+
+        assert!(reads_linearly(&source("avi", "mpeg4", 1), &distinct, &[]));
+        assert!(!reads_linearly(&source("avi", "mpeg4", 0), &distinct, &[]));
+        assert!(!reads_linearly(&source("avi", "h264", 2), &distinct, &[]));
+        assert!(reads_linearly(&source("mpegts", "h264", 2), &repeated, &clean));
+        assert!(!reads_linearly(&source("mpegts", "h264", 2), &distinct, &clean));
+        assert!(!reads_linearly(&source("matroska,webm", "h264", 2), &repeated, &[]));
+    }
+
+    fn ts_packets(packets: &[(&str, &str)]) -> Vec<TsPacket> {
+        packets.iter().map(|(pts, flags)| TsPacket { pts_time: Some(pts.to_string()), flags: flags.to_string() }).collect()
+    }
+
+    #[test]
+    fn a_transport_stream_opening_on_frames_the_decoder_drops_is_not_read_linearly() {
+        let source = source_video(r#"{"streams": [{"avg_frame_rate": "24/1", "codec_name": "h264", "has_b_frames": 2}],
+            "format": {"format_name": "mpegts"}}"#);
+        let repeated = [0.0, 41.7, 8333.3, 8333.33, 8375.0];
+
+        let leading = ts_packets(&[("2.0", "K__"), ("1.958", "___"), ("2.125", "___")]);
+        assert!(!reads_linearly(&source, &repeated, &leading));
+        let mid_gop = ts_packets(&[("2.0", "___"), ("2.042", "K__"), ("2.083", "___")]);
+        assert!(!reads_linearly(&source, &repeated, &mid_gop));
+        let no_time = vec![TsPacket { pts_time: None, flags: "K__".to_string() }];
+        assert!(!reads_linearly(&source, &repeated, &no_time));
     }
 
     #[test]
@@ -2240,11 +2521,27 @@ mod output_param_tests {
     }
 
     #[test]
-    fn leading_frames_join_the_first_chunk_and_every_cut_moves() {
+    fn leading_frames_with_the_time_of_the_first_shown_one_are_counted() {
+        assert_eq!(frames_before_first_shown(&[104.0, 104.0, 104.0, 146.0, 187.0], 104.0), 2);
+        assert_eq!(frames_before_first_shown(&[0.0, 41.0, 83.0, 125.0, 166.0], 125.0), 3);
+        assert_eq!(frames_before_first_shown(&[0.0, 41.0, 83.0], 0.0), 0);
+    }
+
+    #[test]
+    fn spans_match_within_two_frames_or_half_a_percent() {
+        let frame_ms = 1000.0 / 24.0;
+        assert!(spans_match(7_250.0 + 2.0 * frame_ms, 7_250.0, frame_ms));
+        assert!(!spans_match(7_250.0 + 3.0 * frame_ms, 7_250.0, frame_ms));
+        assert!(spans_match(100_490.0, 100_000.0, frame_ms));
+        assert!(!spans_match(100_600.0, 100_000.0, frame_ms));
+    }
+
+    #[test]
+    fn leading_frames_stay_out_of_the_first_chunk_and_every_cut_moves() {
         let mut scenes = vec![scene(0, 0, 24), scene(1, 25, 99), scene(2, 100, 324)];
         shift_scenes(&mut scenes, 6);
         let bounds: Vec<(u64, u64)> = scenes.iter().map(|s| (s.start_frame, s.end_frame)).collect();
-        assert_eq!(bounds, [(0, 30), (31, 105), (106, 330)]);
+        assert_eq!(bounds, [(6, 30), (31, 105), (106, 330)]);
     }
 
     #[test]
@@ -2271,18 +2568,25 @@ mod output_param_tests {
 
     #[test]
     fn a_chunk_list_with_a_gap_is_refused_instead_of_encoded_short() {
-        assert!(validate_scene_list(&[scene(0, 0, 99), scene(1, 100, 239)], 240).is_ok());
+        assert!(validate_scene_list(&[scene(0, 0, 99), scene(1, 100, 239)], 0, 240).is_ok());
 
-        let gap = validate_scene_list(&[scene(0, 0, 99), scene(1, 120, 239)], 240).unwrap_err();
+        let gap = validate_scene_list(&[scene(0, 0, 99), scene(1, 120, 239)], 0, 240).unwrap_err();
         assert!(format!("{gap:#}").contains("gap or an overlap"), "got: {gap:#}");
 
-        let overlap = validate_scene_list(&[scene(0, 0, 99), scene(1, 90, 239)], 240).unwrap_err();
+        let overlap = validate_scene_list(&[scene(0, 0, 99), scene(1, 90, 239)], 0, 240).unwrap_err();
         assert!(format!("{overlap:#}").contains("gap or an overlap"), "got: {overlap:#}");
 
-        assert!(validate_scene_list(&[scene(0, 1, 239)], 240).is_err());
-        assert!(validate_scene_list(&[scene(0, 0, 238)], 240).is_err());
-        assert!(validate_scene_list(&[scene(0, 0, 240)], 240).is_err());
-        assert!(validate_scene_list(&[], 240).is_err());
+        assert!(validate_scene_list(&[scene(0, 1, 239)], 0, 240).is_err());
+        assert!(validate_scene_list(&[scene(0, 0, 238)], 0, 240).is_err());
+        assert!(validate_scene_list(&[scene(0, 0, 240)], 0, 240).is_err());
+        assert!(validate_scene_list(&[], 0, 240).is_err());
+    }
+
+    #[test]
+    fn a_chunk_list_may_start_after_the_leading_frames_it_was_told_about() {
+        assert!(validate_scene_list(&[scene(0, 6, 99), scene(1, 100, 239)], 6, 240).is_ok());
+        assert!(validate_scene_list(&[scene(0, 6, 99), scene(1, 100, 239)], 0, 240).is_err());
+        assert!(validate_scene_list(&[scene(0, 0, 99), scene(1, 100, 239)], 6, 240).is_err());
     }
 
     #[test]
@@ -2303,6 +2607,28 @@ mod output_param_tests {
         backwards.swap(40, 41);
         assert_eq!(vfr_timestamps(&backwards, 45, 1, "t"), None);
         assert_eq!(vfr_timestamps(&[], 24, 1, "t"), None);
+    }
+
+    #[test]
+    fn a_repeated_timestamp_is_raised_and_the_variable_rate_stays() {
+        let mut vfr: Vec<f64> = (0..30).map(|i| i as f64 * 1000.0 / 30.0)
+            .chain((0..60).map(|i| 1000.0 + i as f64 * 1000.0 / 60.0))
+            .collect();
+        vfr[50] = vfr[49];
+        let kept = vfr_timestamps(&vfr, 45, 1, "t").expect("a repeated value fell back to a constant rate");
+        assert_eq!(kept.len(), vfr.len());
+        assert_eq!(kept[50], vfr[49] + 1.0);
+        assert_eq!(kept[51], vfr[51]);
+        assert!(kept.windows(2).all(|w| w[1] > w[0]));
+    }
+
+    #[test]
+    fn a_run_of_repeats_pushes_on_only_as_far_as_it_has_to() {
+        let ts = [0.0, 100.0, 100.0, 100.0, 101.5, 300.0, 400.0];
+        assert_eq!(
+            vfr_timestamps(&ts, 24, 1, "t").expect("variable rate not detected"),
+            [0.0, 100.0, 101.0, 102.0, 103.0, 300.0, 400.0]
+        );
     }
 }
 
@@ -2396,6 +2722,107 @@ mod lifecycle_tests {
         assert_eq!(std::fs::read(processed.join("film.mkv")).unwrap(), b"video");
         assert!(!source.exists() && !temp.path.exists());
         assert!(RETRIES.due(&job));
+    }
+
+    #[test]
+    fn a_part_name_that_is_a_symlink_is_replaced_and_its_target_spared() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (source, part, other) = (dir.path().join("film.mkv"), dir.path().join("film.mkv.part"), dir.path().join("other.mkv"));
+        std::fs::write(&source, b"video").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::fs::write(&other, b"finished encode").unwrap();
+        std::os::unix::fs::symlink(&other, &part).unwrap();
+
+        copy_to_new(&source, &part).unwrap();
+        assert!(!part.is_symlink());
+        assert_eq!(std::fs::read(&part).unwrap(), b"video");
+        assert_eq!(std::fs::metadata(&part).unwrap().permissions().mode() & 0o7777, 0o640);
+        assert_eq!(std::fs::read(&other).unwrap(), b"finished encode");
+
+        std::fs::write(&part, b"the rest of an aborted copy, longer than the source").unwrap();
+        copy_to_new(&source, &part).unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"video");
+    }
+
+    #[test]
+    fn only_an_original_already_gone_leaves_its_copy_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (gone, kept) = (dir.path().join("gone.mkv"), dir.path().join("kept.mkv"));
+        std::fs::write(&kept, b"video").unwrap();
+        remove_original(&gone, &kept).unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), b"video");
+
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let (source, copy) = (locked.join("film.mkv"), dir.path().join("copy.mkv"));
+        std::fs::write(&source, b"video").unwrap();
+        std::fs::write(&copy, b"video").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = remove_original(&source, &copy);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if result.is_ok() {
+            return; // running as root, where the folder's mode stops nobody
+        }
+        assert!(source.exists() && !copy.exists());
+    }
+
+    #[test]
+    fn publishing_replaces_nothing_but_an_empty_leftover_or_a_dangling_link() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (from, to) = (dir.path().join("muxed.mkv"), dir.path().join("film.mkv"));
+
+        std::fs::write(&from, b"encode").unwrap();
+        publish(&from, &to, "film").unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"encode");
+        assert!(!from.exists());
+
+        std::fs::write(&from, b"second").unwrap();
+        std::fs::write(&to, b"").unwrap();
+        publish(&from, &to, "film").unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"second");
+        assert!(!from.exists());
+
+        std::fs::write(&from, b"third").unwrap();
+        std::fs::remove_file(&to).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("nothing"), &to).unwrap();
+        publish(&from, &to, "film").unwrap();
+        assert!(!to.is_symlink());
+        assert_eq!(std::fs::read(&to).unwrap(), b"third");
+
+        std::fs::write(&from, b"fourth").unwrap();
+        std::fs::write(&to, b"").unwrap();
+        rename_unless_finished(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"fourth");
+
+        std::fs::write(&from, b"encode").unwrap();
+        std::fs::write(&to, b"someone else's").unwrap();
+        let err = publish(&from, &to, "film").unwrap_err();
+        assert!(format!("{err:#}").contains("output already exists"), "{err:#}");
+        assert!(!is_transient(&err));
+        assert_eq!(std::fs::read(&to).unwrap(), b"someone else's");
+        assert!(from.exists());
+
+        let err = rename_unless_finished(&from, &to).unwrap_err();
+        assert!(format!("{err:#}").contains("output already exists"), "{err:#}");
+        assert_eq!(std::fs::read(&to).unwrap(), b"someone else's");
+        assert!(from.exists());
+    }
+
+    #[test]
+    fn an_output_that_cannot_be_examined_is_not_replaced() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (from, to) = (dir.path().join("muxed.mkv"), dir.path().join("film.mkv"));
+        std::fs::write(&from, b"encode").unwrap();
+        std::os::unix::fs::symlink(&to, &to).unwrap();
+
+        assert!(publish(&from, &to, "film").is_err());
+        assert!(rename_unless_finished(&from, &to).is_err());
+        assert!(to.is_symlink());
+        assert_eq!(std::fs::read(&from).unwrap(), b"encode");
     }
 
     #[test]

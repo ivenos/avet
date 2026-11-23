@@ -54,6 +54,7 @@ pub fn detect(
     let mut samples: Vec<Crop> = Vec::new();
     let mut failed = 0usize;
     let mut transient = false;
+    let mut killed = false;
     for result in results {
         match result {
             Ok(Ok(Some(c))) => samples.push(c),
@@ -61,6 +62,7 @@ pub fn detect(
             Ok(Err(e))      => {
                 failed += 1;
                 transient |= e.downcast_ref::<crate::job::Transient>().is_some();
+                killed |= e.downcast_ref::<crate::job::Killed>().is_some();
                 tracing::warn!("[{stem}] cropdetect sample failed: {e:#}");
             }
             Err(_)          => { failed += 1; tracing::warn!("[{stem}] cropdetect sample panicked"); }
@@ -69,8 +71,9 @@ pub fn detect(
 
     // A failure is not evidence of "no black bars", and the crop is in the fingerprint.
     if transient {
-        return Err(anyhow::Error::new(crate::job::Transient)
-            .context(format!("auto-crop: {failed} cropdetect sample(s) failed")));
+        let err = anyhow::Error::new(crate::job::Transient);
+        let err = if killed { err.context(crate::job::Killed) } else { err };
+        return Err(err.context(format!("auto-crop: {failed} cropdetect sample(s) failed")));
     }
     if samples.is_empty() {
         if failed > 0 {

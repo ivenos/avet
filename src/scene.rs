@@ -15,7 +15,10 @@ pub fn detect(
     fps: f64,
     stem: &str,
 ) -> Result<Vec<SceneEntry>> {
-    let actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
+    let mut actual_vf = build_detection_vf(vf_filter, cfg.downscale_height);
+    if crate::hdr::detect(source_file)?.matrix_without_swscale {
+        actual_vf = Some(with_convertible_matrix(actual_vf));
+    }
 
     let mut cmd = std::process::Command::new(external_bin("ffmpeg"));
     // FFMS2 decodes in storage orientation and without a container's crop: the crop filter's frame.
@@ -43,9 +46,13 @@ pub fn detect(
 
     // ffmpeg's message is the only useful part of an "init y4m decoder" failure.
     let abort = |mut ffmpeg: std::process::Child, handle: std::thread::JoinHandle<String>, e: anyhow::Error| {
+        let exited = crate::ext::exit_within(&mut ffmpeg, std::time::Duration::from_secs(2));
         let _ = ffmpeg.kill();
         let _ = ffmpeg.wait();
         let stderr = handle.join().unwrap_or_default();
+        if let Some(status) = exited.filter(|s| crate::ext::stopped_from_outside("ffmpeg", *s)) {
+            return Err(crate::ext::tool_error("ffmpeg for scene detection", status, &stderr));
+        }
         match stderr.trim() {
             "" => Err(e),
             s  => Err(e.context(format!("ffmpeg: {s}"))),
@@ -65,13 +72,8 @@ pub fn detect(
         Err(e) => return abort(ffmpeg, stderr_handle, e),
     };
 
-    let speed = match cfg.speed {
-        SceneDetectionSpeedConfig::Standard => SceneDetectionSpeed::Standard,
-        SceneDetectionSpeedConfig::Fast     => SceneDetectionSpeed::Fast,
-    };
-
     let opts = DetectionOptions {
-        analysis_speed: speed,
+        analysis_speed: detection_speed(cfg.speed),
         detect_flashes: true,
         min_scenecut_distance: Some(cfg.min_scene_len),
         max_scenecut_distance: None,
@@ -110,12 +112,27 @@ pub fn detect(
     })
 }
 
+fn detection_speed(speed: SceneDetectionSpeedConfig) -> SceneDetectionSpeed {
+    match speed {
+        SceneDetectionSpeedConfig::Standard => SceneDetectionSpeed::Standard,
+        SceneDetectionSpeedConfig::Fast     => SceneDetectionSpeed::Fast,
+    }
+}
+
 fn build_detection_vf(base_vf: Option<&str>, downscale_height: Option<u32>) -> Option<String> {
     match (base_vf, downscale_height) {
         (None,    None)    => None,
         (Some(v), None)    => Some(v.to_owned()),
         (None,    Some(h)) => Some(format!("scale=-2:min(ih\\,{h})")),
         (Some(v), Some(h)) => Some(format!("{v},scale=-2:min(ih\\,{h})")),
+    }
+}
+
+// The tag only: a YUV conversion leaves luma alone whatever the matrix.
+fn with_convertible_matrix(vf: Option<String>) -> String {
+    match vf {
+        Some(v) => format!("setparams=colorspace=bt709,{v}"),
+        None => "setparams=colorspace=bt709".to_owned(),
     }
 }
 
@@ -204,6 +221,12 @@ mod tests {
     }
 
     #[test]
+    fn each_speed_setting_selects_its_own_detector() {
+        assert_eq!(detection_speed(SceneDetectionSpeedConfig::Standard), SceneDetectionSpeed::Standard);
+        assert_eq!(detection_speed(SceneDetectionSpeedConfig::Fast), SceneDetectionSpeed::Fast);
+    }
+
+    #[test]
     fn detection_vf_none_no_downscale() {
         assert_eq!(build_detection_vf(None, None), None);
     }
@@ -229,6 +252,15 @@ mod tests {
         assert_eq!(
             build_detection_vf(Some("crop=1920:800:0:140"), Some(720)),
             Some("crop=1920:800:0:140,scale=-2:min(ih\\,720)".into())
+        );
+    }
+
+    #[test]
+    fn the_matrix_is_retagged_before_any_other_filter() {
+        assert_eq!(with_convertible_matrix(None), "setparams=colorspace=bt709");
+        assert_eq!(
+            with_convertible_matrix(Some("crop=1920:800:0:140".into())),
+            "setparams=colorspace=bt709,crop=1920:800:0:140"
         );
     }
 

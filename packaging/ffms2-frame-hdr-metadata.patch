@@ -1,7 +1,16 @@
 diff --git a/src/core/videosource.cpp b/src/core/videosource.cpp
-index 018c005..4600640 100644
+index 018c005..1c76fa4 100644
 --- a/src/core/videosource.cpp
 +++ b/src/core/videosource.cpp
+@@ -72,7 +72,7 @@ FFMS_Frame *FFMS_VideoSource::OutputFrame(AVFrame *Frame) {
+     if (LastFrameWidth != Frame->width || LastFrameHeight != Frame->height || LastFramePixelFormat != Frame->format) {
+         if (TargetHeight > 0 && TargetWidth > 0 && !TargetPixelFormats.empty()) {
+             if (!InputFormatOverridden) {
+-                InputFormat = AV_PIX_FMT_NONE;
++                InputFormat = (AVPixelFormat) Frame->format;
+                 InputColorSpace = AVCOL_SPC_UNSPECIFIED;
+                 InputColorRange = AVCOL_RANGE_UNSPECIFIED;
+             }
 @@ -139,6 +139,11 @@ FFMS_Frame *FFMS_VideoSource::OutputFrame(AVFrame *Frame) {
      /* MasteringDisplayMinLuminance can be 0 */
      LocalFrame.HasMasteringDisplayLuminance = !!LocalFrame.MasteringDisplayMaxLuminance;
@@ -14,3 +23,12 @@ index 018c005..4600640 100644
      const AVFrameSideData *DolbyVisionRPUSideData = av_frame_get_side_data(Frame, AV_FRAME_DATA_DOVI_RPU_BUFFER);
      if (DolbyVisionRPUSideData) {
          if (DolbyVisionRPUSideData->size > RPUBufferSize) {
+@@ -471,6 +476,8 @@ void FFMS_VideoSource::SetOutputFormat(const AVPixelFormat *TargetFormats, int W
+     OutputColorRangeSet = true;
+     OutputFormat = AV_PIX_FMT_NONE;
+ 
++    if (!InputFormatOverridden)
++        InputFormat = (AVPixelFormat) DecodeFrame->format;
+     ReAdjustOutputFormat(DecodeFrame);
+     OutputFrame(DecodeFrame);
+ }

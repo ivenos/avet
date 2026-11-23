@@ -10,6 +10,7 @@ use std::sync::{Once, OnceLock};
 use crate::ext::external_bin;
 
 const FFMS_ERROR_BUFFER_SIZE: usize = 1024;
+const FFMS_SEEK_LINEAR: c_int = 0;
 const FFMS_SEEK_NORMAL: c_int = 1;
 const FFMS_TYPE_VIDEO: c_int = 0;
 const FFMS_RESIZER_BICUBIC: c_int  = 4;
@@ -615,6 +616,14 @@ pub struct VideoInfo {
     pub orientation: Orientation,
 }
 
+thread_local! {
+    static RESIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn take_resized() -> bool {
+    RESIZED.replace(false)
+}
+
 pub struct VideoSource {
     ptr: *mut FFMS_VideoSource,
     pub info: VideoInfo,
@@ -641,6 +650,14 @@ pub struct OpenOpts {
 
 impl VideoSource {
     pub fn open(source_file: &Path, index_file: &Path, opts: OpenOpts) -> Result<Self> {
+        Self::open_with(source_file, index_file, opts, FFMS_SEEK_NORMAL)
+    }
+
+    pub fn open_linear(source_file: &Path, index_file: &Path, opts: OpenOpts) -> Result<Self> {
+        Self::open_with(source_file, index_file, opts, FFMS_SEEK_LINEAR)
+    }
+
+    fn open_with(source_file: &Path, index_file: &Path, opts: OpenOpts, seek_mode: c_int) -> Result<Self> {
         let mut idx = Index::read(index_file)?;
         let track = idx.first_video_track()?;
 
@@ -650,7 +667,7 @@ impl VideoSource {
             .with_context(|| format!("NUL byte in source path: {}", source_file.display()))?;
         let mut ei = ErrorInfo::new();
         let ptr = unsafe {
-            FFMS_CreateVideoSource(csrc.as_ptr(), track, idx.0, 1, FFMS_SEEK_NORMAL, &mut ei.raw)
+            FFMS_CreateVideoSource(csrc.as_ptr(), track, idx.0, 1, seek_mode, &mut ei.raw)
         };
         if ptr.is_null() {
             bail!("FFMS_CreateVideoSource failed: {}", ei.message());
@@ -760,6 +777,25 @@ impl VideoSource {
         }
     }
 
+    /// FFMS2's scaled_width is the target even for an unscaled frame; only its scaler's buffer is one av_image_alloc block.
+    fn holds_output(frame: &FFMS_Frame, info: &VideoInfo) -> bool {
+        let format = &info.pixel_format;
+        let (w, h) = (info.width as usize, info.height as usize);
+        let same_layout = frame.encoded_pixel_format == format.pix_fmt
+            || pixel_layout(frame.encoded_pixel_format).is_some_and(|l| Some(l) == pixel_layout(format.pix_fmt));
+        if same_layout && frame.encoded_width as usize == w && frame.encoded_height as usize == h {
+            return true;
+        }
+        let (chroma_w, chroma_h, _, _) = Self::chroma_geometry(format.subsampling, w, h, 0, 0);
+        let mut next = frame.data[0] as usize;
+        [(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)].iter().enumerate().all(|(i, &(plane_w, plane_h))| {
+            let line = (plane_w * format.bytes_per_sample()).next_multiple_of(4);
+            let in_place = frame.data[i] as usize == next && usize::try_from(frame.linesize[i]) == Ok(line);
+            next = next.wrapping_add(line * plane_h);
+            in_place
+        })
+    }
+
     pub fn write_y4m_range<W: Write>(
         &mut self,
         writer: &mut W,
@@ -807,10 +843,19 @@ impl VideoSource {
             if frame.is_null() {
                 bail!("FFMS_GetFrame({frame_n}) failed: {}", ei.message());
             }
+            let frame_ref = unsafe { &*frame };
+            if !Self::holds_output(frame_ref, info) {
+                bail!(
+                    "FFMS_GetFrame({frame_n}): FFMS2 did not scale this {}x{} frame to the source's {}x{}",
+                    frame_ref.encoded_width, frame_ref.encoded_height, info.width, info.height
+                );
+            }
+            if (frame_ref.encoded_width as u32, frame_ref.encoded_height as u32) != (info.width, info.height) {
+                RESIZED.set(true);
+            }
 
             writer.write_all(b"FRAME\n").context("write FRAME marker")?;
 
-            let frame_ref = unsafe { &*frame };
             if let Some(out) = hdr_metadata.as_deref_mut() {
                 out.push(FrameHdrMetadata {
                     dovi_rpu: unsafe { side_data(frame_ref.dolby_vision_rpu, frame_ref.dolby_vision_rpu_size) },
@@ -935,6 +980,57 @@ mod tests {
 
         let unknown = detect_pixel_format(-1);
         assert_eq!((unknown.pix_fmt, unknown.bit_depth), (get_pixel_format("yuv420p10le"), 10));
+    }
+
+    fn frame_at(width: c_int, height: c_int, pix_fmt: c_int, data: [usize; 3], linesize: [c_int; 3]) -> FFMS_Frame {
+        let mut frame: FFMS_Frame = unsafe { std::mem::zeroed() };
+        frame.encoded_width = width;
+        frame.encoded_height = height;
+        frame.encoded_pixel_format = pix_fmt;
+        frame.scaled_width = 1280;
+        frame.scaled_height = 720;
+        for i in 0..3 {
+            frame.data[i] = std::ptr::without_provenance(data[i]);
+            frame.linesize[i] = linesize[i];
+        }
+        frame
+    }
+
+    fn output_of(pix_fmt: c_int, bit_depth: u32) -> VideoInfo {
+        VideoInfo {
+            width: 1280, height: 720, fps_num: 24, fps_den: 1, sar_num: 1, sar_den: 1, num_frames: 1,
+            pixel_format: PixelFormat { pix_fmt, bit_depth, subsampling: PixelSubsampling::Yuv420 },
+            orientation: Orientation::default(),
+        }
+    }
+
+    #[test]
+    fn a_frame_ffms2_left_at_another_size_or_format_is_not_read_as_the_output() {
+        FFMS_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
+        let yuv420 = get_pixel_format("yuv420p");
+        let info = output_of(yuv420, 8);
+        let base = 0x10_0000;
+        let scaler_buffer = [base, base + 1280 * 720, base + 1280 * 720 + 640 * 360];
+
+        assert!(VideoSource::holds_output(&frame_at(1280, 720, yuv420, [base, 0x90_0000, 0xA0_0000], [1312, 656, 656]), &info));
+        assert!(VideoSource::holds_output(&frame_at(1280, 720, get_pixel_format("yuvj420p"), [base, 0x90_0000, 0xA0_0000], [1312, 656, 656]), &info));
+        assert!(VideoSource::holds_output(&frame_at(1280, 64, yuv420, scaler_buffer, [1280, 640, 640]), &info));
+        assert!(VideoSource::holds_output(&frame_at(1920, 1080, yuv420, scaler_buffer, [1280, 640, 640]), &info));
+        assert!(VideoSource::holds_output(&frame_at(1280, 720, get_pixel_format("yuv444p"), scaler_buffer, [1280, 640, 640]), &info));
+
+        assert!(!VideoSource::holds_output(&frame_at(1280, 64, yuv420, [base, 0x90_0000, 0xA0_0000], [1312, 656, 656]), &info));
+        assert!(!VideoSource::holds_output(&frame_at(1920, 720, yuv420, [base, base + 1920 * 720, base + 1920 * 720 + 960 * 360], [1920, 960, 960]), &info));
+        assert!(!VideoSource::holds_output(&frame_at(1280, 720, get_pixel_format("yuv422p"), [base, 0x90_0000, 0xA0_0000], [1312, 656, 656]), &info));
+    }
+
+    #[test]
+    fn the_scaler_buffer_of_a_ten_bit_output_has_two_bytes_a_sample() {
+        FFMS_INIT.call_once(|| unsafe { FFMS_Init(0, 0) });
+        let info = output_of(get_pixel_format("yuv420p10le"), 10);
+        let base = 0x10_0000;
+        let buffer = [base, base + 2560 * 720, base + 2560 * 720 + 1280 * 360];
+        assert!(VideoSource::holds_output(&frame_at(640, 360, get_pixel_format("yuv420p"), buffer, [2560, 1280, 1280]), &info));
+        assert!(!VideoSource::holds_output(&frame_at(640, 360, get_pixel_format("yuv420p"), buffer, [1280, 640, 640]), &info));
     }
 
     #[test]

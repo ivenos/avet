@@ -215,10 +215,7 @@ assert_log_contains "HDR10+: reading it from the bitstream"
 assert_log_contains "encoding: 4 chunks,"
 assert_video_frames "$O/test.mkv" 96
 assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" 96
-# AverageRGB 123 belongs to frame 23, the last one that has its own metadata.
-carried=$(ffprobe -v error "$O/test.mkv" -select_streams v:0 -show_frames \
-    -show_entries frame_side_data=average_maxrgb -of default=nw=1:nk=1 | grep -cx "123/100000")
-[ "$carried" = 73 ] || fail "frames carrying frame 23's HDR10+: expected 73, got $carried"
+assert_hdr10plus_matches "$O/test.mkv" "$FIXTURES_DIR/hdr10plus_sparse.mkv"
 
 I="$WORKDIR/16/in"; O="$WORKDIR/16/out"; mkdir -p "$I/p" "$O"
 CUT="$WORKDIR/16/cut.mp4"
@@ -238,9 +235,7 @@ EOF
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10+ from a cut MP4: no output"
 assert_log_contains "HDR10+: reading it from the bitstream"
 assert_log_not_contains "using the decoder's values"
-expected=$(awk 'BEGIN { for (i = 112; i <= 123; i++) printf "%d ", i; for (i = 24; i < 96; i++) printf "123%s", (i < 95 ? " " : "") }')
-got=$(hdr10plus_average_rgb "$O/test.mkv")
-[ "$got" = "$expected" ] || fail "HDR10+ from a cut MP4: expected AverageRGB '$expected', got '$got'"
+assert_hdr10plus_matches "$O/test.mkv" "$CUT"
 
 # No RPU on the very first picture: the output still carries a Dolby Vision record
 I="$WORKDIR/17/in"; O="$WORKDIR/17/out"; mkdir -p "$I/p" "$O"
@@ -302,6 +297,7 @@ assert_log_contains     "HDR: HDR10+"
 assert_log_not_contains "HDR metadata incomplete"
 assert_hdr_static_match "$O/test.mkv" "$FIXTURES_DIR/hdr10plus_gop.mkv"
 assert_frames_with_side_data "$O/test.mkv" "SMPTE2094-40" "$(packet_count "$O/test.mkv")"
+assert_hdr10plus_matches "$O/test.mkv" "$FIXTURES_DIR/hdr10plus_recording.ts"
 
 # HDR10 whose Matroska Colour element holds only the matrix: the primaries come from the VUI
 I="$WORKDIR/22/in"; O="$WORKDIR/22/out"; mkdir -p "$I/p" "$O"
@@ -323,5 +319,122 @@ printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\nbi
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10 at 8 bits: no output"
 assert_log_contains  "[test] HDR: HDR10 is encoded at bit_depth = 8, which shows banding"
 assert_video_pix_fmt "$O/test.mkv" "yuv420p"
+
+# Dolby Vision in a second video stream, as on a UHD Blu-ray: the base layer alone, and the log says so
+LAYERS="$WORKDIR/400/layers.mkv"; mkdir -p "$WORKDIR/400"
+ffmpeg -nostdin -y -hide_banner -loglevel error -i "$FIXTURES_DIR/hdr10.mkv" -i "$FIXTURES_DIR/dv81_hdr10plus.mkv" \
+    -map 0:v:0 -map 1:v:0 -c copy "$LAYERS"
+[ "$(stream_value "$LAYERS" v:1 stream_side_data=dv_profile)" = 8 ] || fail "two streams: the second has no Dolby Vision record"
+for dv in true false; do
+    I="$WORKDIR/400/$dv/in"; O="$WORKDIR/400/$dv/out"; mkdir -p "$I/p" "$O"
+    cp "$LAYERS" "$I/p/test.mkv"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\ndv = %s\n' "$dv" > "$I/p/encode.toml"
+    run_avet "$I" "$O" "$O/test.mkv" 120 || fail "two streams, dv = $dv: no output"
+    assert_dovi_record "$O/test.mkv" ""
+    if [ "$dv" = true ]; then
+        assert_log_contains "HDR: Dolby Vision is in a separate video stream: only the base layer is encoded"
+    else
+        assert_log_not_contains "separate video stream"
+    fi
+done
+
+# 10-bit HEVC with a matrix swscale cannot convert: scene detection works and the tag stays
+for m in ictcp bt2020c ycgco smpte2085 chroma-derived-nc chroma-derived-c; do
+    I="$WORKDIR/401/$m/in"; O="$WORKDIR/401/$m/out"; mkdir -p "$I/p" "$O"
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v 24 -pix_fmt yuv420p10le \
+        -c:v libx265 -preset ultrafast -x265-params "log-level=error:keyint=24:scenecut=0:colorprim=bt2020:transfer=smpte2084:colormatrix=$m" \
+        "$I/p/test.mkv"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$I/p/encode.toml"
+    run_avet "$I" "$O" "$O/test.mkv" 120 || fail "matrix $m: no output"
+    assert_video_frames "$O/test.mkv" 24
+    assert_color_value  "$O/test.mkv" color_space "$m"
+done
+
+# a matrix AV1 has no code for fails the job instead of losing its tag
+for code in 15 16 17; do
+    I="$WORKDIR/402/$code/in"; O="$WORKDIR/402/$code/out"; mkdir -p "$I/p" "$O"
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v 24 -pix_fmt yuv420p10le \
+        -c:v libx265 -preset ultrafast -x265-params "log-level=error:keyint=24:scenecut=0:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" \
+        -bsf:v "hevc_metadata=matrix_coefficients=$code" "$I/p/test.mkv"
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$I/p/encode.toml"
+    run_avet_timed "$I" "$O" 60 "job failed"
+    assert_file_not_exists "$O/test.mkv"
+    assert_file_exists     "$O/.avet_test/.failed"
+    assert_file_exists     "$I/p/test.mkv"
+done
+
+# a matrix swscale cannot convert that changes between frames fails instead of labeling them all as one
+I="$WORKDIR/403/in"; O="$WORKDIR/403/out"; mkdir -p "$I/p" "$O"
+for part in "a 60 bt2020nc" "b 24 ictcp"; do
+    set -- $part
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v "$2" -pix_fmt yuv420p10le -c:v libx265 -preset ultrafast \
+        -x265-params "log-level=error:keyint=24:scenecut=0:bframes=0:colorprim=bt2020:transfer=smpte2084:colormatrix=$3" "$WORKDIR/403/$1.hevc"
+done
+cat "$WORKDIR/403/a.hevc" "$WORKDIR/403/b.hevc" > "$WORKDIR/403/all.hevc"
+mkvmerge -q -o "$I/p/test.mkv" --default-duration 0:24fps "$WORKDIR/403/all.hevc"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$I/p/encode.toml"
+run_avet_timed "$I" "$O" 60 "job failed"
+assert_file_not_exists "$O/test.mkv"
+assert_file_exists     "$O/.avet_test/.failed"
+assert_file_exists     "$I/p/test.mkv"
+
+refused_for() { # NUMBER MESSAGE
+    printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$WORKDIR/$1/in/p/encode.toml"
+    run_avet_timed "$WORKDIR/$1/in" "$WORKDIR/$1/out" 60 "job failed"
+    assert_log_contains    "$2"
+    assert_file_not_exists "$WORKDIR/$1/out/test.mkv"
+    assert_file_exists     "$WORKDIR/$1/out/.avet_test/.failed"
+}
+
+hevc_parts() { # NUMBER PARAMS_A FRAMES_A PARAMS_B FRAMES_B, into $WORKDIR/NUMBER/in/p/test.mkv
+    mkdir -p "$WORKDIR/$1/in/p" "$WORKDIR/$1/out"
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v "$3" -pix_fmt yuv420p10le -c:v libx265 -preset ultrafast \
+        -x265-params "log-level=error:keyint=24:scenecut=0:bframes=0:$2" "$WORKDIR/$1/a.hevc"
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v "$5" -pix_fmt yuv420p10le -c:v libx265 -preset ultrafast \
+        -x265-params "log-level=error:keyint=24:scenecut=0:bframes=0:$4" "$WORKDIR/$1/b.hevc"
+    cat "$WORKDIR/$1/a.hevc" "$WORKDIR/$1/b.hevc" > "$WORKDIR/$1/all.hevc"
+    mkvmerge -q -o "$WORKDIR/$1/in/p/test.mkv" --default-duration 0:24fps "$WORKDIR/$1/all.hevc"
+}
+
+# SDR frames followed by PQ, the last parameter set in the stream header
+hevc_parts 830 "colorprim=bt709:transfer=bt709:colormatrix=bt709" 60 "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" 24
+refused_for 830 "color matrix changes inside the video, from bt709 to bt2020nc"
+
+# the transfer alone goes from SDR to PQ
+hevc_parts 831 "colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc" 60 "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc" 24
+refused_for 831 "transfer changes inside the video, from bt2020-10 to smpte2084"
+
+# limited range followed by full range, nothing else different
+I="$WORKDIR/832/in"; mkdir -p "$I/p" "$WORKDIR/832/out"
+for part in "a tv off 0" "b pc on 2"; do
+    set -- $part
+    ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "color=white:size=320x180:rate=24:d=2" -vf "scale=out_range=$2,format=yuv420p" -color_range "$2" \
+        -c:v libx264 -preset ultrafast -bf 2 -x264-params "scenecut=0:keyint=24:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=$3" -f mpegts -output_ts_offset "$4" "$WORKDIR/832/$1.ts"
+done
+cat "$WORKDIR/832/a.ts" "$WORKDIR/832/b.ts" > "$I/p/test.ts"
+refused_for 832 "color range changes inside the video, from tv to pc"
+
+# HLG named by an alternative transfer SEI on the first key frames only: frames decoded after a seek show the VUI
+TAGS="colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc"
+hevc_parts 833 "$TAGS:atc-sei=18:pic-struct=0" 48 "$TAGS" 48
+I="$WORKDIR/833/in"; O="$WORKDIR/833/out"
+[ "$(ffprobe -v error -select_streams v:0 -read_intervals "%+#1" -show_entries frame=color_transfer -of csv=p=0 "$I/p/test.mkv" | tr -d ',\n')" = arib-std-b67 ] \
+    || fail "SEI fixture: the first frame is not HLG"
+ffprobe -v error -select_streams v:0 -read_intervals "3%+#6" -show_entries frame=color_transfer -of csv=p=0 "$I/p/test.mkv" | grep -q bt2020-10 \
+    || fail "SEI fixture: the frames after a seek carry the SEI too"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "SEI on some key frames: no output"
+assert_log_contains   "HDR: HLG"
+assert_color_transfer "$O/test.mkv" "arib-std-b67"
+assert_video_frames   "$O/test.mkv" 96
+
+# a container tag that disagrees with every frame is not a change inside the video
+I="$WORKDIR/834/in"; O="$WORKDIR/834/out"; mkdir -p "$I/p" "$O"
+ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=256x144:rate=24" -frames:v 48 -pix_fmt yuv420p -c:v libx264 -preset ultrafast \
+    -x264-params "keyint=24:scenecut=0:colorprim=bt709:transfer=bt709:colormatrix=bt709" "$WORKDIR/834/v.h264"
+mkvmerge -q -o "$I/p/test.mkv" --default-duration 0:24fps --color-matrix-coefficients 0:6 --color-transfer-characteristics 0:6 "$WORKDIR/834/v.h264"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 55\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 120 || fail "container tag against the frames: no output"
+assert_log_not_contains "changes inside the video"
 
 test_done

@@ -142,7 +142,7 @@ struct Packet {
     flags: String,
 }
 
-/// Carries each message on in display order, as a decoder playing from the start would; FFmpeg's
+/// Carries each message on in decode order, as a decoder playing from the start would; FFmpeg's
 /// does so only until the next seek. A picture an edit list discards is no frame in FFMS2.
 fn in_display_order(packets: &[Packet], units: Vec<Option<Vec<u8>>>) -> Result<Vec<Option<Arc<[u8]>>>> {
     ensure!(
@@ -150,20 +150,21 @@ fn in_display_order(packets: &[Packet], units: Vec<Option<Vec<u8>>>) -> Result<V
         "{} video packets but {} pictures in the bitstream", packets.len(), units.len()
     );
     let pts = packets.iter().map(|p| p.pts.context("a video packet has no timestamp")).collect::<Result<Vec<_>>>()?;
-    let mut order: Vec<usize> = (0..units.len()).collect();
-    order.sort_by_key(|&i| pts[i]);
 
-    let units: Vec<Option<Arc<[u8]>>> = units.into_iter().map(|u| u.map(Arc::from)).collect();
-    let mut current = None;
-    Ok(order
+    let mut current: Option<Arc<[u8]>> = None;
+    let carried: Vec<Option<Arc<[u8]>>> = units
         .into_iter()
-        .filter_map(|i| {
-            if let Some(m) = &units[i] {
-                current = Some(Arc::clone(m));
+        .map(|u| {
+            if let Some(m) = u {
+                current = Some(Arc::from(m));
             }
-            (!packets[i].flags.contains('D')).then(|| current.clone())
+            current.clone()
         })
-        .collect())
+        .collect();
+
+    let mut order: Vec<usize> = (0..carried.len()).filter(|&i| !packets[i].flags.contains('D')).collect();
+    order.sort_by_key(|&i| pts[i]);
+    Ok(order.into_iter().map(|i| carried[i].clone()).collect())
 }
 
 fn video_packets(source: &Path) -> Result<Vec<Packet>> {
@@ -397,19 +398,21 @@ mod tests {
         }
 
         #[test]
-        fn display_order_carries_the_last_message_on(
+        fn each_frame_shows_the_last_message_in_decode_order(
             order in Just((0..40).collect::<Vec<i64>>()).prop_shuffle(),
             messages in prop::collection::vec(prop::option::of(any::<u8>()), 40),
         ) {
             let units: Vec<Option<Vec<u8>>> = messages.iter().map(|m| m.map(|b| vec![b])).collect();
             let frames = in_display_order(&shown(&order), units).unwrap();
 
-            let mut by_pts: Vec<(i64, Option<u8>)> = order.iter().copied().zip(messages.iter().copied()).collect();
-            by_pts.sort();
             let mut current = None;
-            for ((_, m), frame) in by_pts.iter().zip(&frames) {
+            let mut by_pts: Vec<(i64, Option<u8>)> = order.iter().zip(&messages).map(|(&pts, m)| {
                 if m.is_some() { current = *m; }
-                prop_assert_eq!(frame.as_ref().map(|f| f[0]), current);
+                (pts, current)
+            }).collect();
+            by_pts.sort();
+            for ((_, want), frame) in by_pts.iter().zip(&frames) {
+                prop_assert_eq!(frame.as_ref().map(|f| f[0]), *want);
             }
         }
     }
@@ -455,12 +458,12 @@ mod tests {
     }
 
     #[test]
-    fn values_carry_on_in_display_order_not_decode_order() {
+    fn values_carry_on_in_decode_order_not_display_order() {
         // Decode order I0 P4 B2 B1 B3 I5, with a new message on P4 only.
         let units = vec![Some(vec![10]), Some(vec![40]), None, None, None, None];
         let frames = in_display_order(&shown(&[0, 4, 2, 1, 3, 5]), units).unwrap();
         let values: Vec<Option<u8>> = frames.iter().map(|f| f.as_ref().map(|m| m[0])).collect();
-        assert_eq!(values, [Some(10), Some(10), Some(10), Some(10), Some(40), Some(40)]);
+        assert_eq!(values, [Some(10), Some(40), Some(40), Some(40), Some(40), Some(40)]);
 
         assert!(in_display_order(&shown(&[0]), vec![None, None]).is_err());
         assert!(in_display_order(&[Packet { pts: None, flags: String::new() }], vec![None]).is_err());
@@ -479,7 +482,7 @@ mod tests {
         let units = vec![Some(vec![10]), None, Some(vec![20]), None, Some(vec![40])];
         let frames = in_display_order(&packets, units).unwrap();
         let values: Vec<Option<u8>> = frames.iter().map(|f| f.as_ref().map(|m| m[0])).collect();
-        assert_eq!(values, [Some(20), Some(20), Some(40)]);
+        assert_eq!(values, [Some(20), Some(10), Some(40)]);
     }
 
     #[test]

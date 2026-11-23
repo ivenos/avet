@@ -84,6 +84,17 @@ expect_fail "a lost default flag"    assert_tracks_match "$W/flag.mkv" "$SRC" a
 expect_pass "same chapters"          assert_chapters_match "$SRC" "$SRC"
 expect_fail "chapters 50 ms late"    assert_chapters_match "$W/chapters50.mkv" "$SRC"
 expect_fail "no chapters"            assert_chapters_match "$W/nochapters.mkv" "$SRC"
+chapters() { # FILE LAST_TITLE
+    printf 'CHAPTER01=00:00:00.000\nCHAPTER01NAME=Opening\nCHAPTER02=00:00:03.500\nCHAPTER02NAME=Middle\nCHAPTER03=00:00:07.250\nCHAPTER03NAME=%s\n' "$2" > "$W/$1.txt"
+    mkvmerge -q -o "$W/$1.mkv" --no-chapters --chapters "$W/$1.txt" "$SRC"
+    need "$W/$1.mkv"
+}
+chapters retitled "The Finish"
+chapters comma_one "Act One, Scene One"
+chapters comma_two "Act One, Scene Two"
+expect_pass "the same chapters again" assert_chapters_match "$W/comma_one.mkv" "$W/comma_one.mkv"
+expect_fail "another second word in a title" assert_chapters_match "$W/retitled.mkv" "$SRC"
+expect_fail "a title differing after a comma" assert_chapters_match "$W/comma_two.mkv" "$W/comma_one.mkv"
 expect_pass "same attachments"       assert_attachments_match "$SRC" "$SRC"
 expect_fail "a changed attachment"   assert_attachments_match "$W/attachment.mkv" "$SRC"
 
@@ -119,6 +130,14 @@ expect_pass "the same pictures"      assert_frames_identical "$SRC" "$SRC"
 expect_fail "two swapped pictures"   assert_frames_identical "$W/swapped.mkv" "$SRC"
 expect_pass "subtitles shown on time" assert_subtitle_events_match "$SRC" s:0 "$SRC" s:0
 expect_fail "subtitles 100 ms late"  assert_subtitle_events_match "$W/sub100.mkv" s:0 "$SRC" s:0
+printf '1\n00:00:01,000 --> 00:00:02,500\nFirst line.\n\n2\n00:00:04,000 --> 00:00:06,042\nGarbled line.\n\n' > "$W/garbled.srt"
+mkvmerge -q -o "$W/garbled_subs.mkv" --no-subtitles "$SRC" --language 0:eng "$W/garbled.srt"
+need "$W/garbled_subs.mkv"
+expect_fail "another text at the same time" assert_subtitle_events_match "$W/garbled_subs.mkv" s:0 "$SRC" s:0
+expect_fail "another text from the first picture on" assert_subtitle_events_match "$W/garbled_subs.mkv" s:0 "$SRC" s:0 from_picture
+expect_pass "the same text from MP4" assert_subtitle_events_match "$FIXTURES_DIR/subs_text.mp4" s:0 "$SRC" s:0
+expect_pass "bitmap subtitles, no text to read" assert_subtitle_events_match "$FIXTURES_DIR/subs_bitmap.mkv" s:0 "$FIXTURES_DIR/subs_bitmap.mkv" s:0
+expect_pass "bitmap subtitles in a TS" assert_subtitle_events_match "$FIXTURES_DIR/subs_dvb.ts" s:0 "$FIXTURES_DIR/subs_dvb.ts" s:0
 expect_pass "a chunk on a keyframe"  assert_keyframes_at_chunks "$SRC" "$W/one_chunk.json"
 expect_fail "a chunk without one"    assert_keyframes_at_chunks "$SRC" "$W/two_chunks.json"
 printf '[]' > "$W/no_chunks.json"
@@ -192,6 +211,10 @@ expect_fail "none in frames that never decode" assert_frames_with_side_data "$W/
 expect_pass "HDR10+ values as in the source" assert_hdr10plus_matches "$DV" "$DV"
 expect_fail "another sequence of them" assert_hdr10plus_matches "$FIXTURES_DIR/hdr10plus_sparse.mkv" "$DV"
 expect_fail "none at all"            assert_hdr10plus_matches "$SRC" "$DV"
+need "$FIXTURES_DIR/hdr10plus_anchors.mkv"
+[ "$(hdr10plus_average_rgb "$FIXTURES_DIR/hdr10plus_anchors.mkv")" = "$(hdr10plus_average_rgb "$DV")" ] || \
+    fail "selftest: hdr10plus_anchors.mkv should differ from its source in the tone curve alone"
+expect_fail "another tone curve, the same AverageRGB" assert_hdr10plus_matches "$FIXTURES_DIR/hdr10plus_anchors.mkv" "$DV"
 expect_pass "the Dolby Vision record" assert_dovi_record "$DV" "8,1"
 expect_fail "the wrong profile"      assert_dovi_record "$DV" "10,1"
 expect_fail "no record at all"       assert_dovi_record "$SRC" "8,1"

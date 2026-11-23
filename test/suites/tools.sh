@@ -30,6 +30,23 @@ tool ffmpeg -nostdin -hide_banner -i "$W/src.mkv" -map 0:v:0 -vf idet -f null - 
 tool ffmpeg -nostdin -hide_banner -i "$W/src.mkv" -map 0:v:0 -vf cropdetect=0.094:2:0 -f null - 2>&1 | \
     grep -qE ' crop=320:240:0:0$' || fail "ffmpeg cropdetect: no 'crop=W:H:X:Y' at the end of a line"
 
+# ffmpeg: the flag columns of -codecs and -encoders, which avet reads by position
+codecs=$(tool ffmpeg -hide_banner -codecs)
+encoders=$(tool ffmpeg -hide_banner -encoders)
+flags_of() { printf '%s\n' "$1" | awk -v name="$2" '$2 == name { print $1; exit }'; }
+case "$(flags_of "$codecs" flac)" in
+    D?A??S) ;;
+    *) fail "ffmpeg -codecs: flac has the flags '$(flags_of "$codecs" flac)', expected D?A??S" ;;
+esac
+case "$(flags_of "$codecs" aac)" in
+    D?A??[!S]) ;;
+    *) fail "ffmpeg -codecs: aac has the flags '$(flags_of "$codecs" aac)', expected D?A?? without S" ;;
+esac
+case "$(flags_of "$encoders" libopus)" in
+    A?????) ;;
+    *) fail "ffmpeg -encoders: libopus has the flags '$(flags_of "$encoders" libopus)', expected A and five more" ;;
+esac
+
 # ffmpeg and mkvmerge on a full disk
 tool ffmpeg -nostdin -hide_banner -loglevel error -y -i "$W/src.mkv" -map 0:v:0 -c copy -f matroska /dev/full 2>&1 | \
     grep -q 'No space left' || fail "ffmpeg: no 'No space left' on a full disk"
@@ -115,5 +132,9 @@ identified=$(tool mkvmerge --ui-language en_US --identify --identification-forma
 for property in '"number":' '"language":' '"language_ietf":'; do
     printf '%s\n' "$identified" | grep -qF "$property" || fail "mkvmerge --identify: no $property property"
 done
+code=$(tool sh -c 'ffmpeg -nostdin -hide_banner -loglevel quiet -re -f lavfi -i testsrc2=size=64x64:rate=24 -f null - & p=$!; sleep 1; kill -TERM $p; wait $p; echo $?')
+[ "$code" = 255 ] || fail "ffmpeg after SIGTERM: exit code $code, avet reads 255 as stopped from outside"
+empty=$(ffprobe -v error -select_streams s:0 -show_entries packet=size -of csv=p=0 "$FIXTURES_DIR/subs_text.mp4" | head -n 1 | tr -d ,)
+[ "$empty" = 2 ] || fail "mov_text: the empty sample has $empty bytes, avet reads 2"
 
 test_done

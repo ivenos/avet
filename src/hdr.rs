@@ -29,6 +29,7 @@ pub struct HdrInfo {
     pub dv_rpu_profile: Option<u32>,
     /// HDR10+ in the probed frames; also set under Dolby Vision, which wins `hdr_type`.
     pub hdr10plus: bool,
+    pub matrix_without_swscale: bool,
 }
 
 impl HdrInfo {
@@ -93,6 +94,11 @@ impl HdrInfo {
     }
 }
 
+// libswscale fails on these with "Impossible to convert". ycgco-re, ycgco-ro and ipt-c2 fail too, but AV1 has no code for them.
+const MATRICES_WITHOUT_SWSCALE: [&str; 6] = [
+    "ycgco", "bt2020c", "smpte2085", "chroma-derived-nc", "chroma-derived-c", "ictcp",
+];
+
 #[derive(Deserialize)]
 struct ProbeOutput {
     #[serde(default)]
@@ -129,6 +135,7 @@ struct ProbeFrame {
     color_transfer: Option<String>,
     color_primaries: Option<String>,
     color_space: Option<String>,
+    color_range: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +177,79 @@ pub fn detect(source_file: &Path) -> Result<HdrInfo> {
         )
     })
     .context("HDR detection")
+}
+
+pub fn dv_in_another_stream(source_file: &Path) -> Result<bool> {
+    let probe: ProbeOutput = crate::ext::ffprobe_json(
+        &[
+            "-v", "error",
+            "-select_streams", "v",
+            "-show_entries", "stream=index",
+            "-show_entries", "stream_side_data=dv_profile",
+            "-print_format", "json",
+        ],
+        source_file,
+    )
+    .context("look for Dolby Vision on the other video streams")?;
+    Ok(has_dv_after_first_stream(&probe))
+}
+
+fn has_dv_after_first_stream(probe: &ProbeOutput) -> bool {
+    probe.streams.iter().skip(1).any(|s| s.side_data_list.iter().any(|d| d.dv_profile.is_some()))
+}
+
+pub fn refuse_changing_colors(source_file: &Path, duration_secs: f64) -> Result<()> {
+    let mut frames = Vec::new();
+    for share in [0.0, 0.2, 0.5, 0.8] {
+        let interval = if share > 0.0 { format!("+{:.3}%+#24", duration_secs * share) } else { "%+#24".to_string() };
+        let probe: Result<ProbeOutput> = crate::ext::ffprobe_json(
+            &[
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-read_intervals", &interval,
+                "-show_frames",
+                "-show_entries", "frame=color_transfer,color_space,color_range",
+                "-print_format", "json",
+            ],
+            source_file,
+        );
+        match probe {
+            Ok(p) => frames.extend(p.frames),
+            Err(e) if crate::job::is_transient(&e) => return Err(e).context("read the colors of the source"),
+            // ffprobe ends with an error on a demuxer that cannot seek.
+            Err(_) => {}
+        }
+    }
+    match color_change(&frames) {
+        Some((what, from, to)) => anyhow::bail!(
+            "the {what} changes inside the video, from {from} to {to}: one encode cannot carry both, so convert the source to one first"
+        ),
+        None => Ok(()),
+    }
+}
+
+fn color_change(frames: &[ProbeFrame]) -> Option<(&'static str, String, String)> {
+    let change = |value: fn(&ProbeFrame) -> Option<&str>, same: fn(&str, &str) -> bool| {
+        let mut known = frames.iter().filter_map(value).filter(|v| !matches!(*v, "" | "unknown" | "reserved"));
+        let first = known.next()?;
+        known.find(|v| !same(first, v)).map(|v| (first.to_string(), v.to_string()))
+    };
+    let named = |what, found: Option<(String, String)>| found.map(|(from, to)| (what, from, to));
+    named("color matrix", change(|f| f.color_space.as_deref(), same_matrix))
+        .or_else(|| named("color range", change(|f| f.color_range.as_deref(), |a, b| a == b)))
+        .or_else(|| named("transfer", change(|f| f.color_transfer.as_deref(), same_transfer)))
+}
+
+// H.273 gives BT.470BG and SMPTE 170M the same coefficients.
+fn same_matrix(a: &str, b: &str) -> bool {
+    let class = |m| if m == "bt470bg" { "smpte170m" } else { m };
+    class(a) == class(b)
+}
+
+// H.273 defines 6, 14 and 15 as the curve of 1, and an alternative transfer SEI can name HLG on some frames only.
+fn same_transfer(a: &str, b: &str) -> bool {
+    let class = |t| if matches!(t, "smpte170m" | "bt2020-10" | "bt2020-12" | "arib-std-b67") { "bt709" } else { t };
+    class(a) == class(b)
 }
 
 fn detect_with(mut probe: impl FnMut(&str) -> Result<ProbeOutput>) -> Result<HdrInfo> {
@@ -223,6 +303,12 @@ impl HdrInfo {
             rgb: layout.is_some_and(|l| l.rgb),
             ..Default::default()
         };
+
+        let matrices: std::collections::BTreeSet<&str> = std::iter::once(stream.color_space.as_str())
+            .chain(probe.frames.iter().filter_map(|f| f.color_space.as_deref()))
+            .filter(|m| !matches!(*m, "" | "unknown"))
+            .collect();
+        info.matrix_without_swscale = matrices.len() == 1 && matrices.iter().all(|m| MATRICES_WITHOUT_SWSCALE.contains(m));
 
         let side_data: Vec<_> = probe.frames.into_iter().flat_map(|f| f.side_data_list).collect();
 
@@ -725,6 +811,68 @@ mod tests {
             "frames": [{"color_primaries": "bt2020", "color_transfer": "smpte2084", "color_space": "bt2020nc"}]
         }"#).unwrap());
         assert_eq!((info.color_primaries, info.transfer_characteristics, info.matrix_coefficients), (Some(9), Some(16), Some(9)));
+    }
+
+    #[test]
+    fn only_one_matrix_swscale_cannot_convert_across_the_stream_and_its_frames_is_converted_around() {
+        let refused = |json: &str| HdrInfo::from_probe(probe_json(json).unwrap()).matrix_without_swscale;
+        for m in ["ycgco", "bt2020c", "smpte2085", "chroma-derived-nc", "chroma-derived-c", "ictcp"] {
+            assert!(map_matrix(m).is_some(), "{m}");
+            assert!(refused(&format!(r#"{{"streams": [{{"color_space": "{m}"}}]}}"#)), "{m}");
+            assert!(refused(&format!(r#"{{"streams": [{{"color_space": "unknown"}}], "frames": [{{"color_space": "{m}"}}]}}"#)), "{m}");
+            assert!(!refused(&format!(r#"{{"streams": [{{"color_space": "bt709"}}], "frames": [{{"color_space": "{m}"}}]}}"#)), "{m}");
+            assert!(!refused(&format!(r#"{{"streams": [{{"color_space": "{m}"}}], "frames": [{{"color_space": "bt2020nc"}}]}}"#)), "{m}");
+        }
+        for m in ["bt709", "bt2020nc", "bt470bg", "smpte170m", "smpte240m", "fcc", "gbr", "unknown", "", "ycgco-re", "ycgco-ro", "ipt-c2"] {
+            assert!(!refused(&format!(r#"{{"streams": [{{"color_space": "{m}"}}], "frames": [{{"color_space": "{m}"}}]}}"#)), "{m}");
+        }
+    }
+
+    fn change_in(frames: &str) -> Option<(&'static str, String, String)> {
+        let probe: ProbeOutput = serde_json::from_str(&format!(r#"{{"frames": [{frames}]}}"#)).unwrap();
+        color_change(&probe.frames)
+    }
+
+    #[test]
+    fn a_matrix_range_or_transfer_that_changes_is_named_with_both_values() {
+        fn found(frames: &str, what: &'static str, from: &str, to: &str) {
+            assert_eq!(change_in(frames), Some((what, from.to_string(), to.to_string())), "{frames}");
+        }
+        found(r#"{"color_space": "bt709"}, {"color_space": "smpte170m"}"#, "color matrix", "bt709", "smpte170m");
+        found(r#"{"color_space": "bt2020nc"}, {"color_space": "ictcp"}"#, "color matrix", "bt2020nc", "ictcp");
+        found(r#"{"color_range": "tv"}, {"color_range": "pc"}"#, "color range", "tv", "pc");
+        found(r#"{"color_transfer": "bt709"}, {"color_transfer": "smpte2084"}"#, "transfer", "bt709", "smpte2084");
+        found(r#"{"color_transfer": "arib-std-b67"}, {"color_transfer": "smpte2084"}"#, "transfer", "arib-std-b67", "smpte2084");
+        found(r#"{"color_transfer": "bt2020-10"}, {"color_transfer": "arib-std-b67"}, {"color_transfer": "iec61966-2-1"}"#,
+            "transfer", "bt2020-10", "iec61966-2-1");
+    }
+
+    #[test]
+    fn unknown_or_empty_values_are_no_change() {
+        assert_eq!(change_in(r#"{"color_space": "bt709"}, {"color_space": "unknown"}, {"color_space": ""}, {}, {"color_space": "bt709"}"#), None);
+        assert_eq!(change_in(r#"{"color_range": "unknown"}, {"color_range": "pc"}, {"color_range": "unknown"}"#), None);
+        assert_eq!(change_in(r#"{"color_transfer": "reserved"}, {"color_transfer": "smpte2084"}"#), None);
+        assert_eq!(change_in(""), None);
+    }
+
+    #[test]
+    fn hlg_named_by_an_sei_on_some_frames_and_curves_h273_calls_equal_are_no_change() {
+        for base in ["bt709", "bt2020-10", "bt2020-12", "smpte170m"] {
+            let frames = format!(r#"{{"color_transfer": "arib-std-b67"}}, {{"color_transfer": "{base}"}}, {{"color_transfer": "arib-std-b67"}}"#);
+            assert_eq!(change_in(&frames), None, "{base}");
+        }
+        assert_eq!(change_in(r#"{"color_transfer": "bt709"}, {"color_transfer": "bt2020-10"}"#), None);
+        assert_eq!(change_in(r#"{"color_space": "bt470bg"}, {"color_space": "smpte170m"}"#), None);
+    }
+
+    #[test]
+    fn only_a_record_after_the_first_video_stream_counts_as_another_stream() {
+        let record = r#""side_data_list": [{"side_data_type": "DOVI configuration record", "dv_profile": 7}]"#;
+        let found = |json: String| has_dv_after_first_stream(&probe_json(&json).unwrap());
+        assert!(found(format!(r#"{{"streams": [{{"index": 0}}, {{"index": 1, {record}}}]}}"#)));
+        assert!(!found(format!(r#"{{"streams": [{{"index": 0, {record}}}, {{"index": 1}}]}}"#)));
+        assert!(!found(format!(r#"{{"streams": [{{"index": 0, {record}}}]}}"#)));
+        assert!(!found(r#"{"streams": [{"index": 0}, {"index": 1}]}"#.to_string()));
     }
 
     fn probe_json(json: &str) -> Result<ProbeOutput> {

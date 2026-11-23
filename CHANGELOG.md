@@ -64,6 +64,46 @@ All notable changes to this project are documented in this file, in the format o
 - Files with non-ASCII names work when avet runs without a UTF-8 locale.
 - HDR videos whose file claims SDR colors keep the colors of their video stream.
 - A track titled with just its codec name, such as `AAC`, no longer becomes `AAC (AAC)`.
+- Video that was cut between key frames no longer plays behind the audio or starts with repeated pictures.
+- Recordings that start mid-stream no longer show pictures with the HDR10+ data of other pictures.
+- HDR10+ values no longer land on the wrong frames at scene cuts.
+- A single repeated timestamp no longer changes the playback speed of variable frame rate video.
+- Sound and subtitles no longer play seconds late when a subtitle starts before the picture.
+- With `video = "copy"`, a video that cannot be carried over now fails the job and the source stays in place.
+- A video whose picture size changes for a few frames no longer puts garbage into the output, the job fails instead.
+- A different video of the same size under the same name no longer gets chunks of the old one.
+- A different video of the same size is no longer moved to `processed` unread.
+- A source that disappears while it is archived to another disk no longer costs the finished copy.
+- An output file that appears during a job is no longer overwritten.
+- Videos with ICtCp, BT.2020 constant luminance or YCgCo colors no longer fail at scene detection.
+- With `dv`, the log now warns when Dolby Vision sits in a separate video stream and only the base layer is encoded.
+- The target quality size limit now also works for AVI files with B-frames.
+- A job whose ffmpeg was stopped from outside is retried instead of failing for good.
+- A full disk while measuring quality is retried instead of failing for good.
+- A broken file with "No space left" in its name or title is no longer mistaken for a full disk.
+- A few frames in another pixel format no longer put garbage into the output.
+- MPEG-2 recordings cut into MPEG-TS no longer lose pictures or play at the wrong length.
+- Cut recordings no longer start with repeated pictures when their first frames carry the same time.
+- The target quality size limit now also works for MP4 files cut between key frames.
+- Chapters of MP4 and MOV files that start late now stay on their pictures.
+- Xvid videos in AVI with B-frames are no longer encoded with broken pictures.
+- Joined TS recordings are no longer encoded with wrong pictures.
+- A video whose colors change partway through now fails with a clear message instead of finishing with wrong colors.
+- Target quality no longer measures the last chunks of a file against the wrong pictures.
+- Target quality no longer crashes when the picture size grows during the video.
+- Target quality keeps its size limit when a few video packets have no timestamp.
+- Video that turns interlaced after its start is now deinterlaced.
+- A TS recording with several programs keeps only the sound and subtitles of the first video's program.
+- A text subtitle that starts before the first picture and runs into it is no longer lost.
+- `jod = nan` is reported as an invalid value instead of a missing one.
+- The error for a wrong color key names a value that fits that key.
+- Editors show that `[audio.lossless]` and `[audio.codec_rules]` inherit from `[audio]`, and describe the color keys.
+
+### Security
+
+- Symbolic links at the output file, its temp folder and in `processed` can no longer make avet overwrite or delete other files.
+- A line break in a file name can no longer fake log lines.
+- Symbolic links left in a work folder are removed when a job starts, and the files they point to stay untouched.
 
 ### Dependencies
 

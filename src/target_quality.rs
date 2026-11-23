@@ -266,13 +266,30 @@ impl Reference {
     pub const PREFIX: &'static str = "reference_";
 
     pub fn write(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Option<Self>> {
+        crate::ffms2::take_resized();
         if !uses_reference(ctx.opts) {
-            return Ok(None);
+            if !seek_misreads(ctx, scene)? {
+                return Ok(None);
+            }
+            tracing::info!("[{}] chunk {} starts near the end of the file: measured against a reference", ctx.stem, scene.padded_index());
         }
+        Self::write_file(ctx, scene).map(Some)
+    }
+
+    fn write_file(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Self> {
         let reference = Reference(ctx.temp_dir.join(format!("{}{}.mkv", Self::PREFIX, scene.padded_index())));
         encode::write_reference(ctx.source, ctx.index, scene, &reference.0, ctx.config, ctx.opts)
             .with_context(|| format!("write the reference of chunk {:05}", scene.index + 1))?;
-        Ok(Some(reference))
+        Ok(reference)
+    }
+
+    /// FFVship copies every frame with the line size of the source's first, so a chunk read at another size needs a file.
+    fn after_resized_read(ctx: &ProbeContext, scene: &SceneEntry) -> Result<Option<Self>> {
+        if !crate::ffms2::take_resized() {
+            return Ok(None);
+        }
+        tracing::info!("[{}] chunk {} has frames of another size: measured against a reference", ctx.stem, scene.padded_index());
+        Self::write_file(ctx, scene).map(Some)
     }
 
     pub fn path(&self) -> &Path {
@@ -291,9 +308,10 @@ pub fn solve_chunk_crf(ctx: &ProbeContext, scene: &SceneEntry, reference: Option
     let hi = ctx.tq.max_crf as f64;
     let key = scene.padded_index();
     let mut n = 0u32;
+    let mut resized = None;
 
     solve(ctx.tq, seed_crf(ctx.config, lo, hi), &mut |crf| {
-        let probe = probe_once(ctx, scene, crf, reference)?;
+        let probe = probe_once(ctx, scene, crf, reference, &mut resized)?;
         n += 1;
         tracing::info!(
             "[{}] chunk {key} probe {n}/{} crf {crf} gives {}, {:.0}% size",
@@ -358,17 +376,28 @@ fn seed_crf(config: &Config, lo: f64, hi: f64) -> f64 {
 }
 
 /// Both readings carry the probe preset's bias; the final encode can come out larger.
-fn probe_once(ctx: &ProbeContext, scene: &SceneEntry, crf: f64, reference: Option<&Reference>) -> Result<Probe> {
+fn probe_once(
+    ctx: &ProbeContext,
+    scene: &SceneEntry,
+    crf: f64,
+    reference: Option<&Reference>,
+    resized: &mut Option<Reference>,
+) -> Result<Probe> {
     let tag = format!("{}_{crf}", scene.padded_index());
     let probe = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
     let overrides = encode::EncodeOverrides { crf: Some(crf), preset: Some(ctx.tq.probe_preset) };
-    let size_bytes = match reference {
-        Some(reference) => encode::encode_reference(reference.path(), scene, &probe, ctx.config, ctx.opts, overrides),
-        None => encode::encode_chunk(ctx.source, ctx.index, scene, &probe, ctx.config, &probe_opts(ctx), overrides),
+    let from_reference = |reference: &Reference| encode::encode_reference(reference.path(), scene, &probe, ctx.config, ctx.opts, overrides);
+    let size_bytes = match reference.or(resized.as_ref()) {
+        Some(reference) => from_reference(reference),
+        None => encode::encode_chunk(ctx.source, ctx.index, scene, &probe, ctx.config, &probe_opts(ctx), overrides).and_then(|size| {
+            *resized = Reference::after_resized_read(ctx, scene)?;
+            resized.as_ref().map_or(Ok(size), from_reference)
+        }),
     }
     // Nothing else in the temp dir's housekeeping knows about probe files.
     .inspect_err(|_| { let _ = std::fs::remove_file(&probe); })
     .with_context(|| format!("probe encode crf {crf}"))?;
+    let reference = reference.or(resized.as_ref());
 
     let jod = score(ctx, scene, &probe, &tag, reference).and_then(|score| match score.mismatch {
         Some(readings) => bail!("FFVship reads {readings}, so its score would compare two different pictures"),
@@ -429,7 +458,32 @@ pub fn measurable(opts: &EncodeOptions) -> bool {
 }
 
 fn uses_reference(opts: &EncodeOptions) -> bool {
-    opts.scale.is_some() || opts.mirror.is_some()
+    opts.scale.is_some() || opts.mirror.is_some() || opts.linear_decode
+}
+
+/// RGB stays on the source: its reference is the 4:2:0 conversion, whose loss the score has to include.
+fn seek_misreads(ctx: &ProbeContext, scene: &SceneEntry) -> Result<bool> {
+    if ctx.source_rgb {
+        return Ok(false);
+    }
+    let frames = match ctx.source_byte_index.len() {
+        0 => u64::from(VideoSource::open(ctx.source, ctx.index, OpenOpts::default()).context("open FFMS2 VideoSource")?.info.num_frames),
+        n => n as u64 - 1,
+    };
+    Ok(starts_near_end(scene.start_frame, frames, ffvship_threads()))
+}
+
+/// FFMS2 with many decoder threads lands a frame off after a seek close to the end of the file.
+fn starts_near_end(start: u64, frames: u64, threads: u64) -> bool {
+    start + threads.saturating_mul(3).max(64) >= frames
+}
+
+/// FFVship's `std::thread::hardware_concurrency`, in libstdc++ glibc's get_nprocs, which ignores a cpuset.
+fn ffvship_threads() -> u64 {
+    unsafe extern "C" {
+        fn get_nprocs() -> std::os::raw::c_int;
+    }
+    u64::try_from(unsafe { get_nprocs() }).unwrap_or(0)
 }
 
 /// The finished chunk as it will play, which the probes at another preset only estimate.
@@ -440,6 +494,14 @@ pub fn measure_final(ctx: &ProbeContext, scene: &SceneEntry, chunk: &Path, refer
     let tag = format!("{}_final", scene.padded_index());
     let tagged = ctx.temp_dir.join(format!("probe_{tag}.ivf"));
     let _cleanup = Cleanup(vec![tagged.clone()]);
+    let resized = match reference.map_or_else(|| Reference::after_resized_read(ctx, scene), |_| Ok(None)) {
+        Ok(resized) => resized,
+        Err(e) => {
+            tracing::warn!("[{}] chunk {}: could not measure the finished encode: {e:#}", ctx.stem, scene.padded_index());
+            return None;
+        }
+    };
+    let reference = reference.or(resized.as_ref());
     let measured = match reference {
         Some(_) => score(ctx, scene, chunk, &tag, reference),
         None => tag_as_probed(ctx, chunk, &tagged).and_then(|copied| {
@@ -726,6 +788,7 @@ fn gpu_side(stderr: &str) -> bool {
 fn measure(m: &MeasureOpts) -> Result<(f64, Option<(Reading, Reading)>)> {
     let json = m.work_dir.join(format!("cvvdp_{}.json", m.tag));
     let _cleanup = Cleanup(vec![json.clone()]);
+    create_score_file(&json)?;
 
     let mut cmd = std::process::Command::new(external_bin("FFVship"));
     match m.reference {
@@ -771,6 +834,11 @@ fn measure_args(m: &MeasureOpts) -> Vec<String> {
     args
 }
 
+/// FFVship and vmaf word a failed open without its cause, and vmaf exits 0.
+fn create_score_file(path: &Path) -> Result<()> {
+    std::fs::File::create(path).map(drop).with_context(|| format!("create {}", path.display()))
+}
+
 fn read_metric_json(path: &Path, what: &str) -> Result<String> {
     let raw = std::fs::read_to_string(path).with_context(|| format!("read {what} json: {}", path.display()))?;
     if serde_json::from_str::<serde::de::IgnoredAny>(&raw).is_err_and(|e| e.is_eof()) {
@@ -799,6 +867,7 @@ fn measure_cambi(ctx: &ProbeContext, scene: &SceneEntry, probe: &Path, tag: &str
     let json = ctx.temp_dir.join(format!("cambi_{tag}.json"));
     let _ = std::fs::remove_file(&fifo);
     let _cleanup = Cleanup(vec![fifo.clone(), json.clone()]);
+    create_score_file(&json)?;
     make_fifo(&fifo)?;
     // O_RDWR on a Linux FIFO never blocks, so neither child hangs opening its end, and
     // dropping it is what lets vmaf see EOF, or the decoder EPIPE, once the other is gone.
@@ -1113,6 +1182,18 @@ mod tests {
     }
 
     #[test]
+    fn a_score_file_a_tool_left_as_avet_created_it_is_retried() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join("cvvdp.json");
+        create_score_file(&json).unwrap();
+        assert_eq!(std::fs::read(&json).unwrap().len(), 0);
+        assert!(crate::job::is_transient(&read_metric_json(&json, "FFVship").unwrap_err()));
+
+        let missing_dir = create_score_file(&dir.path().join("gone/cvvdp.json")).unwrap_err();
+        assert!(!crate::job::is_transient(&missing_dir), "got: {missing_dir:#}");
+    }
+
+    #[test]
     fn parse_cvvdp_takes_last_cumulative() {
         assert!((parse_cvvdp("[[9.95],[9.90],[9.83]]").unwrap() - 9.83).abs() < 1e-9);
         assert!(parse_cvvdp("[]").is_err());
@@ -1215,13 +1296,25 @@ mod tests {
     }
 
     #[test]
-    fn only_a_scaled_or_mirrored_chunk_is_held_against_a_reference() {
+    fn a_chunk_starting_in_the_last_64_frames_or_three_per_thread_is_near_the_end() {
+        assert!(starts_near_end(936, 1000, 8));
+        assert!(!starts_near_end(935, 1000, 8));
+        assert!(starts_near_end(928, 1000, 24));
+        assert!(!starts_near_end(927, 1000, 24));
+        assert!(starts_near_end(0, 64, 1));
+        assert!(!starts_near_end(0, 65, 1));
+        assert!(starts_near_end(999, 1000, 0));
+    }
+
+    #[test]
+    fn only_a_scaled_mirrored_or_linearly_decoded_chunk_is_held_against_a_reference() {
         let deinterlaced = EncodeOptions { deinterlace: Some(crate::interlace::FieldOrder::Tff), ..Default::default() };
         assert!(!uses_reference(&EncodeOptions::default()));
         assert!(!uses_reference(&deinterlaced));
         assert!(uses_reference(&EncodeOptions { scale: Some((320, 180)), ..Default::default() }));
         assert!(uses_reference(&EncodeOptions { mirror: Some(crate::ffms2::Mirror::Horizontal), ..Default::default() }));
         assert!(uses_reference(&EncodeOptions { scale: Some((320, 180)), ..deinterlaced }));
+        assert!(uses_reference(&EncodeOptions { linear_decode: true, ..Default::default() }));
     }
 
     #[test]

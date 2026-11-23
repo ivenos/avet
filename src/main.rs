@@ -244,11 +244,51 @@ impl Visit for ShortNameVisitor<'_> {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        match self.max.filter(|_| field.name() == "message").and_then(|max| short_name(&format!("{value:?}"), max)) {
+        if field.name() != "message" {
+            return self.inner.record_debug(field, value);
+        }
+        let message = one_line_name(&format!("{value:?}"));
+        match self.max.and_then(|max| short_name(&message, max)) {
             Some(short) => self.inner.record_debug(field, &format_args!("{short}")),
-            None => self.inner.record_debug(field, value),
+            None => self.inner.record_debug(field, &format_args!("{message}")),
         }
     }
+}
+
+fn one_line_name(message: &str) -> String {
+    let named = match name_in_brackets(message) {
+        Some(name) if name.contains(['\n', '\r']) => {
+            message.replace(name, &name.replace('\n', "\\n").replace('\r', "\\r"))
+        }
+        _ => message.to_string(),
+    };
+    let mut text = String::with_capacity(named.len());
+    let mut rest = named.as_str();
+    while let Some(i) = rest.find(['\n', '\r']) {
+        let (line, tail) = (&rest[..i], &rest[i + 1..]);
+        text.push_str(line);
+        match (rest.as_bytes()[i], starts_like_a_record(tail)) {
+            (b'\n', true) => text.push_str("\\n"),
+            (b'\r', true) => text.push_str("\\r"),
+            (byte, _) => text.push(byte as char),
+        }
+        rest = tail;
+    }
+    text + rest
+}
+
+fn name_in_brackets(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix('[')?;
+    let end = rest.match_indices(']').map(|(i, _)| i)
+        .find(|&i| rest[i + 1..].is_empty() || rest[i + 1..].starts_with(' '))?;
+    Some(&rest[..end])
+}
+
+fn starts_like_a_record(line: &str) -> bool {
+    let b = line.trim_start_matches(|c: char| !c.is_ascii_graphic()).as_bytes();
+    b.len() > 10
+        && (b[4], b[7], b[10]) == (b'-', b'-', b'T')
+        && [0, 1, 2, 3, 5, 6, 8, 9].iter().all(|&i| b[i].is_ascii_digit())
 }
 
 fn short_name(message: &str, max: usize) -> Option<String> {
@@ -354,6 +394,36 @@ mod tests {
         assert_eq!(short_name("avet started", 3), None);
         assert_eq!(short_name("[never closed", 3), None);
         assert_eq!(short_name("[Show [1080p] job failed\nparse encode.toml\n  |  ]", 4), None);
+    }
+
+    #[test]
+    fn a_line_break_in_a_file_name_stays_on_its_log_line() {
+        let forged = "2026-01-01T00:00:00.000000Z ERROR forged";
+        assert_eq!(
+            one_line_name(&format!("[film\n{forged}] starting /input/p/film\n{forged}.mkv")),
+            format!("[film\\n{forged}] starting /input/p/film\\n{forged}.mkv")
+        );
+        assert_eq!(one_line_name("[a\r\nb] done"), "[a\\r\\nb] done");
+        assert_eq!(one_line_name("[a]\nb] done"), "[a]\\nb] done");
+        assert_eq!(one_line_name(&format!("[a] b\n{forged}] done")), format!("[a] b\\n{forged}] done"));
+        assert_eq!(one_line_name(&format!("[a] b\n  {forged}] done")), format!("[a] b\\n  {forged}] done"));
+        assert_eq!(one_line_name(&format!("[a] b\r{forged}] done")), format!("[a] b\\r{forged}] done"));
+        assert_eq!(one_line_name(&format!("[a] b\r\n{forged}] done")), format!("[a] b\\r\\n{forged}] done"));
+        assert_eq!(one_line_name(&format!("[a] b\n\u{200b}{forged}] done")), format!("[a] b\\n\u{200b}{forged}] done"));
+    }
+
+    #[test]
+    fn a_multi_line_error_behind_the_name_keeps_its_lines() {
+        for message in [
+            "[film] job failed - retrying in 2s\nffmpeg failed (exit status: 1):\n[h264 @ 0x55] error\nConversion failed!",
+            "[Show [1080p] job failed\nparse encode.toml\n  |  ]",
+            "[[SubsPlease] Show - 01 [A1B2]] job failed\nreason",
+            "avet started",
+            "not a name\nsecond line",
+            "[film] ffmpeg: frame= 10\rframe= 20\r\nfailed",
+        ] {
+            assert_eq!(one_line_name(message), message);
+        }
     }
 
     #[test]

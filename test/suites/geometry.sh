@@ -119,4 +119,20 @@ for pair in "pattern_rot90.mp4 stream_side_data=rotation" \
     assert_stream_value "$O/test.mkv" v:0 "$entry" "$EXPECTED"
 done
 
+# a stream that turns interlaced after its start is found and deinterlaced
+I="$WORKDIR/862/in"; O="$WORKDIR/862/out"; mkdir -p "$I/p" "$O"
+PATTERN="geq=lum=128+60*sin(X/9+N*1.7)+50*cos(Y/7-N*1.1):cb=128+60*sin(X/40+Y/9+N*1.3):cr=128+60*cos(Y/7-X/70-N*1.1)"
+ffmpeg -y -hide_banner -loglevel error -f lavfi -i "nullsrc=size=320x180:rate=25,$PATTERN,format=yuv420p" -frames:v 150 \
+    -c:v libx264 -qp 8 -preset ultrafast -g 25 -muxdelay 0 "$WORKDIR/862/prog.ts" || fail "late_interlaced: could not build the progressive part"
+ffmpeg -y -hide_banner -loglevel error -f lavfi -i "nullsrc=size=320x180:rate=50,$PATTERN,format=yuv420p" -frames:v 300 \
+    -vf "tinterlace=mode=interleave_top,setfield=tff" -c:v libx264 -qp 8 -preset ultrafast -flags +ildct+ilme -x264opts tff=1 -g 25 \
+    -muxdelay 0 -output_ts_offset 6.08 "$WORKDIR/862/inter.ts" || fail "late_interlaced: could not build the interlaced part"
+cat "$WORKDIR/862/prog.ts" "$WORKDIR/862/inter.ts" > "$I/p/test.ts"
+printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 11\ncrf = 20\n' > "$I/p/encode.toml"
+run_avet "$I" "$O" "$O/test.mkv" 240 || fail "late_interlaced: no output"
+assert_log_contains "interlaced, top field first"
+combed=$(ffmpeg -hide_banner -i "$O/test.mkv" -map 0:v:0 -vf "select='gte(n,160)',idet" -f null - 2>&1 \
+    | grep "Multi frame detection" | tail -n 1 | sed 's/.*TFF: *\([0-9]*\).*/\1/')
+[ "${combed:-0}" -le 10 ] || fail "late_interlaced: idet still finds $combed combed frames in the output"
+
 test_done

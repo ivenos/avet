@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 struct Section {
     intro: Option<String>,
     rows: BTreeMap<String, Row>,
+    grouped: BTreeMap<String, String>,
+    overrides: Option<Box<Section>>,
 }
 
 struct Row {
@@ -15,9 +17,12 @@ struct Row {
     description: String,
 }
 
+const OVERRIDES_HEADING: &str = "### `[audio.lossless]` and `[audio.codec_rules]`";
+
 fn readme() -> BTreeMap<String, Section> {
     let mut sections = BTreeMap::<String, Section>::new();
     let mut current = None;
+    let mut in_overrides = false;
     let mut in_code = false;
     for line in include_str!("../README.md").lines() {
         if line.starts_with("```") {
@@ -28,11 +33,15 @@ fn readme() -> BTreeMap<String, Section> {
             continue;
         }
         if line.starts_with('#') {
-            current = line
-                .strip_prefix("### `")
-                .and_then(|l| l.strip_suffix('`'))
-                .filter(|name| !name.contains('`'))
-                .map(|name| name.trim_matches(['[', ']']).to_string());
+            in_overrides = line == OVERRIDES_HEADING;
+            current = if in_overrides {
+                Some("audio".to_string())
+            } else {
+                line.strip_prefix("### `")
+                    .and_then(|l| l.strip_suffix('`'))
+                    .filter(|name| !name.contains('`'))
+                    .map(|name| name.trim_matches(['[', ']']).to_string())
+            };
             if let Some(name) = &current {
                 sections.entry(name.clone()).or_default();
             }
@@ -41,7 +50,35 @@ fn readme() -> BTreeMap<String, Section> {
         let Some(section) = current.as_ref().and_then(|name| sections.get_mut(name)) else {
             continue;
         };
-        if line.starts_with("| `") {
+        if in_overrides {
+            if line.starts_with("| `") {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                assert_eq!(cells.len(), 6, "README row with other than four cells: {line}");
+                let overrides = section.overrides.get_or_insert_default();
+                for key in cells[1].split(',') {
+                    overrides.rows.insert(
+                        key.trim().trim_matches('`').to_string(),
+                        Row {
+                            default: cells[2].to_string(),
+                            values: cells[3].to_string(),
+                            description: format!("{}. Default: {}. Values: {}", cells[4], cells[2], cells[3]),
+                        },
+                    );
+                }
+            } else if let Some((table, _)) = line.strip_prefix("- `[audio.").and_then(|l| l.split_once("]`")) {
+                section.grouped.insert(table.to_string(), line.trim_start_matches("- ").to_string());
+            }
+            continue;
+        }
+        if line.starts_with("| color keys |") {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            assert_eq!(cells.len(), 6, "README row with other than four cells: {line}");
+            let kind = cells[3].split(',').next().unwrap_or_default();
+            for key in crate::config::COLOR_KEYS {
+                let example = crate::config::color_key_example(key);
+                section.grouped.insert(key.to_string(), format!("{}. Values: {kind}, such as {example}", cells[4]));
+            }
+        } else if line.starts_with("| `") {
             let cells: Vec<&str> = line.split('|').map(str::trim).collect();
             assert_eq!(cells.len(), 6, "README row with other than four cells: {line}");
             assert!(!cells[3].is_empty() && !cells[4].is_empty() && !cells[4].ends_with('.'), "README row with an empty cell or a final period: {line}");
@@ -129,13 +166,21 @@ fn describe(table: &mut Value, path: &str, section: &Section) {
     };
     for (key, prop) in props.iter_mut() {
         let nested = is_table(prop);
-        match section.rows.get(key) {
-            Some(row) => prop["description"] = json!(row.description),
+        match section.rows.get(key).map(|row| &row.description).or(section.grouped.get(key)) {
+            Some(text) => {
+                prop["description"] = json!(text);
+                if section.grouped.contains_key(key)
+                    && let Some(entry) = prop.get_mut("additionalProperties").filter(|v| v.is_object())
+                {
+                    entry["description"] = json!(text);
+                }
+            }
             None if nested || open => {}
             None => panic!("README has no row for `{path}.{key}`"),
         }
         if nested {
-            describe(prop, &format!("{path}.{key}"), section);
+            let inner = section.overrides.as_deref().filter(|_| section.grouped.contains_key(key));
+            describe(prop, &format!("{path}.{key}"), inner.unwrap_or(section));
         }
     }
 }
@@ -145,6 +190,33 @@ fn schema_is_written_to_schema_out() {
     let schema = serde_json::to_string_pretty(&generate()).unwrap() + "\n";
     if let Some(path) = std::env::var_os("SCHEMA_OUT") {
         std::fs::write(path, schema).unwrap();
+    }
+}
+
+#[test]
+fn audio_overrides_are_described_as_inheriting_from_audio() {
+    let schema = generate();
+    let audio = &schema["properties"]["audio"]["properties"];
+    for (table, keys) in [("lossless", &audio["lossless"]), ("codec_rules", &audio["codec_rules"]["additionalProperties"])] {
+        let text = audio[table]["description"].as_str().unwrap_or_else(|| panic!("audio.{table} has no description"));
+        assert!(text.contains(&format!("[audio.{table}]")), "audio.{table}: {text}");
+        assert_eq!(keys["description"].as_str(), Some(text), "an entry of audio.{table}");
+        let keys = keys["properties"].as_object().unwrap();
+        assert_eq!(keys.keys().collect::<Vec<_>>(), ["bitrate", "codec", "mode", "options"]);
+        for (key, prop) in keys {
+            let text = prop["description"].as_str().unwrap_or_else(|| panic!("audio.{table}.{key} has no description"));
+            assert!(text.contains("Default: from `[audio]`") && !text.contains("Required"), "audio.{table}.{key}: {text}");
+        }
+    }
+}
+
+#[test]
+fn every_color_key_has_the_description_of_the_readme_row() {
+    let schema = generate();
+    for key in crate::config::COLOR_KEYS {
+        let text = schema["properties"]["encoder_params"]["properties"][key]["description"].as_str();
+        assert!(text.is_some_and(|t| t.starts_with("Replace the color description")), "{key}: {text:?}");
+        assert!(text.is_some_and(|t| t.ends_with(&format!("such as {}", crate::config::color_key_example(key)))), "{key}: {text:?}");
     }
 }
 

@@ -86,8 +86,11 @@ output/
 <summary>Details</summary>
 
 - Only the first video track is encoded, as 4:2:0 at 8 or 10 bits. An odd frame size loses its last column or row.
-- Interlaced video is deinterlaced with bwdif at its frame rate, when the stream is flagged interlaced and ffmpeg's idet finds its frames combed.
+- Interlaced video is deinterlaced with bwdif at its frame rate, when the stream is flagged interlaced at its start or at 20, 50 or 80 % of its length and ffmpeg's idet finds its frames combed.
 - Aspect ratio, rotation and mirroring, the color description, HDR10, HLG and HDR10+ metadata and the offsets between streams are kept.
+- A source whose color matrix, color range or transfer changes inside the video fails with a `.failed` marker.
+- From a transport stream with several programs, only the sound and subtitles of the first video's program are kept.
+- A text subtitle that starts before the first picture and runs into it starts at the first picture. One that ends before it is dropped.
 - A folder without `encode.toml` is skipped, with a warning if it holds videos. A video directly in `input/` is skipped with a warning.
 - An `encode.toml` in a folder inside a profile is ignored with a warning.
 - A file whose output already exists is skipped. A file still being copied in is picked up once it stops growing.
@@ -110,7 +113,7 @@ output/
 | `INPUT_DIR` | `./input`, `/input` in the image | Input directory |
 | `OUTPUT_DIR` | `./output`, `/output` in the image | Output directory, not inside `INPUT_DIR` |
 | `POLL_INTERVAL` | `60` | Seconds between scans |
-| `RUST_LOG` | `info` | Log level, e.g. `debug` |
+| `RUST_LOG` | `info` | Log level, e.g. `avet=debug` |
 | `LOG_NAME_LENGTH` | - | Cuts the file name in brackets in front of each log line to this many characters, e.g. `30`. The line that starts a job also shows the full path |
 
 ## Configuration
@@ -181,6 +184,8 @@ Every key goes to the encoder as `--key value`, booleans as `1` or `0`.
 - `dv` needs an HEVC source and does not work with `bit_depth = 8`. It converts profile 7 to 8.1.
 - Without `dv`, and for other profiles, only the Dolby Vision base layer is kept.
 - Dolby Vision whose base layer is no picture on its own, such as profile 5, is refused.
+- Dolby Vision in a separate video stream, as on a UHD Blu-ray, is not carried: only the base layer is encoded, and with `dv` the log warns.
+- With `video = "copy"`, a file fails if mkvmerge cannot carry its video over, such as MJPEG in MP4 or FFV1 in MOV.
 
 ### `[audio]`
 
@@ -239,7 +244,7 @@ eac3 = { mode = "encode", codec = "libopus", bitrate = "192k" }
 | `speed` | `"standard"` | `"standard"`, `"fast"` | `"fast"` trades accuracy for speed |
 | `downscale_height` | - | `64` and up | Detect scenes on a copy scaled to this height |
 
-- `extra_split_sec` never makes chunks shorter than 24 frames.
+- `extra_split_sec` counts as at least 24 frames, and is off when it comes to less than half a frame.
 - `extra_split` overrides `extra_split_sec`.
 
 ### `[target_quality]`

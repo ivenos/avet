@@ -148,16 +148,23 @@ assert_min_chunk_frames   "$O/.avet_test/scenes.json" 60
 assert_video_frames       "$O/test.mkv" 240
 assert_keyframes_at_chunks "$O/test.mkv" "$O/.avet_test/scenes.json"
 
-# a recording cut mid-GOP: every chunk still starts on its scene change
+# a recording cut mid-GOP: the frames before the first picture stay out, every chunk starts on its scene change
 I="$WORKDIR/12/in"; O="$WORKDIR/12/out"; mkdir -p "$I/p" "$O"
 cp "$FIXTURES_DIR/cut_gop.ts" "$I/p/test.ts"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n[avet]\nkeep_temp = true\n' > "$I/p/encode.toml"
 TEST_SCENE_REPAIR=1 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "cut recording: no output"
 assert_log_contains "scene cuts move by"
-assert_scenes_cover "$O/.avet_test/scenes.json"
+lead=$(sed -n 's/.*"start_frame": *\([0-9]*\).*/\1/p' "$O/.avet_test/scenes.json" | head -n 1)
+[ "${lead:-0}" -gt 0 ] || fail "cut recording: the first chunk starts at '$lead', not after the leading frames"
+awk -v lead="${lead:-0}" '/"(start|end)_frame"/ { n = $2 + 0; sub(/[0-9]+/, n - lead) } { print }' \
+    "$O/.avet_test/scenes.json" > "$WORKDIR/12/rebased.json"
+assert_scenes_cover "$WORKDIR/12/rebased.json"
+shown=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_read_frames \
+    -of default=nw=1:nk=1 "$FIXTURES_DIR/cut_gop.ts" | head -n 1 | tr -d ',\n')
+assert_video_frames "$O/test.mkv" "$shown"
 changes=$(ffmpeg -hide_banner -i "$O/test.mkv" -vf "setpts=N/TB,select=gt(scene\,0.3),showinfo" -f null - 2>&1 \
     | sed -n 's/.*pts_time:\([0-9]*\).*/\1/p' | tr '\n' ' ')
-starts=$(sed -n 's/.*"start_frame": *\([0-9]*\).*/\1/p' "$O/.avet_test/scenes.json" | tr '\n' ' ')
+starts=$(sed -n 's/.*"start_frame": *\([0-9]*\).*/\1/p' "$WORKDIR/12/rebased.json" | tr '\n' ' ')
 [ -n "$changes" ] && [ "0 $changes" = "$starts" ] \
     || fail "cut recording: scene changes at frames '$changes', chunks start at '$starts'"
 

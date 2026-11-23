@@ -235,10 +235,7 @@ fn failed_marker(output_dir: &Path, job: &Job) -> Option<PathBuf> {
     if !temp.failed_path.exists() || temp.failed_under_another_profile(&job.encode_toml) {
         return None;
     }
-    match temp.recorded_id() {
-        Some(prev) if crate::resume::source_id(&job.source_file).is_ok_and(|id| id != prev) => None,
-        _ => Some(temp.failed_path),
-    }
+    (!temp.source_replaced(&job.source_file)).then_some(temp.failed_path)
 }
 
 pub fn ensure_processed_dir(input_dir: &Path, rel_dir: &Path) -> Result<PathBuf> {
