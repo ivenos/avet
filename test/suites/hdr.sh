@@ -305,7 +305,9 @@ ffmpeg -nostdin -y -hide_banner -loglevel error -f lavfi -i "testsrc2=size=320x1
     -c:v libx265 -preset ultrafast \
     -x265-params "log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:max-cll=1000,400:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)" \
     -color_primaries bt2020 -color_trc smpte2084 -colorspace bt2020nc "$I/p/test.mkv"
-[ "$(stream_value "$I/p/test.mkv" v:0 stream=color_primaries)" = unknown ] || fail "HDR10 colour: the source stream has its primaries"
+# Since FFmpeg 9.1 (7c2853dfc1), ffprobe fills each colour field the container leaves unset from the bitstream.
+[ "$(ffprobe -v error -nofind_stream_info -select_streams v:0 -show_entries stream=color_primaries -of default=nw=1:nk=1 "$I/p/test.mkv")" = unknown ] \
+    || fail "HDR10 colour: the source stream has its primaries"
 printf 'encoder = "svt-av1"\n[encoder_params]\npreset = 12\ncrf = 50\n' > "$I/p/encode.toml"
 run_avet "$I" "$O" "$O/test.mkv" 120 || fail "HDR10 colour: no output"
 assert_log_contains    "HDR: HDR10"
